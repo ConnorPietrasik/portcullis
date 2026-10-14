@@ -1,0 +1,25 @@
+# Authelia user database — TEMPLATE.
+# The real users_database.yml is gitignored, so password hashes never reach
+# GitHub (a public clone of this repo won't have it — create it from here).
+#
+# Setup:
+#   cp users_database.yml.example users_database.yml
+# then replace the placeholder with a real argon2 hash:
+#   docker run --rm authelia/authelia:4.39 authelia crypto hash generate argon2 --password 'YOUR-PASSWORD'
+#
+# Groups drive access rules in configuration.yml:
+#   admins  → panel.pietrasik.top
+#   friends → e.g. jellyfin.pietrasik.top
+# setup/02-deploy-stack.sh refuses to deploy while placeholders remain.
+
+users:
+  connor:
+    displayname: Connor
+    password: REPLACE_WITH_ARGON2_HASH
+    groups: [admins]
+    email: connorgpietrasik@gmail.com
+
+  # friend:
+  #   displayname: Friend
+  #   password: <generate an argon2 hash the same way, when needed>
+  #   groups: [friends]

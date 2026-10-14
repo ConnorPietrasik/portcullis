@@ -1,0 +1,28 @@
+[Unit]
+Description=panel-ddns — reconcile the NameSilo apex A record with the public IP
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=panel
+Group=panel
+# Same file the compose stack and panel-api use — one source of truth for the
+# NameSilo key (read by systemd as root; the script never sees the file itself).
+EnvironmentFile=/opt/panel/.env
+ExecStart=/usr/bin/python3 /opt/panel-ddns/ddns.py
+TimeoutStartSec=5min
+
+# ── hardening: outbound HTTP(S)/DNS only; the script writes nothing ──────────
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+
+[Install]
+WantedBy=multi-user.target

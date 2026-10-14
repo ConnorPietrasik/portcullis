@@ -1,0 +1,15 @@
+# Authelia portal routing. Lives here (not container labels) because Traefik
+# runs the FILE provider only — it mounts no docker.sock at all.
+
+http:
+  routers:
+    authelia:
+      rule: "Host(`auth.pietrasik.top`)"
+      middlewares: [sec-headers@file]
+      service: authelia
+
+  services:
+    authelia:
+      loadBalancer:
+        servers:
+          - url: "http://authelia:9091"

@@ -1,0 +1,29 @@
+# LLM servers — OpenAI-style machine APIs. TLS terminates here (wildcard cert,
+# DNS-01); auth is llama-server's own --api-key (Authorization: Bearer), NOT
+# Authelia: forward-auth is cookie-based and can't serve API clients that only
+# speak bearer tokens. These routers deliberately omit auth-chain@file — that
+# is what makes plain OpenAI clients work with
+#   base_url = https://llm.pietrasik.top/v1
+# The API key is the gate; llm-rate blunts key-guessing and scan traffic.
+# (This host 502s until the matching compose service is up — harmless.)
+# One router+service pair per server: llm2.pietrasik.top → llm-embed:8080, …
+
+http:
+  routers:
+    llm-glm:
+      rule: "Host(`llm.pietrasik.top`)"
+      middlewares: [sec-headers@file, llm-rate@file]
+      service: llm-glm
+
+  services:
+    llm-glm:
+      loadBalancer:
+        servers:
+          - url: "http://llm-glm:8080"
+
+  middlewares:
+    llm-rate:
+      rateLimit:
+        average: 10 # req/s sustained — inference is slow; this only blunts abuse
+        period: 1s
+        burst: 20

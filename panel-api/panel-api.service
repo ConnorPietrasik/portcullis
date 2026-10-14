@@ -1,0 +1,28 @@
+[Unit]
+Description=Panel API (host service behind panel.pietrasik.top/api)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+User=panel
+Group=panel
+WorkingDirectory=/opt/panel-api
+# Single source of truth for PANEL_TOKEN (same file the compose stack uses).
+EnvironmentFile=/opt/panel/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/panel-api/venv/bin/uvicorn main:app --host 172.17.0.1 --port 8010
+Restart=on-failure
+RestartSec=3
+
+# ── hardening ────────────────────────────────────────────────────────────────
+PrivateTmp=yes
+ProtectHome=read-only
+ProtectSystem=full
+# Deliberately NOT enabled — they would break `sudo -n panel-do` (setuid) or
+# the sysfs GPU reads the whole dashboard depends on:
+#   NoNewPrivileges=yes, RestrictSUIDSGID=yes (sudo needs setuid)
+#   PrivateDevices=yes, ProtectKernel* (service must read /sys/class/drm, /sys/class/hwmon)
+#   CapabilityBoundingSet= (children spawned via sudo would lose needed privileges)
+
+[Install]
+WantedBy=multi-user.target

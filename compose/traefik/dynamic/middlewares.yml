@@ -1,0 +1,33 @@
+# Shared middlewares. __PANEL_TOKEN__ is substituted by setup/02-deploy-stack.sh
+# (this file therefore contains a secret — it is chmod 600 on the server).
+
+http:
+  middlewares:
+    sec-headers:
+      headers:
+        stsSeconds: 31536000
+        stsIncludeSubdomains: true
+        frameDeny: true # X-Frame-Options: DENY — nothing here needs to be iframed
+        contentTypeNosniff: true
+        referrerPolicy: same-origin
+
+    # Authelia forward-auth. Traefik strips any client-supplied Remote-* headers
+    # and replaces them with Authelia's verdict, so they can't be forged.
+    authelia:
+      forwardAuth:
+        address: http://authelia:9091/api/verify?rd=https%3A%2F%2Fauth.pietrasik.top
+        authResponseHeaders:
+          - Remote-User
+          - Remote-Groups
+          - Remote-Email
+
+    auth-chain:
+      chain:
+        middlewares: [sec-headers, authelia]
+
+    # Injected into requests forwarded to the panel API only. Clients cannot
+    # set this header themselves — Traefik overwrites it.
+    panel-secret:
+      headers:
+        customRequestHeaders:
+          X-Panel-Token: __PANEL_TOKEN__

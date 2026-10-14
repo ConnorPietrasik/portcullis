@@ -1,0 +1,10 @@
+[Unit]
+Description=Run panel-ddns every 10 minutes (and shortly after boot)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+RandomizedDelaySec=45s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,67 @@
+# Authelia configuration. Secrets are injected via environment variables in
+# docker-compose.yml (AUTHELIA_*), never stored in this file.
+# Docs: https://www.authelia.com/configuration/prologue/introduction/
+
+theme: dark
+default_redirection_url: https://pietrasik.top
+
+server:
+  address: 'tcp://0.0.0.0:9091/'
+
+log:
+  level: info
+
+authentication_backend:
+  password_reset:
+    disable: true # filesystem notifier can't send mail; reset via CLI if needed
+  file:
+    path: /config/users_database.yml
+
+# Order matters: first match wins. Specific rules BEFORE the wildcard.
+# The bare-domain bypass is deliberately LAST so it can only ever match
+# pietrasik.top itself — anything you add later on a new subdomain is
+# private-by-default (caught by the *.pietrasik.top rule above it).
+access_control:
+  default_policy: deny
+  rules:
+    - domain: auth.pietrasik.top
+      policy: bypass
+
+    - domain: panel.pietrasik.top
+      policy: two_factor
+      subject: ['group:admins'] # panel: only you
+
+    - domain: jellyfin.pietrasik.top # example: friends-only app
+      policy: two_factor
+      subject: ['group:friends']
+
+    - domain: demo.pietrasik.top # public demo — the app does its own auth
+      policy: bypass
+
+    - domain: '*.pietrasik.top' # everything else: any authenticated user
+      policy: two_factor
+
+    - domain: pietrasik.top # portfolio: public (bare domain only)
+      policy: bypass
+
+session:
+  cookies:
+    - name: authelia_session
+      domain: pietrasik.top
+      authelia_url: https://auth.pietrasik.top
+      same_site: lax
+      inactivity: 15m
+      expiration: 1h
+      remember_me: 30d
+
+storage:
+  local:
+    path: /config/db.sqlite3
+
+totp:
+  issuer: pietrasik.top
+  skew: 1
+
+notifier:
+  filesystem:
+    filename: /config/notification.txt

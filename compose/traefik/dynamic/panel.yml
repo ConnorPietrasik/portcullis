@@ -1,0 +1,33 @@
+# Panel routing. panel-web is reached by container DNS on the edge network;
+# panel-api is the host systemd service, reached via the docker0 bridge gateway.
+
+http:
+  routers:
+    panel-web:
+      rule: "Host(`panel.pietrasik.top`)"
+      middlewares: [auth-chain@file]
+      service: panel-web
+      priority: 100
+
+    panel-api:
+      rule: "Host(`panel.pietrasik.top`) && PathPrefix(`/api`)"
+      middlewares: [auth-chain@file, panel-secret@file, rate-panel@file]
+      service: panel-api
+      priority: 200
+
+  services:
+    panel-web:
+      loadBalancer:
+        servers:
+          - url: "http://panel-web:80"
+    panel-api:
+      loadBalancer:
+        servers:
+          - url: "http://host.docker.internal:8010"
+
+  middlewares:
+    rate-panel:
+      rateLimit:
+        average: 10
+        period: 1s
+        burst: 20

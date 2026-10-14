@@ -1,0 +1,42 @@
+# Traefik static config. __ACME_EMAIL__ and __ACME_CA_SERVER__ are substituted
+# by setup/02-deploy-stack.sh.
+
+log:
+  level: INFO
+accessLog: {}
+
+# /ping on the internal :8082 "traefik" entrypoint — used by the compose
+# healthcheck (`traefik healthcheck --ping`). Never published: only 80/443 are.
+ping: {}
+
+providers:
+  # FILE ONLY — no docker provider, so traefik mounts no docker.sock.
+  # All routers/services live in traefik/dynamic/*.yml (watched for changes).
+  file:
+    directory: /etc/traefik/dynamic
+
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+  websecure:
+    address: ":443"
+    http:
+      tls:
+        certResolver: letsencrypt
+        domains:
+          - main: "pietrasik.top"
+            sans: ["*.pietrasik.top"]
+
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: __ACME_EMAIL__
+      caServer: __ACME_CA_SERVER__
+      storage: /letsencrypt/acme.json
+      dnsChallenge:
+        provider: namesilo

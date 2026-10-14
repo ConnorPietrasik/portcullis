@@ -1,0 +1,16 @@
+# Public apps. The file provider watches this directory — edits apply without
+# a traefik restart. Add future public apps here (private apps get a router in
+# their own file with auth-chain@file; see docs/RUNBOOK.md → “add an app”).
+
+http:
+  routers:
+    portfolio:
+      rule: "Host(`pietrasik.top`)"
+      middlewares: [sec-headers@file] # public: no authelia — bypass rule in configuration.yml
+      service: portfolio
+
+  services:
+    portfolio:
+      loadBalancer:
+        servers:
+          - url: "http://portfolio:80"

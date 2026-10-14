@@ -1,0 +1,285 @@
+:root {
+  --bg: #0f141a;
+  --panel: #171e26;
+  --line: #243040;
+  --fg: #dbe2ea;
+  --muted: #8b98a5;
+  --green: #3ddc84;
+  --amber: #f6c344;
+  --red: #ff5252;
+  --accent: #4da3ff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.5 system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+
+.app {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 0 16px 40px;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--line);
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+  z-index: 5;
+}
+
+header h1 {
+  font-size: 18px;
+  margin: 0;
+  letter-spacing: 2px;
+  color: var(--accent);
+}
+
+nav {
+  display: flex;
+  gap: 6px;
+}
+
+button {
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 14px;
+  cursor: pointer;
+  font: inherit;
+}
+
+button:hover {
+  border-color: var(--accent);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.tab.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #0b1016;
+  font-weight: 600;
+}
+
+button.warn:hover {
+  border-color: var(--amber);
+}
+
+button.danger:hover {
+  border-color: var(--red);
+}
+
+main {
+  padding-top: 18px;
+}
+
+footer {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 28px;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 14px;
+  margin-bottom: 14px;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 14px 16px;
+}
+
+.card h3 {
+  margin: 0 0 6px;
+  font-size: 15px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.dials {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  justify-content: space-around;
+}
+
+figure {
+  margin: 0;
+  text-align: center;
+}
+
+figcaption {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.dial-na {
+  width: 150px;
+  height: 90px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+}
+
+.kv {
+  display: flex;
+  gap: 18px;
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 6px;
+}
+
+.kv.err {
+  color: var(--red);
+  font-weight: 600;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.banner {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 14px;
+  margin-bottom: 14px;
+  color: var(--muted);
+}
+
+.banner.err {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+.badge {
+  display: inline-block;
+  border-radius: 999px;
+  padding: 1px 10px;
+  font-size: 12px;
+  border: 1px solid var(--line);
+}
+
+.badge.ok {
+  color: var(--green);
+  border-color: var(--green);
+}
+
+.badge.warn {
+  color: var(--amber);
+  border-color: var(--amber);
+}
+
+.badge.err {
+  color: var(--red);
+  border-color: var(--red);
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+th {
+  color: var(--muted);
+  font-weight: 500;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+tr:last-child td {
+  border-bottom: none;
+}
+
+.btns {
+  white-space: nowrap;
+}
+
+.btns button {
+  margin-left: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+.action input {
+  display: block;
+  width: 100%;
+  margin: 8px 0;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 7px 10px;
+  font: 13px ui-monospace, monospace;
+}
+
+.settings label {
+  display: block;
+  color: var(--muted);
+  margin: 10px 0 6px;
+}
+
+.settings input {
+  display: block;
+  margin-top: 4px;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 7px 10px;
+  width: 180px;
+  font: inherit;
+}
+
+pre.out {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font: 12px ui-monospace, monospace;
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
+pre.out.ok {
+  border-color: var(--green);
+}
+
+pre.out.err {
+  border-color: var(--red);
+}

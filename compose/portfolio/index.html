@@ -1,0 +1,59 @@
+<!doctype html>
+<!-- Placeholder landing page for pietrasik.top. Replace with the real
+     portfolio whenever it exists — this file is bind-mounted read-only into
+     nginx:alpine (compose/docker-compose.yml → portfolio service). -->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex" />
+  <title>pietrasik.top</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; margin: 0; }
+    body {
+      min-height: 100svh;
+      display: grid;
+      place-items: center;
+      background: #0f1115;
+      color: #e8eaf0;
+      font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+      padding: 2rem;
+    }
+    main { max-width: 34rem; text-align: center; }
+    h1 {
+      font-size: clamp(1.8rem, 5vw, 2.6rem);
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+    .rule {
+      width: 4rem; height: 2px;
+      background: #3ddc84;
+      border: 0; margin: 1.4rem auto;
+    }
+    p { color: #9aa1ad; }
+    nav { margin-top: 2rem; display: flex; gap: 1rem; justify-content: center; }
+    a {
+      color: #3ddc84;
+      text-decoration: none;
+      border: 1px solid #2a2f3a;
+      border-radius: 8px;
+      padding: 0.55rem 1.1rem;
+      transition: border-color 0.15s ease;
+    }
+    a:hover { border-color: #3ddc84; }
+    footer { position: fixed; bottom: 1.2rem; font-size: 0.8rem; color: #565d68; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>pietrasik.top</h1>
+    <hr class="rule" />
+    <p>Something is taking shape here. The machines are humming; the site isn't ready yet.</p>
+    <nav>
+      <a href="https://panel.pietrasik.top">panel</a>
+    </nav>
+  </main>
+  <footer>&copy; 2026 Connor Pietrasik</footer>
+</body>
+</html>

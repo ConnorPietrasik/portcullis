@@ -1,0 +1,22 @@
+# secrets — never commit
+.env
+# real user database (password hashes) — template tracked as users_database.yml.example
+compose/authelia/users_database.yml
+
+# frontend
+node_modules/
+dist/
+package-lock.bak
+
+# go
+panel-do/panel-do
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# runtime artifacts that may appear if the repo lives on the server
+*.sqlite3
+notification.txt
+acme.json
