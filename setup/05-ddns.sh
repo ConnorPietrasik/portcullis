@@ -12,6 +12,11 @@ need systemctl
 load_env
 ensure_panel_user
 
+# The unit reads NAMESILO_API_KEY via EnvironmentFile=/opt/panel/.env, which
+# only exists after make deploy — fail loudly rather than with systemd's
+# opaque "Failed with result 'resources'".
+[[ -f /opt/panel/.env ]] || die "/opt/panel/.env missing — run make deploy first (panel-ddns reads NAMESILO_API_KEY from it)"
+
 TARGET=/opt/panel-ddns
 
 info "Installing panel-ddns to $TARGET"

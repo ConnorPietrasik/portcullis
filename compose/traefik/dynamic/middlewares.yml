@@ -13,9 +13,12 @@ http:
 
     # Authelia forward-auth. Traefik strips any client-supplied Remote-* headers
     # and replaces them with Authelia's verdict, so they can't be forged.
+    # /api/authz/forward-auth is the 4.38+ replacement for the deprecated
+    # /api/verify?rd=… — the portal URL now comes from the session cookie's
+    # authelia_url, so the rd parameter is gone.
     authelia:
       forwardAuth:
-        address: http://authelia:9091/api/verify?rd=https%3A%2F%2Fauth.pietrasik.top
+        address: http://authelia:9091/api/authz/forward-auth
         authResponseHeaders:
           - Remote-User
           - Remote-Groups

@@ -18,6 +18,20 @@ sudo mkdir -p "$TARGET"
 tar -C "$REPO_ROOT/compose" --exclude=node_modules --exclude=dist -cf - . \
   | sudo tar -C "$TARGET" -xf -
 
+# Remove managed configs deleted from the repo (e.g. a route file taken out of
+# traefik/dynamic/) — tar overwrites but never prunes. Scoped to traefik/ only:
+# authelia/ holds runtime data (db.sqlite3 with TOTP seeds, users_database.yml)
+# and is never pruned.
+target_list="$(cd "$TARGET/traefik" && find . -type f | sed 's|^\./||' | sort)"
+repo_list="$(cd "$REPO_ROOT/compose/traefik" && find . -type f | sed 's|^\./||' | sort)"
+[[ -n "$repo_list" ]] || die "repo traefik tree unexpectedly empty — aborting before touching $TARGET"
+while IFS= read -r f; do
+  if ! grep -Fxq -- "$f" <<<"$repo_list"; then
+    info "Removing stale managed config: traefik/$f"
+    sudo rm -f "$TARGET/traefik/$f"
+  fi
+done <<<"$target_list"
+
 info "Writing secrets into deployed configs (repo copies keep placeholders)"
 sudo sed -i \
   -e "s|__ACME_EMAIL__|${ACME_EMAIL}|g" \

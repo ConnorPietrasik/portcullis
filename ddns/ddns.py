@@ -143,8 +143,11 @@ def reconcile(key: str, ip: str) -> int:
             if (rr.findtext("type") or "").strip().upper() == "A"
             and rel_host(rr.findtext("host") or "") == want_rel
         ]
+        # Apex: omit rrhost entirely — NameSilo documents leaving the parameter
+        # off for the root domain; an explicit empty value is an untested edge.
+        rrhost = want_rel or None
         if not mine:
-            api(key, "dnsAddRecord", rrhost=want_rel, rrvalue=ip, rrttl=str(TTL))
+            api(key, "dnsAddRecord", rrhost=rrhost, rrvalue=ip, rrttl=str(TTL))
             log(f"created A {full_host(h)} -> {ip}")
             changes += 1
             continue
@@ -156,7 +159,7 @@ def reconcile(key: str, ip: str) -> int:
             if not rrid:
                 log(f"WARNING: A {full_host(h)}: record without record_id, skipping")
                 continue
-            api(key, "dnsRecordUpdate", rrid=rrid, rrhost=want_rel, rrvalue=ip, rrttl=str(TTL))
+            api(key, "dnsUpdateRecord", rrid=rrid, rrhost=rrhost, rrvalue=ip, rrttl=str(TTL))
             log(f"updated A {full_host(h)} ({rrid}): {value or '?'} -> {ip}")
             changes += 1
     return changes

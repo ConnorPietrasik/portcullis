@@ -3,7 +3,6 @@
 # Docs: https://www.authelia.com/configuration/prologue/introduction/
 
 theme: dark
-default_redirection_url: https://pietrasik.top
 
 server:
   address: 'tcp://0.0.0.0:9091/'
@@ -45,10 +44,13 @@ access_control:
       policy: bypass
 
 session:
+  # default_redirection_url MUST be per-cookie (4.38+ multi-domain protection):
+  # a top-level one is a hard startup error while cookies[] is configured.
   cookies:
     - name: authelia_session
       domain: pietrasik.top
       authelia_url: https://auth.pietrasik.top
+      default_redirection_url: https://pietrasik.top
       same_site: lax
       inactivity: 15m
       expiration: 1h
