@@ -46,6 +46,12 @@ services:
     environment:
       NAMESILO_API_KEY: ${NAMESILO_API_KEY}
       NAMESILO_PROPAGATION_TIMEOUT: ${NAMESILO_PROPAGATION_TIMEOUT:-1800} # NameSilo TTLs are slow; keep this high (seconds!)
+      # The one-time `*` CNAME (RUNBOOK Phase 0) makes _acme-challenge.pietrasik.top
+      # a wildcard-synthesized CNAME, which lego would follow during DNS-01 and
+      # misplace the challenge TXT (go-acme/lego#1816). Disabling CNAME follow
+      # pins the standard behavior: TXT at _acme-challenge.pietrasik.top, where
+      # the explicit record wins over the wildcard. Stable upstream option.
+      LEGO_DISABLE_CNAME_SUPPORT: "true"
     labels:
       - panel.manage=edge router # shows in the panel's Services view
     volumes:

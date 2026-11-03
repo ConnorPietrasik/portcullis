@@ -15,6 +15,14 @@ something looks off.
    created automatically by `make ddns` in Phase 2 (it needs `/opt/panel/.env`
    from `make deploy`, so it can't run earlier).
 
+   **Why the stack sets `LEGO_DISABLE_CNAME_SUPPORT=true` (traefik env in
+   `compose/docker-compose.yml`):** this CNAME makes `_acme-challenge.pietrasik.top`
+   a wildcard-synthesized CNAME, which lego (Traefik's ACME client) would follow
+   while solving DNS-01 and misplace the challenge TXT (go-acme/lego#1816).
+   With the env var set, the TXT always lands at `_acme-challenge.pietrasik.top`
+   itself, where the explicit record takes precedence over the wildcard
+   (RFC 4592) — both for issuance and every renewal. Do not remove it.
+
 That's the whole phase. The wildcard cert comes from the DNS-01 challenge,
 which needs no A records at all. `panel-ddns` keeps the apex A (`pietrasik.top`)
 current forever after, and the reconciler never touches CNAMEs, so every
@@ -322,4 +330,4 @@ If you later enable HTTP/3: add `http3: {}` to the `websecure` entryPoint in
 | Services view empty | containers lack the `panel.manage` label |
 | container action → 500 | panel-do too old for the container actions → `make panel-do`; details in `sudo journalctl -u panel-api -n 50` |
 | domain resolves to an old IP | panel-ddns failing → `journalctl -u panel-ddns`; then `sudo systemctl start panel-ddns` (missing/stale records are fixed in place) |
-| panel-api won't bind | docker not running yet (`After=docker.service`); `ip addr show docker0` missing |
+| panel-api won't bind | docker failed to start (`panel-api` does `Wants=docker.service`, so a docker *failure* surfaces here too): `systemctl status docker`, `ip addr show docker0` missing |
