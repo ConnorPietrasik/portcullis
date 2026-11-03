@@ -212,8 +212,17 @@ clients keep bearer auth, browsers get 2FA.
 
 ## Add a privileged action
 
-Edit the ACTIONS section of `panel-do/main.go` (rules in [HANDOFF.md](../panel-do/HANDOFF.md)), then `make panel-do`. The UI picks it up
-from `--list` within ~60s.
+One Go function in the ACTIONS section of `panel-do/main.go` + one registry entry, then `make panel-do`. The UI picks it up from `--list`
+within ~60s; the API needs no change. The rules are in the comment block at the top of the ACTIONS section in `main.go` (violations =
+security bug) — in short: exec only via `runCmd(ctx, "/absolute/path", …)`; args arrive pre-validated as opaque tokens and are never file
+paths; no `os.Getenv`, no network, no goroutines; separators like `--` are hardcoded inside `runCmd` calls. Before deploying, check:
+
+- [ ] `git diff` shows changes only inside the ACTIONS section
+- [ ] every `Run` calls only `runCmd` — no direct `exec.Command`, no `os.Open`/`os.Create`/`os.Getenv`, no goroutines, no network imports
+- [ ] all regexes anchored (`^…$`), arity exact, no optional/variadic args
+- [ ] no action treats an arg as a path or places an arg before a hardcoded `--`
+- [ ] timeout sane for the action; destructive ones flagged `Confirm: true`
+- [ ] `make panel-do` passes (gofmt + `go vet` checks + negative-test suite)
 
 ## Hardening checklist
 

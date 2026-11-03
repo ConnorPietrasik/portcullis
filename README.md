@@ -32,7 +32,7 @@ docker.sock — the internet-facing process gets zero docker access.
 | `setup/` | idempotent setup scripts, run in order (see below) |
 | `compose/` | the edge stack deployed to `/opt/panel` (traefik, authelia, panel UI — traefik is file-provider only) |
 | `panel-api/` | FastAPI host service → `/opt/panel-api`, run by `panel-api.service` |
-| `panel-do/` | Go whitelist dispatcher + [HANDOFF.md](panel-do/HANDOFF.md) (how to add actions safely) |
+| `panel-do/` | Go whitelist dispatcher — add actions per [RUNBOOK](docs/RUNBOOK.md#add-a-privileged-action) |
 | `ddns/` | stdlib-python systemd timer → keeps the apex NameSilo A record on the current public IP |
 | `docs/RUNBOOK.md` | phase-by-phase deploy + verify + hardening guide |
 | `docs/ARCHITECTURE.md` | why it's built this way, trust boundaries |
@@ -78,8 +78,8 @@ Never set `PANEL_DEV=1` in production — the systemd unit doesn't, and nothing 
   first, one minor at a time.
 - **New app**: compose service on `edge` + router in `compose/traefik/dynamic/` + optional Authelia rule →
   [RUNBOOK](docs/RUNBOOK.md#add-an-app)
-- **New privileged action**: edit `panel-do/main.go` ACTIONS section → `make panel-do` → [HANDOFF](panel-do/HANDOFF.md) (container control
-  is registry actions too — Services and Actions views both render from `panel-do --list`)
+- **New privileged action**: edit `panel-do/main.go` ACTIONS section → `make panel-do` → [RUNBOOK](docs/RUNBOOK.md#add-a-privileged-action)
+  (container control is registry actions too — Services and Actions views both render from `panel-do --list`)
 - **Rotate secrets**: edit `.env`, `make deploy`, `sudo systemctl restart panel-api`
 - **Logs / status**: `make logs`, `make status`
 
