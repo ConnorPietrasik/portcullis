@@ -187,6 +187,20 @@ if [[ "$code" == 401 ]]; then
 else
   bad "GET /api/metrics unauthenticated → ${code:-000} (expected 401)"
 fi
+# The REAL data path: edge container → host API. The curls above run on the
+# host itself, so they pass even when traefik's route 502s (wrong bind IP or
+# missing UFW rule for the edge subnet).
+if [[ -d /opt/panel ]] && sudo docker compose --project-directory /opt/panel ps --services --status=running 2>/dev/null | grep -qx panel-web; then
+  edge_health="$(sudo docker compose --project-directory /opt/panel exec -T panel-web \
+    wget -qO- --timeout=5 http://172.17.0.1:8010/api/health 2>/dev/null || true)"
+  if grep -q '"ok":true' <<<"$edge_health"; then
+    ok "edge container → 172.17.0.1:8010 reachable (real API path)"
+  else
+    bad "edge container cannot reach 172.17.0.1:8010 — panel /api/* will 502"; hint "UFW 8010 rule for the edge subnet (RUNBOOK → UFW); bind: sudo ss -tln | grep 8010"
+  fi
+else
+  skip "edge → API path (panel-web not running)"
+fi
 
 # ── panel-do ─────────────────────────────────────────────────────────────────
 section "panel-do (privileged dispatcher)"

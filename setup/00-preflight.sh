@@ -20,7 +20,8 @@ fi
 if command -v go >/dev/null 2>&1; then
   info "  ok: go ($(go version))"
 else
-  warn "  go not found — needed for panel-do  (pacman -S go)"
+  warn "  MISSING: go  (pacman -S go) — panel-do can't build (make stack)"
+  fail=1
 fi
 
 if command -v dig >/dev/null 2>&1; then

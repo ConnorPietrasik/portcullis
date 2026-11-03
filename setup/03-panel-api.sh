@@ -23,7 +23,9 @@ if [[ ! -x /opt/panel-api/venv/bin/python ]]; then
 fi
 info "Installing python dependencies"
 sudo -u panel /opt/panel-api/venv/bin/pip install --quiet --upgrade pip
-sudo -u panel /opt/panel-api/venv/bin/pip install --quiet -r "$REPO_ROOT/panel-api/requirements.txt"
+# Install from the copy in /opt/panel-api, not the repo: user 'panel' may not
+# be able to traverse the repo's home directory (permissions).
+sudo -u panel /opt/panel-api/venv/bin/pip install --quiet -r /opt/panel-api/requirements.txt
 
 info "Installing systemd unit"
 sudo cp -a "$REPO_ROOT/panel-api/panel-api.service" /etc/systemd/system/panel-api.service

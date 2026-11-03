@@ -144,8 +144,9 @@ Reuses `NAMESILO_API_KEY` — the same key Traefik uses for DNS-01.
 
 ```bash
 journalctl -u panel-ddns -n 50                  # what it did and when
-sudo systemctl start panel-ddns.service         # reconcile now
-sudo -u panel python3 /opt/panel-ddns/ddns.py   # manual run (same full check)
+sudo systemctl start panel-ddns.service         # reconcile now — also the manual run (the script
+                                                #   FATALs if run directly: the API key only comes
+                                                #   from the unit's EnvironmentFile)
 dig +short pietrasik.top @ns1.dnsowl.com        # what the authoritative NS says (check NS at NameSilo)
 ```
 
@@ -266,7 +267,12 @@ from `--list` within ~60s.
 
 ```bash
 sudo ufw allow 80,443/tcp comment 'traefik web'   # TCP only — 443/udp is HTTP/3, not served here
-sudo ufw allow from 172.16.0.0/12 to any port 8010 proto tcp comment 'panel-api from docker bridges'
+# 8010 is scoped to the edge network's ACTUAL subnet (source) — Docker assigns
+# it from a pool that depends on which subnets are already taken (a fresh
+# daemon starts at 172.18.0.0/16); derive, don't guess. The destination is
+# pinned to panel-api's bind IP (keep in sync with panel-api.service):
+EDGE_SUBNET=$(sudo docker network inspect edge -f '{{(index .IPAM.Config 0).Subnet}}')
+sudo ufw allow from "$EDGE_SUBNET" to ip 172.17.0.1 port 8010 proto tcp comment 'panel-api from edge network'
 sudo ufw enable && sudo ufw status verbose
 ```
 
@@ -278,7 +284,7 @@ Two gotchas:
   that way, and never publish the API beyond loopback/bridge IPs.
 - **The 8010 rule is required**, not optional: container → host traffic hits
   UFW's INPUT chain, and `default deny incoming` turns the panel into 502s.
-  Scoped to docker's bridge subnets (172.16.0.0/12), the internet can't touch it.
+  Scoped to the edge network's own subnet and to 172.17.0.1, the internet can't touch it.
 
 Verify after enabling (want: 401 JSON = reachable, not a timeout; then refused
 from outside):
@@ -299,6 +305,7 @@ If you later enable HTTP/3: add `http3: {}` to the `websecure` entryPoint in
 | cert never issues | wrong `NAMESILO_API_KEY`; DNS records missing; propagation — `make logs`, traefik container |
 | 401 loop in browser | server clock skew breaks TOTP — `timedatectl`; clear `authelia_session` cookie |
 | `/api/*` → 502 | panel-api down: `sudo systemctl status panel-api`, `sudo journalctl -u panel-api -n 50` |
+| `/api/*` → 502 only in the browser (host curls fine) | missing UFW 8010 rule for the edge subnet (RUNBOOK → UFW), or the traefik service URL in `traefik/dynamic/panel.yml` drifted from `172.17.0.1:8010` |
 | `/api/actions` → 500 | panel-do not installed or sudoers missing → `make panel-do` |
 | Services view empty | containers lack the `panel.manage` label |
 | container action → 500 | panel-do too old for the container actions → `make panel-do`; details in `sudo journalctl -u panel-api -n 50` |

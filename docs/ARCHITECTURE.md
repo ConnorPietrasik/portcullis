@@ -30,8 +30,10 @@
 **Panel UI in a container, API on the host.** The UI is static files — perfect
 container citizen, rebuilt on `docker compose up -d --build`, routed by Traefik
 like everything else. The API must run on the host: it reads GPU sysfs and
-invokes `sudo -n panel-do`. It binds `172.17.0.1` (the docker0 gateway) so edge
-containers can reach it via `host.docker.internal` but the internet can't.
+invokes `sudo -n panel-do`. It binds `172.17.0.1` (the docker0 gateway) — edge
+containers reach it by addressing that IP directly (the host is their default
+gateway and owns the IP; note `host.docker.internal` would resolve to the edge
+network's own gateway instead, where nothing listens) — but the internet can't.
 
 **Two independent gates in front of the API.** Traefik injects `X-Panel-Token`
 (from `/opt/panel/.env`) — clients can't set it, Traefik overwrites it. Authelia

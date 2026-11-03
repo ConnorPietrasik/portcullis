@@ -1,5 +1,11 @@
 # Panel routing. panel-web is reached by container DNS on the edge network;
-# panel-api is the host systemd service, reached via the docker0 bridge gateway.
+# panel-api is the host systemd service, reached via the docker0 bridge
+# gateway. The IP is explicit on purpose — NOT host.docker.internal: with a
+# `host-gateway` extra_hosts entry, that name resolves to the *edge* network's
+# own gateway (e.g. 172.18.0.1), where nothing listens; panel-api binds
+# 172.17.0.1 only.
+# Edge containers reach it fine: the host is their default gateway and owns
+# that IP.
 
 http:
   routers:
@@ -23,7 +29,7 @@ http:
     panel-api:
       loadBalancer:
         servers:
-          - url: "http://host.docker.internal:8010"
+          - url: "http://172.17.0.1:8010"
 
   middlewares:
     rate-panel:

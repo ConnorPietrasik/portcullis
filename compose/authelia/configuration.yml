@@ -30,12 +30,13 @@ access_control:
       policy: two_factor
       subject: ['group:admins'] # panel: only you
 
-    - domain: jellyfin.pietrasik.top # example: friends-only app
-      policy: two_factor
-      subject: ['group:friends']
-
-    - domain: demo.pietrasik.top # public demo — the app does its own auth
-      policy: bypass
+    # Example rules — uncomment (kept ABOVE the wildcard) when you add these
+    # apps; until then they are dead weight (a matching router doesn't exist):
+    # - domain: jellyfin.pietrasik.top # friends-only app
+    #   policy: two_factor
+    #   subject: ['group:friends']
+    # - domain: demo.pietrasik.top # public demo — the app does its own auth
+    #   policy: bypass
 
     - domain: '*.pietrasik.top' # everything else: any authenticated user
       policy: two_factor

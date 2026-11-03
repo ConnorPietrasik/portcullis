@@ -41,4 +41,4 @@ fi
 info "panel-ddns installed (timer: every 10 min + 2 min after boot)"
 echo "  status: systemctl status panel-ddns.timer"
 echo "  log:    journalctl -u panel-ddns -f"
-echo "  manual run: sudo -u panel python3 /opt/panel-ddns/ddns.py"
+echo "  manual run: sudo systemctl start panel-ddns.service"

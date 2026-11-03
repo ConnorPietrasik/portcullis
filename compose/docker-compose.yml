@@ -4,7 +4,7 @@
 # Routing (all TLS via the *.pietrasik.top wildcard cert, DNS-01 via NameSilo):
 #   pietrasik.top            → portfolio container (public, uncomment below)
 #   panel.pietrasik.top/     → panel-web (Authelia: admins)
-#   panel.pietrasik.top/api  → host API :8010 (Authelia + X-Panel-Token, via host.docker.internal)
+#   panel.pietrasik.top/api  → host API :8010 (Authelia + X-Panel-Token, via docker0 gateway 172.17.0.1)
 #   auth.pietrasik.top       → authelia portal
 #
 # Traefik runs the FILE provider only (traefik/dynamic/*.yml) — it has no
@@ -40,13 +40,12 @@ services:
     restart: unless-stopped
     logging: *default-logging
     ports: ["80:80", "443:443"]
-    extra_hosts: ["host.docker.internal:host-gateway"]
     healthcheck:
       <<: *healthcheck-opts
       test: ["CMD", "traefik", "healthcheck", "--ping"]
     environment:
       NAMESILO_API_KEY: ${NAMESILO_API_KEY}
-      NAMESILO_PROPAGATION_TIMEOUT: ${NAMESILO_PROPAGATION_TIMEOUT:-30m} # NameSilo TTLs are slow; keep this
+      NAMESILO_PROPAGATION_TIMEOUT: ${NAMESILO_PROPAGATION_TIMEOUT:-1800} # NameSilo TTLs are slow; keep this high (seconds!)
     labels:
       - panel.manage=edge router # shows in the panel's Services view
     volumes:
