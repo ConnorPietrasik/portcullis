@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Build panel-do (privileged action dispatcher), install it immutable, set up sudoers,
-# and run the negative-test suite from the design doc.
+# Build panel-do (privileged action dispatcher), install it (root-owned, 0755),
+# set up sudoers, and run the negative-test suite from the design doc.
 set -euo pipefail
 source "$(dirname "$(realpath "$0")")/common.sh"
 need go
@@ -20,9 +20,9 @@ info "Building panel-do"
 )
 
 info "Installing to /usr/local/libexec/panel-do"
-sudo chattr -i /usr/local/libexec/panel-do 2>/dev/null || true
+# Protection is root ownership + 0755 (panel-do's self-check re-verifies both
+# on every run). No immutable flag — btrfs/overlayfs don't support it.
 sudo install -o root -g root -m 0755 "$REPO_ROOT/panel-do/panel-do" /usr/local/libexec/panel-do
-sudo chattr +i /usr/local/libexec/panel-do
 
 info "Installing sudoers rule (/etc/sudoers.d/panel)"
 tmp="$(mktemp)"

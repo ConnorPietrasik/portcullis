@@ -62,7 +62,7 @@ min of detection plus 1 h of resolver caching.
 
 **Privileged actions through a compiled dispatcher.** `panel-do` is a small Go binary: hardcoded action registry, central arg validation
 (arity, printable ASCII, no leading `-`, no path separators, per-action anchored regexes), no shell, scrubbed env, per-action timeout,
-root-owned + `chattr +i`, audit logs to journald. The sudoers rule grants `panel` exactly one command. The UI renders whatever
+root-owned + `0755`, audit logs to journald. The sudoers rule grants `panel` exactly one command. The UI renders whatever
 `panel-do --list` reports, so the registry can never drift from what the binary enforces. See [panel-do/HANDOFF.md](../panel-do/HANDOFF.md).
 
 **Authelia groups.** `admins` (you) → panel; `friends` → e.g. Jellyfin; public demos bypass Authelia entirely and do their own auth;

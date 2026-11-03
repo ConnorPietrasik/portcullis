@@ -85,7 +85,7 @@ dashboard shell (API calls will fail until Phases 3–4 are done — expected).
 make panel-do
 ```
 
-The script builds (`gofmt`/`go vet` checked), installs to `/usr/local/libexec/panel-do` (`chattr +i`), writes `/etc/sudoers.d/panel`, and
+The script builds (`gofmt`/`go vet` checked), installs to `/usr/local/libexec/panel-do` (root-owned, `0755`), writes `/etc/sudoers.d/panel`, and
 runs the negative-test suite (unknown action → 64, path/flag injection → 65). Re-run any time after editing `panel-do/main.go` — it's
 idempotent.
 

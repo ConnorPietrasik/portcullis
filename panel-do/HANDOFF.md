@@ -46,7 +46,6 @@ Manual equivalent:
 cd panel-do && go vet ./... && gofmt -l .   # must be clean
 go build -trimpath -ldflags="-s -w" -o panel-do .
 sudo install -o root -g root -m 0755 panel-do /usr/local/libexec/panel-do
-sudo chattr +i /usr/local/libexec/panel-do
 ```
 
 sudoers (`/etc/sudoers.d/panel`, installed by the script):
