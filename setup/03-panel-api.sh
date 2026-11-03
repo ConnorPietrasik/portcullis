@@ -10,6 +10,33 @@ load_env
 
 [[ -f /opt/panel/.env ]] || die "/opt/panel/.env missing — run: make deploy (panel-api.service reads PANEL_TOKEN from it)"
 
+# ── UFW gate ─────────────────────────────────────────────────────────────────
+# panel-api binds 172.17.0.1:8010. UFW must already scope 8010 to the edge
+# subnet BEFORE this listener exists (RUNBOOK → UFW) — otherwise the API is
+# reachable from the WAN for the window until the firewall lands.
+if ! command -v ufw >/dev/null 2>&1; then
+  die "ufw missing (pacman -S ufw) — required before panel-api (RUNBOOK → UFW)"
+fi
+ufw_status="$(sudo ufw status 2>/dev/null || true)"
+if ! grep -q "Status: active" <<<"$ufw_status"; then
+  die "UFW inactive — add the 80,443 + 8010 rules and enable it (RUNBOOK → UFW) before panel-api, then re-run"
+fi
+# The 8010 rule must be edge-scoped: a "From: Anywhere" rule would leave the
+# API WAN-reachable — exactly what the scoping exists to prevent.
+# NOTE: `ufw status` renders the RUNBOOK's destination-scoped rule with the
+# destination IP FIRST in the To column ("172.17.0.1 8010/tcp  ALLOW
+# 172.18.0.0/16" — no /32: ufw normalizes host addresses away), and a rule
+# added without an explicit proto has no /tcp suffix at all, so match "8010"
+# anywhere in the line, never ^8010.
+rules_8010="$(grep '8010' <<<"$ufw_status" || true)"
+if [[ -z "$rules_8010" ]]; then
+  die "UFW active but no 8010 rule — add the edge-scoped rule (RUNBOOK → UFW), then re-run; panel-api must not bind without it"
+fi
+if grep -q 'Anywhere' <<<"$rules_8010"; then
+  die "8010 rule not edge-scoped (From: Anywhere) — the API would be WAN-reachable; re-add it per RUNBOOK → UFW, then re-run"
+fi
+info "UFW active with the edge-scoped 8010 rule — safe to bind 172.17.0.1:8010"
+
 ensure_panel_user
 
 info "Installing panel-api to /opt/panel-api"

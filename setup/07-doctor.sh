@@ -240,10 +240,16 @@ if command -v ufw >/dev/null 2>&1; then
     else
       warn "80,443/tcp rule missing"; hint "RUNBOOK → UFW (docker-published ports bypass ufw — belt-and-suspenders)"
     fi
-    if grep -q "8010" <<<"$ufw_status"; then
-      ok "8010 bridge-scoped rule present"
-    else
+    # `ufw status` renders the destination-scoped rule as "172.17.0.1 8010/tcp"
+    # (no /32; a rule without an explicit proto has no /tcp suffix), so match
+    # "8010" anywhere in the line, never ^8010.
+    rules_8010="$(grep '8010' <<<"$ufw_status" || true)"
+    if [[ -z "$rules_8010" ]]; then
       bad "no 8010 rule — container→host API calls will 502"; hint "RUNBOOK → UFW: derive the edge subnet and add the rule (required)"
+    elif grep -q 'Anywhere' <<<"$rules_8010"; then
+      bad "8010 rule not edge-scoped (From: Anywhere) — API is WAN-reachable"; hint "RUNBOOK → UFW: re-add it scoped to the edge subnet"
+    else
+      ok "8010 rule present and edge-scoped"
     fi
   else
     bad "UFW not active"; hint "required on this host — RUNBOOK → UFW (add the 80,443 + 8010 rules, then sudo ufw enable)"

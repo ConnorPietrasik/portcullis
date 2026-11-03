@@ -21,6 +21,19 @@ for c in docker openssl curl python3 git; do
   if command -v "$c" >/dev/null 2>&1; then info "  ok: $c"; else warn "  MISSING: $c"; fail=1; fi
 done
 
+# panel-api installs a virtualenv — Arch needs python3-venv for that.
+# Test a real creation (ensurepip included), not just module presence.
+if command -v python3 >/dev/null 2>&1; then
+  venv_test="$(mktemp -d)"
+  if python3 -m venv "$venv_test" >/dev/null 2>&1; then
+    info "  ok: python3 -m venv (panel-api's venv step)"
+  else
+    warn "  MISSING: python3-venv (pacman -S python3-venv) — panel-api install will fail at the venv step"
+    fail=1
+  fi
+  rm -rf "$venv_test"
+fi
+
 if docker compose version >/dev/null 2>&1; then
   info "  ok: docker compose plugin"
 else
@@ -31,7 +44,7 @@ fi
 if command -v go >/dev/null 2>&1; then
   info "  ok: go ($(go version))"
 else
-  warn "  MISSING: go  (pacman -S go) — panel-do can't build (make stack)"
+  warn "  MISSING: go  (pacman -S go) — panel-do can't build (make panel-do)"
   fail=1
 fi
 
@@ -96,6 +109,25 @@ if command -v ss >/dev/null 2>&1; then
     echo "$listeners" | sed 's/^/      /'
   else
     info "  ok: ports 80/443 free"
+  fi
+fi
+
+# panel.yml (traefik route) + panel-api.service (bind) hardcode 172.17.0.1 —
+# the docker0 gateway. A non-default bridge = a "successful" deploy whose
+# /api 502s forever. Fail when docker0 is up with the wrong IP; when docker
+# isn't started yet (fresh host, Phase 1), just flag it for a re-check.
+if command -v ip >/dev/null 2>&1; then
+  if ip -4 addr show docker0 >/dev/null 2>&1; then
+    if ip -4 -o addr show docker0 | awk '{print $4}' | grep -q '^172\.17\.0\.1/'; then
+      info "  ok: docker0 is 172.17.0.1 (panel API bind/route IP)"
+    else
+      warn "  WRONG: docker0 is not 172.17.0.1 — panel.yml + panel-api.service hardcode it:"
+      ip -4 -o addr show docker0 | awk '{print "      " $4}'
+      echo "      fix: set daemon.json 'bip' to 172.17.0.0/16 (+ restart docker), or update every hardcoded 172.17.0.1 ref together (panel.yml, panel-api.service, 07-doctor.sh, RUNBOOK)"
+      fail=1
+    fi
+  else
+    info "  docker0 absent (docker not started?) — it must be 172.17.0.1 (panel API IP); re-check once docker is up"
   fi
 fi
 

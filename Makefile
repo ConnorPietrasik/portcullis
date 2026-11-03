@@ -22,12 +22,14 @@ ddns:
 promote:
 	bash setup/06-acme-promote.sh
 
-## stack = full server install, in dependency order
+## stack = the README quickstart sequence (phases 2–4, RUNBOOK order) in one
+## shot, for RE-RUNS. First deploy follows the RUNBOOK step by step so UFW
+## lands between deploy and api (make api is gated on it and stops the chain).
 stack:
 	bash setup/02-deploy-stack.sh
+	bash setup/05-ddns.sh
 	bash setup/04-panel-do.sh
 	bash setup/03-panel-api.sh
-	bash setup/05-ddns.sh
 
 status:
 	cd /opt/panel && sudo docker compose ps

@@ -1,10 +1,9 @@
 # portcullis
 
-Home-server admin panel: AMD temps/usage dials, container control, whitelisted
-privileged actions — behind Traefik + Authelia 2FA.
+Home-server admin panel: AMD temps/usage dials, container control, whitelisted privileged actions — behind Traefik + Authelia 2FA.
 
-*The name is the architecture: one gated entrance to the host (Traefik), one
-privileged path through it (`panel-do`), everything else default-deny.*
+*The name is the architecture: one gated entrance to the host (Traefik), one privileged path through it (`panel-do`), everything else
+default-deny.*
 
 ```
 Traefik ─┬─ pietrasik.top            → portfolio container (public)
@@ -40,20 +39,25 @@ docker.sock — the internet-facing process gets zero docker access.
 
 ## Quickstart (on the server)
 
+**[docs/RUNBOOK.md](docs/RUNBOOK.md) is the deploy guide — follow it in order** (phase 0 is manual DNS prep; phase 5 is the final check from
+an external network). It is the single source of truth for the sequence, so this section is an orientation, not a second copy:
+
+- Phase 0 is manual: NameSilo API key + the one-time `*` CNAME → `pietrasik.top`.
+- **UFW is a required step between `make deploy` and `make api`** (RUNBOOK → UFW). `make api` refuses to run until it is in place, so the
+  ordering can't be skipped by accident — but do it in the window, not after.
+
 ```bash
-make preflight        # check tooling (docker, compose, go, …)
-make secrets          # generate .env, then edit: NAMESILO_API_KEY (ACME_EMAIL pre-filled)
-                      # (.env starts on LE *staging*; deploy auto-flips to prod once
-                      # the staging cert issues — see RUNBOOK Phase 2)
-# edit compose/authelia/users_database.yml — argon2 hashes for your users
-make stack            # deploy edge stack → panel-do → panel-api → panel-ddns (apex A self-creates)
-make doctor           # verify the whole stack — pass/fail per layer (read-only)
+make preflight   # phase 1: host tooling
+make secrets     # phase 1: .env (then fill NAMESILO_API_KEY + users_database.yml)
+make deploy      # phase 2: edge stack → /opt/panel (staging cert → auto-promotes to prod)
+make ddns        # phase 2: apex A record self-creates
+make panel-do    # phase 3: privileged dispatcher
+make api         # phase 4: host API (gated on UFW)
+make doctor      # any time: whole-stack pass/fail report (read-only)
 ```
 
-Then per [docs/RUNBOOK.md](docs/RUNBOOK.md): make sure the `*.pietrasik.top`
-CNAME → `pietrasik.top` exists (one-time, manual), watch `make logs` for the
-wildcard cert, log in at
-`https://auth.pietrasik.top` (first login registers TOTP), open
+`make stack` = `deploy` → `ddns` → `panel-do` → `api` (phases 2–4, in order) in one shot, for **re-runs**; the first deploy follows the
+RUNBOOK step by step so UFW lands in the window. First login: `https://auth.pietrasik.top` (registers TOTP), then
 `https://panel.pietrasik.top`.
 
 ## Local dev (no deploy)
@@ -65,14 +69,17 @@ cd /opt/panel-api && PANEL_DEV=1 venv/bin/uvicorn main:app --port 8010   # ⚠ a
 cd compose/panel-frontend && npm ci && npm run dev   # vite proxies /api → localhost:8010
 ```
 
-Never set `PANEL_DEV=1` in production — the systemd unit doesn't, and nothing
-else should.
+Never set `PANEL_DEV=1` in production — the systemd unit doesn't, and nothing else should.
 
 ## Day-2 ops
 
-- **Patch updates**: images are pinned at the *minor* line (`traefik:v3.7`, `authelia:4.39`, `nginx:1.31`) — `make deploy` pulls the latest patch (security/bugfixes) within each line. Minor bumps are deliberate edits to `compose/docker-compose.yml` — read the release notes first, one minor at a time.
-- **New app**: compose service on `edge` + router in `compose/traefik/dynamic/` + optional Authelia rule → [RUNBOOK](docs/RUNBOOK.md#add-an-app)
-- **New privileged action**: edit `panel-do/main.go` ACTIONS section → `make panel-do` → [HANDOFF](panel-do/HANDOFF.md) (container control is registry actions too — Services and Actions views both render from `panel-do --list`)
+- **Patch updates**: images are pinned at the *minor* line (`traefik:v3.7`, `authelia:4.39`, `nginx:1.31`) — `make deploy` pulls the latest
+  patch (security/bugfixes) within each line. Minor bumps are deliberate edits to `compose/docker-compose.yml` — read the release notes
+  first, one minor at a time.
+- **New app**: compose service on `edge` + router in `compose/traefik/dynamic/` + optional Authelia rule →
+  [RUNBOOK](docs/RUNBOOK.md#add-an-app)
+- **New privileged action**: edit `panel-do/main.go` ACTIONS section → `make panel-do` → [HANDOFF](panel-do/HANDOFF.md) (container control
+  is registry actions too — Services and Actions views both render from `panel-do --list`)
 - **Rotate secrets**: edit `.env`, `make deploy`, `sudo systemctl restart panel-api`
 - **Logs / status**: `make logs`, `make status`
 
