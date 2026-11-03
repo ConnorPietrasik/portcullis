@@ -101,7 +101,9 @@ acme_promote() { # <target-dir> — flip staging→prod. Idempotent; wipes the A
   # (stop → wipe → up) down to two compose commands.
   sudo sed -i "s|$ACME_STAGING_URL|$ACME_PROD_URL|g" "$target/traefik/traefik.yml"
   if [[ -f "$REPO_ROOT/.env" ]]; then
-    sed -i "s|$ACME_STAGING_URL|$ACME_PROD_URL|g" "$REPO_ROOT/.env"
+    # Anchor to the assignment line — a global s/// would also rewrite the
+    # staging/prod URLs in the .env comment block, corrupting that doc.
+    sed -i "s|^ACME_CA_SERVER=.*|ACME_CA_SERVER=${ACME_PROD_URL}|" "$REPO_ROOT/.env"
     sudo install -m 600 "$REPO_ROOT/.env" "$target/.env"
   fi
 

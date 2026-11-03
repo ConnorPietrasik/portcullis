@@ -59,10 +59,14 @@ def require_admin(
     x_panel_token: Optional[str] = Header(default=None),
     remote_user: Optional[str] = Header(default=None),
     remote_groups: Optional[str] = Header(default=None),
-) -> None:
-    """FastAPI dependency: Traefik token + Authelia identity, both re-checked."""
+) -> Optional[str]:
+    """FastAPI dependency: Traefik token + Authelia identity, both re-checked.
+
+    Returns the authenticated username (None in dev mode) so the privileged
+    endpoints can record it in their audit line.
+    """
     if DEV_MODE:
-        return
+        return None
     if not PANEL_TOKEN or not x_panel_token or not secrets.compare_digest(
         x_panel_token.encode(), PANEL_TOKEN.encode()
     ):
@@ -71,6 +75,7 @@ def require_admin(
         raise HTTPException(401, "missing Remote-User (forward-auth bypass attempt?)")
     if "admins" not in set(GROUP_SPLIT_RE.split(remote_groups or "")):
         raise HTTPException(403, "admins only")
+    return remote_user
 
 
 # ──────────────────────────── metrics ────────────────────────────
@@ -212,7 +217,7 @@ def uptime_s() -> Optional[float]:
 
 
 @app.get("/api/metrics")
-def metrics(_admin: None = Depends(require_admin)) -> dict[str, Any]:
+def metrics(_admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
     return {
         "ts": int(time.time()),
         "gpus": amd_gpus(),
@@ -305,8 +310,30 @@ def invalidate_containers_cache() -> None:
     _containers_cache["data"] = None
 
 
+def _err_detail(proc: subprocess.CompletedProcess) -> str:
+    """One-line failure detail: last stderr line, or the exit code."""
+    err_lines = proc.stderr.strip().splitlines()
+    return err_lines[-1] if err_lines else f"exit {proc.returncode}"
+
+
+def _audit(user: Optional[str], action: str, args: list[str], result: int | str, err: str = "") -> None:
+    """One journal line per privileged invocation (stdout → journald).
+
+    sudo's own log only says *panel* ran the command; this records which
+    Authelia user triggered it and the outcome — `journalctl -u panel-api`
+    is the audit trail. On failure, `err` appends the one-line detail.
+    """
+    line = (
+        f"panel-api: audit user={user or 'dev'} action={action} "
+        f"args={args!r} result={result}"
+    )
+    if err:
+        line += f" err={err[:500]}"
+    print(line, flush=True)
+
+
 @app.get("/api/containers")
-def containers(_admin: None = Depends(require_admin)) -> dict[str, Any]:
+def containers(_admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
     managed = [
         _container_view(x)
         for x in containers_cached()
@@ -316,7 +343,7 @@ def containers(_admin: None = Depends(require_admin)) -> dict[str, Any]:
 
 
 @app.post("/api/containers/{cid}/{action}")
-def container_action(cid: str, action: str, _admin: None = Depends(require_admin)) -> dict[str, Any]:
+def container_action(cid: str, action: str, _admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
     if action not in CONTAINER_VERBS:
         raise HTTPException(400, f"action must be one of {sorted(CONTAINER_VERBS)}")
     if not CID_RE.match(cid):
@@ -327,15 +354,18 @@ def container_action(cid: str, action: str, _admin: None = Depends(require_admin
     try:
         proc = _sudo_panel_do(name, [cid], timeout)
     except subprocess.TimeoutExpired as e:
+        _audit(_admin, name, [cid], "timeout")
         raise HTTPException(504, "action timed out") from e
     except OSError as e:
+        _audit(_admin, name, [cid], "spawn-error")
         raise HTTPException(500, f"sudo failed: {e}") from e
     finally:
         invalidate_containers_cache()
     if proc.returncode == 0:
+        _audit(_admin, name, [cid], 0)
         return {"ok": True}
-    err_lines = proc.stderr.strip().splitlines()
-    detail = err_lines[-1] if err_lines else f"exit {proc.returncode}"
+    detail = _err_detail(proc)
+    _audit(_admin, name, [cid], proc.returncode, detail)
     raise HTTPException(502, detail)
 
 
@@ -368,7 +398,7 @@ def panel_do_actions() -> list[dict[str, Any]]:
 
 
 @app.get("/api/actions")
-def actions(_admin: None = Depends(require_admin)) -> dict[str, Any]:
+def actions(_admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
     return {"actions": panel_do_actions()}
 
 
@@ -377,7 +407,7 @@ class ActionBody(BaseModel):
 
 
 @app.post("/api/action/{name}")
-def run_action(name: str, body: ActionBody, _admin: None = Depends(require_admin)) -> dict[str, Any]:
+def run_action(name: str, body: ActionBody, _admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
     # Light sanity checks here (panel-do re-validates authoritatively).
     if not ACTION_NAME_RE.match(name):
         raise HTTPException(400, "bad action name")
@@ -393,9 +423,13 @@ def run_action(name: str, body: ActionBody, _admin: None = Depends(require_admin
     try:
         proc = _sudo_panel_do(name, body.args, timeout)
     except subprocess.TimeoutExpired as e:
+        _audit(_admin, name, body.args, "timeout")
         raise HTTPException(504, "action timed out") from e
     except OSError as e:
+        _audit(_admin, name, body.args, "spawn-error")
         raise HTTPException(500, f"sudo failed: {e}") from e
+    err = _err_detail(proc) if proc.returncode else ""
+    _audit(_admin, name, body.args, proc.returncode, err)
     invalidate_containers_cache()  # e.g. prune-docker removes stopped containers
     return {
         "ok": proc.returncode == 0,
