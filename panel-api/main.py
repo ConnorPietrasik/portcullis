@@ -23,6 +23,7 @@ import glob
 import json
 import os
 import re
+import secrets
 import subprocess
 import time
 from pathlib import Path
@@ -62,7 +63,9 @@ def require_admin(
     """FastAPI dependency: Traefik token + Authelia identity, both re-checked."""
     if DEV_MODE:
         return
-    if not PANEL_TOKEN or not x_panel_token or x_panel_token != PANEL_TOKEN:
+    if not PANEL_TOKEN or not x_panel_token or not secrets.compare_digest(
+        x_panel_token.encode(), PANEL_TOKEN.encode()
+    ):
         raise HTTPException(401, "bad or missing X-Panel-Token")
     if not remote_user:
         raise HTTPException(401, "missing Remote-User (forward-auth bypass attempt?)")

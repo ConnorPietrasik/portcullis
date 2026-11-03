@@ -29,6 +29,7 @@ set "@,*" only if the wildcard is ever an A record).
 
 from __future__ import annotations
 
+import http.client
 import os
 import re
 import subprocess
@@ -87,8 +88,28 @@ def api(key: str, op: str, **params: object) -> ET.Element:
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             root = ET.parse(r).getroot()
-    except (OSError, ET.ParseError) as e:
-        die(f"{op}: request failed: {e}")
+    except ET.ParseError:
+        die(f"{op}: response was not well-formed XML")
+    except http.client.HTTPException as e:
+        # Wire-level HTTP errors from the socket read — BadStatusLine,
+        # RemoteDisconnected, IncompleteRead, … (a body truncated mid-XML
+        # usually surfaces as the ParseError above, since ET.parse reads in
+        # bounded chunks that return partial data rather than raising).
+        # Only the exception type is surfaced; the request URL (which carries
+        # the API key) is never part of any message we log.
+        die(f"{op}: malformed HTTP response ({type(e).__name__})")
+    except OSError as e:
+        # Structured error text, never str(e): an HTTPError's reason is a
+        # server-controlled status phrase (plain string), a connection
+        # error's reason is the underlying socket/SSL/gai exception. Only the
+        # exception-object reasons are surfaced; the request URL (which carries
+        # the API key) is never part of any message we log.
+        status = getattr(e, "code", None)
+        reason = getattr(e, "reason", None)
+        reason = str(reason) if isinstance(reason, BaseException) else ""
+        detail = (f"HTTP {status}" if status is not None
+                  else f"network error ({reason or type(e).__name__})")
+        die(f"{op}: request failed ({detail})")
     reply = root.find("reply")
     if reply is None:
         die(f"{op}: malformed response (no <reply> element)")
@@ -143,11 +164,17 @@ def reconcile(key: str, ip: str) -> int:
             if (rr.findtext("type") or "").strip().upper() == "A"
             and rel_host(rr.findtext("host") or "") == want_rel
         ]
-        # Apex: omit rrhost entirely — NameSilo documents leaving the parameter
-        # off for the root domain; an explicit empty value is an untested edge.
-        rrhost = want_rel or None
+        # Apex: send rrhost=@ for the root domain. The docs only show the
+        # subdomain form and are silent on apex handling; @ is what
+        # ddns-go's NameSilo provider sends on both add and update (its
+        # record matching expects dnsListRecords to return @ for the apex),
+        # so it's the best-attested form for both calls below.
+        rrhost = want_rel or "@"
         if not mine:
-            api(key, "dnsAddRecord", rrhost=rrhost, rrvalue=ip, rrttl=str(TTL))
+            # rrtype is a documented dnsAddRecord parameter (A/AAAA/CNAME/
+            # MX/TXT/SRV/CAA) that every public NameSilo implementation
+            # passes, so pin it explicitly rather than rely on a default.
+            api(key, "dnsAddRecord", rrtype="A", rrhost=rrhost, rrvalue=ip, rrttl=str(TTL))
             log(f"created A {full_host(h)} -> {ip}")
             changes += 1
             continue

@@ -229,20 +229,27 @@ else
 fi
 
 # ── firewall ─────────────────────────────────────────────────────────────────
-section "firewall (ufw — warn-only)"
-if command -v ufw >/dev/null 2>&1 && sudo ufw status 2>/dev/null | grep -q "Status: active"; then
-  if sudo ufw status 2>/dev/null | grep -q "80,443/tcp"; then
-    ok "80,443/tcp allowed"
+# UFW is REQUIRED on this host (no firewalld/iptables fallback): the edge→API
+# path and the host's public exposure both depend on it.
+section "firewall (ufw — required)"
+if command -v ufw >/dev/null 2>&1; then
+  ufw_status="$(sudo ufw status 2>/dev/null || true)"
+  if grep -q "Status: active" <<<"$ufw_status"; then
+    if grep -q "80,443/tcp" <<<"$ufw_status"; then
+      ok "80,443/tcp allowed"
+    else
+      warn "80,443/tcp rule missing"; hint "RUNBOOK → UFW (docker-published ports bypass ufw — belt-and-suspenders)"
+    fi
+    if grep -q "8010" <<<"$ufw_status"; then
+      ok "8010 bridge-scoped rule present"
+    else
+      bad "no 8010 rule — container→host API calls will 502"; hint "RUNBOOK → UFW: derive the edge subnet and add the rule (required)"
+    fi
   else
-    warn "80,443/tcp rule missing"; hint "RUNBOOK → UFW"
-  fi
-  if sudo ufw status 2>/dev/null | grep -q "8010"; then
-    ok "8010 bridge-scoped rule present"
-  else
-    warn "no 8010 rule — container→host API calls will 502"; hint "RUNBOOK → UFW (this rule is required)"
+    bad "UFW not active"; hint "required on this host — RUNBOOK → UFW (add the 80,443 + 8010 rules, then sudo ufw enable)"
   fi
 else
-  skip "ufw not active (docker-published ports bypass it anyway — RUNBOOK → UFW)"
+  bad "UFW not installed"; hint "required on this host — pacman -S ufw, then RUNBOOK → UFW (add the 80,443 + 8010 rules, then sudo ufw enable)"
 fi
 
 # ── audit trail ──────────────────────────────────────────────────────────────

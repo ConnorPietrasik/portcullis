@@ -24,7 +24,7 @@ re-create it by hand.
 ## Phase 1 — Tooling + secrets
 
 ```bash
-make preflight      # docker, compose plugin, go, python3, ports 80/443 free
+make preflight      # docker, compose plugin, go, ufw, python3, ports 80/443 free
 make secrets        # writes .env (chmod 600)
 ```
 
@@ -55,6 +55,14 @@ make ddns           # installs panel-ddns (needs /opt/panel/.env) — apex A sel
 make logs           # watch: traefik acme lines = cert issuance (NameSilo TTLs are slow — minutes, not seconds)
 sudo docker compose --project-directory /opt/panel logs authelia | grep -i error
 ```
+
+**UFW (required step — do it now)** — configure it before `panel-api` exists:
+`make deploy` just created the `edge` network the 8010 rule is scoped to, and
+enabling UFW now — before `panel-api` binds 8010 in Phase 4 — means 8010 is
+never reachable from outside the edge subnet, even briefly. Commands at
+[UFW](#ufw-required); note the 401-JSON verify there only passes once
+`panel-api` is up (Phase 4). `make doctor` fails while UFW is inactive or the
+8010 rule is missing.
 
 **First bring-up runs on the staging ACME directory** (`.env.example` defaults
 `ACME_CA_SERVER` to it): debugging the NameSilo DNS-01 dance against production
@@ -255,15 +263,19 @@ from `--list` within ~60s.
       (skip if `/var/log/journal` already exists).
 - [ ] SSD trim: `sudo systemctl enable --now fstrim.timer` (weekly; HDDs don't
       need it).
-- [ ] UFW configured per [UFW](#ufw-if-you-use-it) below — only 80/443 public; `172.17.0.1:8010` never reachable externally.
+- [ ] UFW active and configured per [UFW](#ufw-required) below — **required on
+      this host** (no firewalld/iptables fallback); only 80/443 public; `172.17.0.1:8010`
+      never reachable externally.
 - [ ] No container mounts `/var/run/docker.sock` — not even `:ro` (a ro-mounted socket still grants full Docker API access). Traefik runs the file provider precisely so it needs none.
-- [ ] If firewalld is active instead, the equivalent is needed: allow docker subnets → host :8010.
 - [ ] `chmod 600 /opt/panel/.env /opt/panel/traefik/dynamic/middlewares.yml` (deploy script does this — verify after manual edits).
 - [ ] CrowdSec + Traefik bouncer plugin (optional, later).
 - [ ] SSH keys-only as break-glass access.
 - [ ] Backups: `/opt/panel/.env`, `compose/` (this repo), Authelia `/opt/panel/authelia/` (config + `db.sqlite3` — TOTP seeds!), the `acme` docker volume, and this git repo.
 
-## UFW (if you use it)
+## UFW (required)
+
+This host always runs UFW — it is a mandatory deploy step (Phase 2), not an
+option; `make doctor` fails while it is inactive or the 8010 rule is missing.
 
 ```bash
 sudo ufw allow 80,443/tcp comment 'traefik web'   # TCP only — 443/udp is HTTP/3, not served here

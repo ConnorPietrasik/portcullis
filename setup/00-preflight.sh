@@ -6,6 +6,17 @@ source "$(dirname "$(realpath "$0")")/common.sh"
 info "Panel preflight — checking host tooling"
 fail=0
 
+# Sudo first: cache credentials up front so the ufw check below doesn't
+# prompt mid-list, and know whether sudo-based queries are trustworthy.
+sudo_ok=0
+if sudo -v 2>/dev/null; then
+  info "  ok: sudo available"
+  sudo_ok=1
+else
+  warn "  MISSING: sudo  (pacman -S sudo) — required; every deploy/doctor step calls sudo"
+  fail=1
+fi
+
 for c in docker openssl curl python3 git; do
   if command -v "$c" >/dev/null 2>&1; then info "  ok: $c"; else warn "  MISSING: $c"; fail=1; fi
 done
@@ -24,6 +35,24 @@ else
   fail=1
 fi
 
+if command -v ufw >/dev/null 2>&1; then
+  info "  ok: ufw (required firewall)"
+  ufw_state=""
+  if (( sudo_ok )); then
+    ufw_state="$(sudo ufw status 2>/dev/null | grep '^Status:' || true)"
+  fi
+  if [[ "$ufw_state" == "Status: active" ]]; then
+    info "  ok: ufw active"
+  elif [[ -n "$ufw_state" ]]; then
+    info "  ufw not active yet — enable it in Phase 2 (RUNBOOK → UFW)"
+  else
+    info "  ufw state unknown (needs working sudo) — enable it in Phase 2 (RUNBOOK → UFW)"
+  fi
+else
+  warn "  MISSING: ufw  (pacman -S ufw) — required; the deploy depends on it"
+  fail=1
+fi
+
 if command -v dig >/dev/null 2>&1; then
   info "  ok: dig (panel-ddns detects the public IP with it)"
 else
@@ -38,12 +67,6 @@ fi
 
 if [[ $EUID -eq 0 ]]; then
   warn "Running as root. Scripts use sudo internally; prefer a regular sudo-capable user."
-fi
-
-if sudo -v 2>/dev/null; then
-  info "  ok: sudo available"
-else
-  warn "  sudo unavailable — setup scripts need it"
 fi
 
 if command -v systemctl >/dev/null 2>&1; then
