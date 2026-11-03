@@ -2,8 +2,8 @@
 
 Phase-by-phase deploy with a verification step after each. Each phase is independently testable — if something breaks, you know which layer.
 
-On the server, `make doctor` runs every check below as a single pass/fail report (read-only) — handy after any phase, after `make deploy`,
-or whenever something looks off.
+On the server, `make doctor` runs every server-side check below as a single pass/fail report (read-only) — handy after any phase,
+after `make deploy`, or whenever something looks off. (Phase 5 is by definition from an external network, so it stays manual.)
 
 ## Phase 0 — NameSilo DNS prep (one-time, manual)
 
@@ -226,8 +226,9 @@ paths; no `os.Getenv`, no network, no goroutines; separators like `--` are hardc
 
 ## Hardening checklist
 
-- [ ] Repo under version control (`git init && git add -A && git commit`) — `.gitignore` already keeps `.env`, built binaries, and caches
-  out. Do this before the first deploy so there's a rollback point.
+- [ ] The clone stays the source of truth — edit tracked files in the repo (commit before `make deploy` for a rollback point),
+  never hand-edit the deployed copies: deploys sync repo → `/opt/panel` one-way (stale managed traefik configs get pruned).
+  `.gitignore` already keeps `.env`, built binaries, and caches out of git.
 - [ ] Persistent journald — panel-do's audit trail lives there: `sudo mkdir -p /var/log/journal && sudo systemctl restart systemd-journald`
   (skip if `/var/log/journal` already exists).
 - [ ] SSD trim: `sudo systemctl enable --now fstrim.timer` (weekly; HDDs don't need it).
