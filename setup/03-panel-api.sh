@@ -57,7 +57,13 @@ sudo -u panel /opt/panel-api/venv/bin/pip install --quiet -r /opt/panel-api/requ
 info "Installing systemd unit"
 sudo cp -a "$REPO_ROOT/panel-api/panel-api.service" /etc/systemd/system/panel-api.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now panel-api
+# enable + explicit restart (not `enable --now`): on a re-run after editing
+# main.py the unit is already active, so `start` would be a no-op — the running
+# uvicorn keeps serving the old code while the is-active check below reports
+# success. `restart` always stop-then-starts, picking up the new file (and any
+# deps pip just upgraded under it).
+sudo systemctl enable panel-api
+sudo systemctl restart panel-api
 
 sleep 1
 if systemctl is-active --quiet panel-api; then

@@ -27,7 +27,12 @@ info "Installing systemd units"
 sudo install -o root -g root -m 0644 \
   "$REPO_ROOT/ddns/panel-ddns.service" "$REPO_ROOT/ddns/panel-ddns.timer" /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now panel-ddns.timer
+# restart the timer (not `enable --now`): daemon-reload above re-arms a valid
+# new schedule, but a timer left broken by a bad schedule edit only recovers
+# via stop + start (systemd#16578) — `start` alone is a no-op on an active
+# timer, and doesn't recover a broken one.
+sudo systemctl enable panel-ddns.timer
+sudo systemctl restart panel-ddns.timer
 
 info "Running one reconcile now (creates the apex A record if missing)"
 if sudo systemctl start panel-ddns.service; then # Type=oneshot: start blocks until done
