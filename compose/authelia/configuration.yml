@@ -28,7 +28,14 @@ access_control:
 
     - domain: panel.pietrasik.top
       policy: two_factor
-      subject: ['group:admins'] # panel: only you
+      subject: ['group:admins'] # panel: only you — enforced by the deny rule
+                                # below (a subject rule only MATCHES admins, it
+                                # does not exclude everyone else)
+
+    - domain: panel.pietrasik.top
+      policy: deny # everyone else: without this catch-all, non-admins fall
+                   # through to the *.pietrasik.top wildcard below and are
+                   # admitted after 2FA (UI shell; the API still 403s them)
 
     # Example rules — uncomment (kept ABOVE the wildcard) when you add these
     # apps; until then they are dead weight (a matching router doesn't exist):
