@@ -179,8 +179,9 @@ http:
 ```
 
 `make deploy` (syncs configs + `docker compose up -d`). Default policy: any authenticated user. Add an Authelia rule in
-`compose/authelia/configuration.yml` **above the wildcard** only if it needs group restriction or a public bypass, then
-`sudo docker compose up -d --force-recreate authelia`.
+`compose/authelia/configuration.yml` **above the wildcard** only if it needs group restriction or a public bypass —
+`make deploy` restarts authelia whenever `configuration.yml` or `users_database.yml` content changes (both are read
+only at container start, no hot reload), so no manual recreate step is needed.
 
 ## Add an LLM server (OpenAI-style API)
 

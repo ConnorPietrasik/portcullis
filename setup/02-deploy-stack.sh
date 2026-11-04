@@ -13,6 +13,23 @@ if ! sudo docker network inspect edge >/dev/null 2>&1; then
   sudo docker network create edge
 fi
 
+# ── Snapshot start-time-only configs ────────────────────────────────────────
+# authelia (configuration.yml + users DB — file.watch is off) and traefik's
+# *static* traefik.yml are read only at container start: `up -d` recreates a
+# service only when its compose *definition* changes, never for bind-mounted
+# file content, and neither service hot-reloads. Without this, editing a user
+# or an ACL rule and running `make deploy` would print Done with the change
+# inert. Snapshot the deployed files now; the restart happens after `up -d`
+# below, only if content actually changed.
+# (traefik/dynamic/ is exempt — the file provider hot-reloads it.)
+snap_dir="$(mktemp -d)"
+trap 'rm -rf "$snap_dir"' EXIT
+for f in authelia/configuration.yml authelia/users_database.yml traefik/traefik.yml; do
+  if [[ -f "$TARGET/$f" ]]; then
+    sudo cp -p "$TARGET/$f" "$snap_dir/${f//\//_}"
+  fi
+done
+
 info "Copying compose stack to $TARGET (skipping node_modules/dist)"
 sudo mkdir -p "$TARGET"
 tar -C "$REPO_ROOT/compose" --exclude=node_modules --exclude=dist -cf - . \
@@ -79,6 +96,27 @@ info "Building + starting stack (first run pulls images and compiles the fronten
 # --remove-orphans: services deleted from the compose file (e.g. the old
 # socket-proxy) must not keep running after a deploy.
 sudo docker compose --project-directory "$TARGET" -f "$TARGET/docker-compose.yml" up -d --build --remove-orphans
+
+# Restart services whose start-time-only config content actually changed (see
+# snapshot above). No change → no restart, so routine deploys add no downtime.
+authelia_changed=0
+for f in authelia/configuration.yml authelia/users_database.yml; do
+  if [[ -f "$snap_dir/${f//\//_}" ]] && ! sudo cmp -s "$snap_dir/${f//\//_}" "$TARGET/$f"; then
+    authelia_changed=1
+  fi
+done
+traefik_changed=0
+if [[ -f "$snap_dir/traefik_traefik.yml" ]] \
+   && ! sudo cmp -s "$snap_dir/traefik_traefik.yml" "$TARGET/traefik/traefik.yml"; then
+  traefik_changed=1
+fi
+if (( authelia_changed || traefik_changed )); then
+  services=()
+  if (( authelia_changed )); then services+=(authelia); fi
+  if (( traefik_changed )); then services+=(traefik); fi
+  info "Config content changed — restarting ${services[*]} (read only at container start, no hot reload)"
+  sudo docker compose --project-directory "$TARGET" -f "$TARGET/docker-compose.yml" restart "${services[@]}"
+fi
 sudo docker compose --project-directory "$TARGET" -f "$TARGET/docker-compose.yml" ps
 
 # ── ACME staging → prod auto-promotion ────────────────────────────────────
