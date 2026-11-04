@@ -33,6 +33,33 @@ load_env() {
   done
 }
 
+# Derive the reduced env file panel-api.service loads from the deployed .env.
+# panel-api reads ONLY PANEL_TOKEN / PANEL_DEV / PANEL_DISK_MOUNTS from its
+# environment (panel-api/main.py), and it is the long-lived process running as
+# the unprivileged 'panel' user: everything systemd injects is readable from
+# /proc/<pid>/environ by anything at that uid. Loading the full .env would put
+# NAMESILO_API_KEY (DNS-01 → wildcard certs → MITM) and all three Authelia
+# secrets (session forgery / TOTP-store decryption) in the blast radius of a
+# panel-uid compromise. The derived file holds only the PANEL_* vars; systemd
+# reads it as root, so the 0600 mode never blocks the unit — the service still
+# cannot open the file itself.
+# Called from 02-deploy-stack.sh (make deploy) AND 03-panel-api.sh (make api)
+# so both the install and the "edit .env → make deploy → restart" rotate flow
+# keep it in sync with .env. Regenerates (overwrites) on every run.
+sync_panel_api_env() { # <target-dir> — derive <target>/.panel-api.env from <target>/.env
+  local target="$1" key tmp
+  tmp="$(mktemp)"
+  for key in PANEL_TOKEN PANEL_DEV PANEL_DISK_MOUNTS; do
+    # ^KEY= with optional surrounding whitespace mirrors systemd's EnvironmentFile
+    # parser; if a key is duplicated, the last line wins in both — semantics match.
+    sudo grep -E "^[[:space:]]*${key}[[:space:]]*=" "$target/.env" >>"$tmp" || true
+  done
+  sudo install -m 600 "$tmp" "$target/.panel-api.env"   # root:root 0600 — panel can't read it
+  rm -f "$tmp"
+  sudo grep -q '^[[:space:]]*PANEL_TOKEN[[:space:]]*=' "$target/.panel-api.env" \
+    || warn "PANEL_TOKEN missing in $target/.env — panel-api will reject every request until it is set"
+}
+
 # Idempotently ensure the non-root 'panel' user exists (runs the host API).
 ensure_panel_user() {
   if ! id panel >/dev/null 2>&1; then

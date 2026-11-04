@@ -7,8 +7,10 @@ Wants=network-online.target
 Type=oneshot
 User=panel
 Group=panel
-# Same file the compose stack and panel-api use — one source of truth for the
-# NameSilo key (read by systemd as root; the script never sees the file itself).
+# The full .env (one source of truth for the NameSilo key, read by systemd as
+# root; the script never sees the file itself). This oneshot runs a few
+# seconds per 10 min, so its secret-exposure window is negligible — the
+# long-lived panel-api gets a reduced file instead (sync_panel_api_env).
 EnvironmentFile=/opt/panel/.env
 ExecStart=/usr/bin/python3 /opt/panel-ddns/ddns.py
 TimeoutStartSec=5min

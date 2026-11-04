@@ -74,5 +74,8 @@ so new subdomains are private by default.
 **AMD GPUs without ROCm.** Everything glanceable lives in sysfs: `/sys/class/drm/card*/device` (busy %, VRAM) and its `hwmon`
 (edge/junction/mem temps, power, fan). No `amd-smi` needed; revisit only for per-process VRAM or fan control.
 
-**Secrets.** One `.env` (chmod 600) feeds compose + the systemd unit (`EnvironmentFile`). Deploy-time placeholders (`__PANEL_TOKEN__`,
+**Secrets.** One `.env` (chmod 600) is the single source of truth: it feeds compose and panel-ddns
+(`EnvironmentFile`), and deploy derives `/opt/panel/.panel-api.env` (0600, only the `PANEL_*` vars the API reads)
+for panel-api — the long-lived panel-uid process must not hold the Authelia/NameSilo/LLM secrets in its
+environment (`/proc/<pid>/environ` is readable by anything at that uid). Deploy-time placeholders (`__PANEL_TOKEN__`,
 `__ACME_EMAIL__`) are substituted into Traefik's dynamic config by `setup/02-deploy-stack.sh`; the repo copy stays clean.

@@ -45,6 +45,10 @@ if sudo grep -RqE '__ACME_EMAIL__|__ACME_CA_SERVER__|__PANEL_TOKEN__' "$TARGET/t
 fi
 
 sudo install -m 600 "$REPO_ROOT/.env" "$TARGET/.env"
+# panel-api must not hold the full secret set in its env (it reads only the
+# PANEL_* vars) — re-derive its reduced env file so "edit .env → make deploy →
+# restart panel-api" rotation stays one-shot (see sync_panel_api_env).
+sync_panel_api_env "$TARGET"
 sudo chmod 600 "$TARGET/traefik/dynamic/middlewares.yml"   # contains PANEL_TOKEN
 
 if [[ ! -f "$TARGET/authelia/users_database.yml" ]]; then

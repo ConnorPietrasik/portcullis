@@ -8,7 +8,7 @@ need python3
 need systemctl
 load_env
 
-[[ -f /opt/panel/.env ]] || die "/opt/panel/.env missing — run: make deploy (panel-api.service reads PANEL_TOKEN from it)"
+[[ -f /opt/panel/.env ]] || die "/opt/panel/.env missing — run: make deploy (panel-api.service reads PANEL_TOKEN from it, via the derived .panel-api.env)"
 
 # ── UFW gate ─────────────────────────────────────────────────────────────────
 # panel-api binds 172.17.0.1:8010. UFW must already scope 8010 to the edge
@@ -55,6 +55,10 @@ sudo -u panel /opt/panel-api/venv/bin/pip install --quiet --upgrade pip
 sudo -u panel /opt/panel-api/venv/bin/pip install --quiet -r /opt/panel-api/requirements.txt
 
 info "Installing systemd unit"
+# (Re)derive the reduced env file NOW: the unit requires it, and doing it here
+# (not only in 02-deploy-stack.sh) makes `make api` self-contained — it picks
+# up a .env that changed since the last deploy.
+sync_panel_api_env /opt/panel
 sudo cp -a "$REPO_ROOT/panel-api/panel-api.service" /etc/systemd/system/panel-api.service
 sudo systemctl daemon-reload
 # enable + explicit restart (not `enable --now`): on a re-run after editing

@@ -236,7 +236,8 @@ paths; no `os.Getenv`, no network, no goroutines; separators like `--` are hardc
   public; `172.17.0.1:8010` never reachable externally.
 - [ ] No container mounts `/var/run/docker.sock` — not even `:ro` (a ro-mounted socket still grants full Docker API access). Traefik runs
   the file provider precisely so it needs none.
-- [ ] `chmod 600 /opt/panel/.env /opt/panel/traefik/dynamic/middlewares.yml` (deploy script does this — verify after manual edits).
+- [ ] `chmod 600 /opt/panel/.env /opt/panel/.panel-api.env /opt/panel/traefik/dynamic/middlewares.yml` (deploy script does this — verify after manual edits;
+  `.panel-api.env` is derived from `.env` — regenerate with `make api`, never hand-edit).
 - [ ] CrowdSec + Traefik bouncer plugin (optional, later).
 - [ ] SSH keys-only as break-glass access.
 - [ ] Backups: `/opt/panel/.env`, `compose/` (this repo), Authelia `/opt/panel/authelia/` (config + `db.sqlite3` — TOTP seeds!), the `acme`

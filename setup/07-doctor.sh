@@ -175,6 +175,26 @@ if systemctl is-active --quiet panel-api 2>/dev/null; then
 else
   bad "systemd: panel-api inactive"; hint "sudo journalctl -u panel-api -n 50 (RUNBOOK Phase 4)"
 fi
+# The reduced env file: it must hold the token and no shared secret. A
+# regression here = the full secret set sitting in a panel-uid /proc environ.
+if [[ -f /opt/panel/.panel-api.env ]]; then
+  env_mode="$(stat -c %a /opt/panel/.panel-api.env 2>/dev/null || true)"
+  if [[ "$env_mode" == 600 ]]; then ok ".panel-api.env mode 600"; else
+    warn ".panel-api.env mode ${env_mode:-unreadable} (want 600)"; hint "make api re-derives it root-owned"
+  fi
+  if sudo grep -qE '^[[:space:]]*PANEL_TOKEN[[:space:]]*=' /opt/panel/.panel-api.env; then
+    ok ".panel-api.env holds PANEL_TOKEN"
+  else
+    bad ".panel-api.env missing PANEL_TOKEN"; hint "make api (re-derives from /opt/panel/.env)"
+  fi
+  if sudo grep -qE '^[[:space:]]*(NAMESILO_API_KEY|AUTHELIA_SESSION_SECRET|AUTHELIA_STORAGE_ENCRYPTION_KEY|AUTHELIA_JWT_SECRET|LLM_API_KEY)[[:space:]]*=' /opt/panel/.panel-api.env; then
+    bad ".panel-api.env contains a shared secret"; hint "make api (it must hold only PANEL_TOKEN/PANEL_DEV/PANEL_DISK_MOUNTS)"
+  else
+    ok ".panel-api.env holds no shared secrets"
+  fi
+else
+  bad "/opt/panel/.panel-api.env missing"; hint "make api (derives it from /opt/panel/.env)"
+fi
 health="$(curl -s --max-time 5 http://172.17.0.1:8010/api/health 2>/dev/null || true)"
 if grep -q '"ok":true' <<<"$health"; then
   ok "GET /api/health → ok (open liveness endpoint)"
