@@ -430,7 +430,7 @@ def run_action(name: str, body: ActionBody, _admin: Optional[str] = Depends(requ
         raise HTTPException(500, f"sudo failed: {e}") from e
     err = _err_detail(proc) if proc.returncode else ""
     _audit(_admin, name, body.args, proc.returncode, err)
-    invalidate_containers_cache()  # e.g. prune-docker removes stopped containers
+    invalidate_containers_cache()  # e.g. a container action may have changed the fleet
     return {
         "ok": proc.returncode == 0,
         "exit_code": proc.returncode,

@@ -65,6 +65,20 @@ fi
 # ── edge stack ───────────────────────────────────────────────────────────────
 section "edge stack (docker)"
 if [[ -d /opt/panel ]]; then
+  # `edge` is EXTERNAL to compose — only setup/02-deploy-stack.sh creates it
+  # (make deploy / make stack). If the edge containers are stopped (or
+  # removed) and unused networks are pruned, `edge` is deleted: `docker
+  # system prune` does both in one run (stopped containers first, then the
+  # network); a bare `docker network prune` needs the stopped containers
+  # removed first (their endpoints protect it while they exist). The panel's
+  # prune-docker never touches networks (dangling images + build cache only).
+  # Afterwards `up -d` fails with "network edge declared as external, but
+  # could not be found".
+  if sudo docker network inspect edge >/dev/null 2>&1; then
+    ok "network: edge present"
+  else
+    bad "network: edge missing — `docker compose up -d` will refuse to start"; hint "sudo docker network create edge (make deploy / make stack recreate it automatically)"
+  fi
   running="$(sudo docker compose --project-directory /opt/panel ps --services --status=running 2>/dev/null || true)"
   for svc in traefik authelia panel-web portfolio; do
     if grep -qx "$svc" <<<"$running"; then

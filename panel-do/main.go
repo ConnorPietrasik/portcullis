@@ -199,10 +199,32 @@ func restartService(ctx context.Context, args []string, logf func(string, ...any
 	return err
 }
 
+// pruneDocker reclaims disk from dangling images and unused build cache.
+// Deliberately NOT `docker system prune`: it also removes (a) stopped
+// containers — e.g. a locally-built LLM server stopped to free RAM, whose
+// locally-built image then dangles and is swept by the image prune in the
+// same run (02-deploy-stack.sh tolerates such images via
+// `pull --ignore-pull-failures`, but re-building isn't free) — and (b)
+// networks unused by any container, pruned AFTER the container removal: with
+// all four edge containers stopped from the panel, the EXTERNAL `edge`
+// network is left with no endpoints and deleted, after which
+// `docker compose up -d` fails ("network edge declared as external, but
+// could not be found"). A bare `docker network prune` can't do that while
+// the stopped containers still exist (their endpoints protect the network);
+// `system prune` removes them first. Containers and networks are never
+// touched here.
 func pruneDocker(ctx context.Context, args []string, logf func(string, ...any)) error {
-	out, err := runCmd(ctx, "/usr/bin/docker", "system", "prune", "-f")
-	logf("prune: %s", strings.TrimSpace(out))
-	return err
+	out, err := runCmd(ctx, "/usr/bin/docker", "image", "prune", "-f")
+	logf("image prune: %s", strings.TrimSpace(out))
+	if err != nil {
+		return fmt.Errorf("image prune: %v: %s", err, out)
+	}
+	out, err = runCmd(ctx, "/usr/bin/docker", "builder", "prune", "-f")
+	logf("builder prune: %s", strings.TrimSpace(out))
+	if err != nil {
+		return fmt.Errorf("builder prune: %v: %s", err, out)
+	}
+	return nil
 }
 
 func listContainers(ctx context.Context, args []string, logf func(string, ...any)) error {
@@ -235,7 +257,7 @@ var registry = map[string]Action{
 		Run:     restartService,
 	},
 	"prune-docker": {
-		Summary: "Prune unused docker data",
+		Summary: "Prune dangling images + build cache (never containers or networks)",
 		Args:    nil,
 		Timeout: 5 * time.Minute,
 		Confirm: true,
