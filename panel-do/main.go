@@ -194,6 +194,26 @@ func restartService(ctx context.Context, args []string, logf func(string, ...any
 	if out, err := runCmd(ctx, "/usr/bin/systemctl", "restart", "--", args[0]); err != nil {
 		return fmt.Errorf("restart %s: %v: %s", args[0], err, out)
 	}
+	// A oneshot unit is *inactive* after a clean run (unless
+	// RemainAfterExit), so is-active would report success as a failure.
+	// systemctl start/restart blocks until a oneshot's run completes, so its
+	// Result is final here: "success" = the main process exited 0.
+	unitType, err := runCmd(ctx, "/usr/bin/systemctl", "show", "-p", "Type", "--value", "--", args[0])
+	if err != nil {
+		return fmt.Errorf("restart %s: cannot read unit Type: %v: %s", args[0], err, unitType)
+	}
+	if strings.TrimSpace(unitType) == "oneshot" {
+		out, err := runCmd(ctx, "/usr/bin/systemctl", "show", "-p", "Result", "--value", "--", args[0])
+		if err != nil {
+			return fmt.Errorf("restart %s: cannot read unit Result: %v: %s", args[0], err, out)
+		}
+		result := strings.TrimSpace(out)
+		logf("unit %s (oneshot) result: %s", args[0], result)
+		if result != "success" {
+			return fmt.Errorf("restart %s: oneshot run finished with Result=%s", args[0], result)
+		}
+		return nil
+	}
 	out, err := runCmd(ctx, "/usr/bin/systemctl", "is-active", "--", args[0])
 	logf("unit %s state: %s", args[0], strings.TrimSpace(out))
 	return err

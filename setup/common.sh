@@ -54,6 +54,24 @@ load_env() {
   done
 }
 
+# Core of the reduced-env derivation: copy the raw lines for the given keys
+# out of <target>/.env into a fresh root-owned 0600 <target>/.<name>.env
+# (regenerated on every run — derived files are never hand-edited).
+# The ^KEY= pattern with optional surrounding whitespace mirrors systemd's
+# EnvironmentFile parser; if a key is duplicated, the last line wins in both —
+# semantics match. Absent keys simply don't appear (optional vars).
+derive_reduced_env() { # <target-dir> <name> [key...]
+  local target="$1" name="$2" key tmp
+  shift 2
+  tmp="$(mktemp)"
+  for key in "$@"; do
+    # shellcheck disable=SC2024 # sudo is only for reading the 0600 .env; $tmp must stay user-owned
+    sudo grep -E "^[[:space:]]*${key}[[:space:]]*=" "$target/.env" >>"$tmp" || true
+  done
+  sudo install -m 600 "$tmp" "$target/.$name.env"   # root:root 0600 — panel can't read it
+  rm -f "$tmp"
+}
+
 # Derive the reduced env file panel-api.service loads from the deployed .env.
 # panel-api reads ONLY PANEL_TOKEN / PANEL_DEV / PANEL_DISK_MOUNTS from its
 # environment (panel-api/main.py), and it is the long-lived process running as
@@ -64,22 +82,31 @@ load_env() {
 # panel-uid compromise. The derived file holds only the PANEL_* vars; systemd
 # reads it as root, so the 0600 mode never blocks the unit — the service still
 # cannot open the file itself.
-# Called from 02-deploy-stack.sh (make deploy) AND 03-panel-api.sh (make api)
-# so both the install and the "edit .env → make update" rotate flow keep it
-# in sync with .env. Regenerates (overwrites) on every run.
+# Called from stack_sync_configs (make deploy / make update) AND
+# 03-panel-api.sh (make api) so both the install and the "edit .env → make
+# update" rotate flow keep it in sync with .env.
 sync_panel_api_env() { # <target-dir> — derive <target>/.panel-api.env from <target>/.env
-  local target="$1" key tmp
-  tmp="$(mktemp)"
-  for key in PANEL_TOKEN PANEL_DEV PANEL_DISK_MOUNTS; do
-    # ^KEY= with optional surrounding whitespace mirrors systemd's EnvironmentFile
-    # parser; if a key is duplicated, the last line wins in both — semantics match.
-    # shellcheck disable=SC2024 # sudo is only for reading the 0600 .env; $tmp must stay user-owned
-    sudo grep -E "^[[:space:]]*${key}[[:space:]]*=" "$target/.env" >>"$tmp" || true
-  done
-  sudo install -m 600 "$tmp" "$target/.panel-api.env"   # root:root 0600 — panel can't read it
-  rm -f "$tmp"
+  local target="$1"
+  derive_reduced_env "$target" panel-api "${panel_api_env_keys[@]}"   # key lists: envload.sh
   sudo grep -q '^[[:space:]]*PANEL_TOKEN[[:space:]]*=' "$target/.panel-api.env" \
     || warn "PANEL_TOKEN missing in $target/.env — panel-api will reject every request until it is set"
+}
+
+# Derive the reduced env file panel-ddns.service loads from the deployed .env.
+# panel-ddns reads ONLY NAMESILO_API_KEY (+ the optional DDNS_HOSTS). It runs
+# as the SAME uid 'panel' as panel-api, so its environ is readable by a
+# panel-uid process (e.g. panel-api itself) while it runs — with the full .env
+# as its EnvironmentFile, the Authelia secrets + PANEL_TOKEN would sit in a
+# /proc/<pid>/environ for a few seconds per 10-minute tick. The derived file
+# keeps everything except the one key the script needs out of that window.
+# Called from stack_sync_configs (make deploy / make update) AND 05-ddns.sh
+# (make ddns); the oneshot re-reads the file on every tick, so a rotated key
+# is picked up on the next tick without a timer restart.
+sync_ddns_env() { # <target-dir> — derive <target>/.panel-ddns.env from <target>/.env
+  local target="$1"
+  derive_reduced_env "$target" panel-ddns "${panel_ddns_env_keys[@]}"   # key lists: envload.sh
+  sudo grep -q '^[[:space:]]*NAMESILO_API_KEY[[:space:]]*=' "$target/.panel-ddns.env" \
+    || warn "NAMESILO_API_KEY missing in $target/.env — panel-ddns will FATAL on every tick until it is set"
 }
 
 # Idempotently ensure the non-root 'panel' user exists (runs the host API).
@@ -155,10 +182,12 @@ stack_sync_configs() { # <target-dir>
     die "secret substitution failed — placeholders remain under $target"
   fi
   sudo install -m 600 "$REPO_ROOT/.env" "$target/.env"
-  # panel-api must not hold the full secret set in its env (it reads only the
-  # PANEL_* vars) — re-derive its reduced env file so an .env edit stays
-  # one-shot (see sync_panel_api_env).
+  # The panel-uid services (long-lived panel-api, same-uid panel-ddns oneshot)
+  # must not hold the full secret set in their env — re-derive their reduced
+  # env files so an .env edit stays one-shot (see sync_panel_api_env /
+  # sync_ddns_env).
   sync_panel_api_env "$target"
+  sync_ddns_env "$target"
   sudo chmod 600 "$target/traefik/dynamic/middlewares.yml"   # contains PANEL_TOKEN
   if [[ ! -f "$target/authelia/users_database.yml" ]]; then
     die "authelia/users_database.yml missing (fresh clone? it's gitignored — hashes stay off GitHub).
@@ -646,8 +675,9 @@ snapshot_host_stack() { # <snapshot-dir>
   local dir="$1" fe m
   fe="$REPO_ROOT/compose/panel-frontend"
   sudo mkdir -p "$dir/npm" || die "cannot create snapshot dir $dir"
-  # The snapshot holds secrets (panel.tar carries .env + .panel-api.env) —
-  # root-only, mirroring the 0600 discipline of the deployed originals.
+  # The snapshot holds secrets (panel.tar carries .env + the reduced env
+  # files) — root-only, mirroring the 0600 discipline of the deployed
+  # originals.
   sudo chmod 700 "$dir"
   if [[ -d /opt/panel-api ]]; then
     # Exact copy, venv included: what makes the panel-api rollback offline.
@@ -669,14 +699,15 @@ snapshot_host_stack() { # <snapshot-dir>
   # RUNBOOK's migration caveat) and panel-frontend's node_modules/dist.
   local members=()
   for m in docker-compose.yml traefik portfolio authelia/configuration.yml \
-           authelia/users_database.yml panel-frontend .env .panel-api.env; do
+           authelia/users_database.yml panel-frontend .env .panel-api.env \
+           .panel-ddns.env; do
     [[ -e "/opt/panel/$m" ]] && members+=("$m")
   done
   if (( ${#members[@]} > 0 )); then
     sudo tar -C /opt/panel --exclude=panel-frontend/node_modules --exclude=panel-frontend/dist \
       -cf "$dir/panel.tar" "${members[@]}" \
       || die "cannot snapshot the deployed config tree into $dir (disk full?)"
-    sudo chmod 600 "$dir/panel.tar"   # .env + .panel-api.env inside — not for other users
+    sudo chmod 600 "$dir/panel.tar"   # .env + the reduced env files inside — not for other users
   fi
 }
 
@@ -791,8 +822,8 @@ rollback_panel_api() { # <snapshot-dir>
 }
 
 # Restore the snapshot's deployed config tree (docker-compose.yml, traefik/,
-# portfolio/, the authelia configs, panel-frontend, .env, .panel-api.env — see
-# snapshot_host_stack). Must run BEFORE the image recreate: the rollback's
+# portfolio/, the authelia configs, panel-frontend, .env, the reduced env
+# files — see snapshot_host_stack). Must run BEFORE the image recreate: the rollback's
 # `compose up` then reads the pre-update compose file + .env, and the re-created
 # containers start with pre-update configs. Runtime data is not in the tar and
 # is untouched. Files created under /opt/panel during the update (e.g. a newly

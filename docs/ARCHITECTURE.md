@@ -57,7 +57,8 @@ reconciles — updating stale A records, creating missing ones; CNAMEs at a conf
 manual CNAME → apex, so it follows the A record for free and must never get its own A). Deliberately stateless with no short-circuit: a
 "nothing changed, skip" check can silently trust a stale assumption (an IP that flapped and returned between ticks, a record edited by
 hand), and the load it saves is ~6 tiny API calls/hour — not worth a failure mode. Reuses the API key Traefik already needs for DNS-01
-(nothing new to leak; the key is never logged). TTL is pinned at NameSilo's 3600 minimum, so worst-case cutover after an IP change is ~10
+(nothing new to leak; the key is never logged; it arrives via a reduced env file, so the rest of the secret set never enters the
+oneshot's environ). TTL is pinned at NameSilo's 3600 minimum, so worst-case cutover after an IP change is ~10
 min of detection plus 1 h of resolver caching.
 
 **Privileged actions through a compiled dispatcher.** `panel-do` is a small Go binary: hardcoded action registry, central arg validation
@@ -74,8 +75,10 @@ so new subdomains are private by default.
 **AMD GPUs without ROCm.** Everything glanceable lives in sysfs: `/sys/class/drm/card*/device` (busy %, VRAM) and its `hwmon`
 (edge/junction/mem temps, power, fan). No `amd-smi` needed; revisit only for per-process VRAM or fan control.
 
-**Secrets.** One `.env` (chmod 600) is the single source of truth: it feeds compose and panel-ddns
-(`EnvironmentFile`), and deploy derives `/opt/panel/.panel-api.env` (0600, only the `PANEL_*` vars the API reads)
-for panel-api — the long-lived panel-uid process must not hold the Authelia/NameSilo/LLM secrets in its
-environment (`/proc/<pid>/environ` is readable by anything at that uid). Deploy-time placeholders (`__PANEL_TOKEN__`,
-`__ACME_EMAIL__`) are substituted into Traefik's dynamic config by `setup/02-deploy-stack.sh`; the repo copy stays clean.
+**Secrets.** One `.env` (chmod 600) is the single source of truth: it feeds compose, and deploy derives the
+reduced env files the panel-uid systemd units load — `/opt/panel/.panel-api.env` (0600, only the `PANEL_*` vars the
+API reads) and `/opt/panel/.panel-ddns.env` (0600, only `NAMESILO_API_KEY` + optional `DDNS_HOSTS`) — because a
+panel-uid process can read its own `/proc/<pid>/environ`, so the panel-uid services (long-lived panel-api, and the
+same-uid panel-ddns oneshot on each tick) must not hold the rest of the secret set (Authelia, LLM) in their
+environment. Deploy-time placeholders (`__PANEL_TOKEN__`, `__ACME_EMAIL__`) are substituted into Traefik's dynamic
+config by `setup/02-deploy-stack.sh`; the repo copy stays clean.

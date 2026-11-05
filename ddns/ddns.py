@@ -8,7 +8,8 @@ with it.
 
 Runs as user 'panel' from a systemd timer (stdlib only, no venv, no root,
 outbound network only). Reuses NAMESILO_API_KEY via the unit's EnvironmentFile
-(/opt/panel/.env) — the same key Traefik uses for the DNS-01 challenge. No new
+(/opt/panel/.panel-ddns.env, derived from /opt/panel/.env — only this key +
+DDNS_HOSTS) — the same key Traefik uses for the DNS-01 challenge. No new
 secrets, and the key is never logged (URLs are built, never printed).
 
 Purely declarative, no state: every tick detects the public IPv4 (OpenDNS
@@ -200,7 +201,7 @@ def reconcile(key: str, ip: str) -> int:
 def main() -> int:
     key = os.environ.get("NAMESILO_API_KEY", "").strip()
     if not key:
-        die("NAMESILO_API_KEY missing (systemd unit reads it from /opt/panel/.env)")
+        die("NAMESILO_API_KEY missing (systemd unit reads it from /opt/panel/.panel-ddns.env — re-derive with: make ddns)")
     ip = public_ip()
     changes = reconcile(key, ip)
     log(f"done: {DOMAIN} ({', '.join(HOSTS)}) -> {ip}"

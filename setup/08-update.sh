@@ -6,7 +6,7 @@
 #
 #   - stack configs — the same repo → /opt/panel sync as make deploy:
 #     compose/traefik/authelia/portfolio + .env, secrets substituted, stale
-#     route files pruned, panel-api's reduced env file re-derived
+#     route files pruned, the panel-uid services' reduced env files re-derived
 #   - container images on the major line (traefik:v3, authelia/authelia:4,
 #     nginx:stable-alpine — compose/docker-compose.yml)
 #   - panel-web's frontend: build context synced from the repo, npm deps
@@ -91,7 +91,7 @@ info "3/7 syncing the repo's configs to /opt/panel (compose + traefik + authelia
 # The same sync make deploy performs (stack_sync_configs, common.sh): file
 # content only — nothing is recreated yet, and a sync failure aborts with
 # every container untouched. .env is re-copied, so an .env edit is applied
-# here (and re-derives panel-api's reduced env file).
+# here (and re-derives both panel-uid reduced env files).
 stack_sync_configs /opt/panel
 
 info "4/7 pulling new images (nothing is touched until every pull succeeds)"

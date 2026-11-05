@@ -7,11 +7,14 @@ Wants=network-online.target
 Type=oneshot
 User=panel
 Group=panel
-# The full .env (one source of truth for the NameSilo key, read by systemd as
-# root; the script never sees the file itself). This oneshot runs a few
-# seconds per 10 min, so its secret-exposure window is negligible — the
-# long-lived panel-api gets a reduced file instead (sync_panel_api_env).
-EnvironmentFile=/opt/panel/.env
+# Reduced env file: ONLY the vars this timer reads (NAMESILO_API_KEY,
+# optional DDNS_HOSTS), derived from /opt/panel/.env at deploy time
+# (sync_ddns_env, setup/common.sh). The script runs as the same uid as
+# panel-api, so its environ is readable by a panel-uid process during each
+# tick — the full .env (Authelia secrets, PANEL_TOKEN) is never in it.
+# systemd reads the file as root; the oneshot re-reads it on every tick, so a
+# rotated key is live on the next tick (no timer restart needed).
+EnvironmentFile=/opt/panel/.panel-ddns.env
 ExecStart=/usr/bin/python3 /opt/panel-ddns/ddns.py
 TimeoutStartSec=5min
 

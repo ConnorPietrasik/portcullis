@@ -7,7 +7,9 @@
 # (export) WITHOUT executing it, and refuse anything the file's other readers
 # would parse differently:
 #   - docker compose auto-loads the deployed .env for the containers
-#   - systemd's EnvironmentFile= reads the same deployed file (panel-ddns)
+#   - the systemd units read REDUCED files derived from that same .env by
+#     raw-line grep (.panel-api.env for panel-api, .panel-ddns.env for
+#     panel-ddns — see derive_reduced_env, setup/common.sh)
 #   - this parser feeds the deploy scripts' own checks and substitutions
 # If this parser accepts a file, the value the deploy scripts see is EXACTLY
 # the value the containers and the systemd units receive.
@@ -70,17 +72,25 @@
 # warned), 2 if the file is missing. Requires warn() from the caller (falls
 # back to stderr if it is not defined).
 
+# The keys each panel-uid reduced env file may carry — the SINGLE SOURCE of
+# truth, shared by the derivation (sync_*_env, setup/common.sh) and the
+# doctor's whitelist check (setup/07-doctor.sh — it verifies every line of the
+# deployed files is one of these, so a leaked key is caught even if it is a
+# secret added to .env later). Keep in sync with what the services actually
+# read: panel-api/main.py (PANEL_TOKEN, PANEL_DEV, PANEL_DISK_MOUNTS) and
+# ddns/ddns.py (NAMESILO_API_KEY, optional DDNS_HOSTS).
+panel_api_env_keys=(PANEL_TOKEN PANEL_DEV PANEL_DISK_MOUNTS)
+panel_ddns_env_keys=(NAMESILO_API_KEY DDNS_HOSTS)
+
 # Keys whose line must not carry an `export ` prefix (refused, not merely
-# warned): the ones panel-ddns reads from the DEPLOYED .env via
-# EnvironmentFile= (ddns/panel-ddns.service; ddns.py's os.environ.get),
-# plus the PANEL_* keys sync_panel_api_env() copies as raw lines into
-# .panel-api.env (its grep requires the line to start with the key, and
-# systemd would drop an `export `-prefixed copy anyway). systemd drops a
-# line it can't parse SILENTLY (journal error only), so an `export `-
-# prefixed line here breaks DNS tracking / panel-api with no deploy error.
-# Keep in sync with ddns/panel-ddns.service + ddns/ddns.py
-# + sync_panel_api_env().
-__envload_no_export_keys=" NAMESILO_API_KEY DDNS_HOSTS PANEL_TOKEN PANEL_DEV PANEL_DISK_MOUNTS "
+# warned): exactly the keys the REDUCED ENV FILES carry above (union of the
+# two lists) — .panel-ddns.env (panel-ddns.service's EnvironmentFile=, ddns.py's
+# os.environ.get) and .panel-api.env (panel-api.service's EnvironmentFile=),
+# both derived by raw-line grep (derive_reduced_env), whose ^KEY= pattern
+# requires the line to start with the key; systemd would drop an `export `-
+# prefixed copy SILENTLY (journal error only), so an `export `-prefixed line
+# here breaks DNS tracking / panel-api with no deploy error.
+__envload_no_export_keys=" ${panel_api_env_keys[*]} ${panel_ddns_env_keys[*]} "
 
 __envload_warn() {
   if declare -F warn >/dev/null 2>&1; then

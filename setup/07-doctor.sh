@@ -201,8 +201,10 @@ if systemctl is-active --quiet panel-api 2>/dev/null; then
 else
   bad "systemd: panel-api inactive"; hint "sudo journalctl -u panel-api -n 50 (RUNBOOK Phase 4)"
 fi
-# The reduced env file: it must hold the token and no shared secret. A
-# regression here = the full secret set sitting in a panel-uid /proc environ.
+# The reduced env file: it must hold the token and ONLY the keys its service
+# reads (whitelist, shared with the derivation — envload.sh: any other key is
+# a leak, including secrets added to .env later; no secret list to maintain).
+# A regression here = the full secret set sitting in a panel-uid /proc environ.
 if [[ -f /opt/panel/.panel-api.env ]]; then
   env_mode="$(stat -c %a /opt/panel/.panel-api.env 2>/dev/null || true)"
   if [[ "$env_mode" == 600 ]]; then ok ".panel-api.env mode 600"; else
@@ -213,10 +215,12 @@ if [[ -f /opt/panel/.panel-api.env ]]; then
   else
     bad ".panel-api.env missing PANEL_TOKEN"; hint "make api (re-derives from /opt/panel/.env)"
   fi
-  if sudo grep -qE '^[[:space:]]*(NAMESILO_API_KEY|AUTHELIA_SESSION_SECRET|AUTHELIA_STORAGE_ENCRYPTION_KEY|AUTHELIA_JWT_SECRET|LLM_API_KEY)[[:space:]]*=' /opt/panel/.panel-api.env; then
-    bad ".panel-api.env contains a shared secret"; hint "make api (it must hold only PANEL_TOKEN/PANEL_DEV/PANEL_DISK_MOUNTS)"
+  api_allow="${panel_api_env_keys[*]}"; api_allow="${api_allow// /|}"
+  if sudo grep -qEv "^[[:space:]]*(${api_allow})[[:space:]]*=" /opt/panel/.panel-api.env; then
+    bad ".panel-api.env holds a key outside its allowed set (${panel_api_env_keys[*]})"
+    hint "make api (re-derives it from /opt/panel/.env — never hand-edit)"
   else
-    ok ".panel-api.env holds no shared secrets"
+    ok ".panel-api.env holds only its allowed keys"
   fi
 else
   bad "/opt/panel/.panel-api.env missing"; hint "make api (derives it from /opt/panel/.env)"
@@ -294,6 +298,30 @@ if systemctl is-active --quiet panel-ddns.timer 2>/dev/null; then
   ok "systemd timer active"
 else
   bad "panel-ddns.timer not active"; hint "make ddns (RUNBOOK → Dynamic IP)"
+fi
+# The reduced env file: it must hold the NameSilo key and ONLY the keys its
+# script reads (whitelist, shared with the derivation — envload.sh) — a
+# regression here puts the full secret set in a panel-uid oneshot's environ
+# for a few seconds per tick (same discipline as .panel-api.env).
+if [[ -f /opt/panel/.panel-ddns.env ]]; then
+  env_mode="$(stat -c %a /opt/panel/.panel-ddns.env 2>/dev/null || true)"
+  if [[ "$env_mode" == 600 ]]; then ok ".panel-ddns.env mode 600"; else
+    warn ".panel-ddns.env mode ${env_mode:-unreadable} (want 600)"; hint "make ddns re-derives it root-owned"
+  fi
+  if sudo grep -qE '^[[:space:]]*NAMESILO_API_KEY[[:space:]]*=' /opt/panel/.panel-ddns.env; then
+    ok ".panel-ddns.env holds NAMESILO_API_KEY"
+  else
+    bad ".panel-ddns.env missing NAMESILO_API_KEY"; hint "make ddns (re-derives from /opt/panel/.env)"
+  fi
+  ddns_allow="${panel_ddns_env_keys[*]}"; ddns_allow="${ddns_allow// /|}"
+  if sudo grep -qEv "^[[:space:]]*(${ddns_allow})[[:space:]]*=" /opt/panel/.panel-ddns.env; then
+    bad ".panel-ddns.env holds a key outside its allowed set (${panel_ddns_env_keys[*]})"
+    hint "make ddns (re-derives it from /opt/panel/.env — never hand-edit)"
+  else
+    ok ".panel-ddns.env holds only its allowed keys"
+  fi
+else
+  bad "/opt/panel/.panel-ddns.env missing"; hint "make ddns (derives it from /opt/panel/.env)"
 fi
 last="$(sudo journalctl -u panel-ddns.service -n 1 --no-pager -o cat 2>/dev/null | tail -1)"
 if [[ -n "$last" ]]; then

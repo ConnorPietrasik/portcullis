@@ -88,7 +88,8 @@ Never set `PANEL_DEV=1` in production — the systemd unit doesn't, and nothing 
   rule, then `make update` → [RUNBOOK](docs/RUNBOOK.md#add-an-app)
 - **New privileged action**: edit `panel-do/main.go` ACTIONS section → `make panel-do` → [RUNBOOK](docs/RUNBOOK.md#add-a-privileged-action)
   (container control is registry actions too — Services and Actions views both render from `panel-do --list`)
-- **Rotate secrets**: edit `.env`, `make update` (it re-derives panel-api's env file and restarts it)
+- **Rotate secrets**: edit `.env`, `make update` (it re-derives the panel-api + panel-ddns env files — panel-api is
+  restarted, panel-ddns picks the new value up on its next tick)
 - **Logs / status**: `make logs`, `make status`
 
 ## License

@@ -137,7 +137,9 @@ A record declaratively every 10 minutes: detect public IP → list records → u
 hosts are skipped (`*.pietrasik.top` is a CNAME → apex, so it rides along) — never overwritten. No state file, no short-circuit — whatever
 drifted (a changed IP, a record deleted by hand, an IP that flipped and flipped back between ticks) is fixed within one tick. Cost is one
 list call per tick (~6/hour — trivial). TTL is pinned at 3600 (NameSilo's minimum), so worst-case cutover after an IP change ≈ 10 min + 1 h
-of resolver caching. Reuses `NAMESILO_API_KEY` — the same key Traefik uses for DNS-01.
+of resolver caching. Reuses `NAMESILO_API_KEY` — the same key Traefik uses for DNS-01. The key reaches
+the oneshot via a reduced env file (`.panel-ddns.env` — only that key + `DDNS_HOSTS`), so the full
+`.env` secret set never sits in the oneshot's environ while it runs as the panel uid.
 
 ```bash
 journalctl -u panel-ddns -n 50                  # what it did and when
@@ -177,7 +179,7 @@ How it works (`setup/08-update.sh`, shared helpers in `setup/common.sh`):
 - **Snapshot** = `/opt/panel/.update-snapshot-<ts>` (state in `/opt/panel/.update-state`): the exact
   *image IDs* of what is running (tags move, IDs don't), re-tagged `portcullis-rollback/<svc>:<ts>`;
   **the deployed config tree** (`/opt/panel`: docker-compose.yml, traefik/, portfolio/, the authelia
-  configs, panel-frontend, `.env`, `.panel-api.env` — a tarball; runtime data like `db.sqlite3` is
+  configs, panel-frontend, `.env`, the reduced env files — a tarball; runtime data like `db.sqlite3` is
   excluded); an **exact copy of `/opt/panel-api` (venv included)**; and the npm `package.json` + the
   server's `package-lock.json` (gitignored server-local state — snapshotted when it exists) about to be
   bumped. A failed npm bump, config sync, or pull stops the run *before* any container is touched.
@@ -191,8 +193,8 @@ How it works (`setup/08-update.sh`, shared helpers in `setup/common.sh`):
   (on the server, builds use it via `npm ci`). Rollback restores the pre-update files from the
   snapshot; only a deliberate range edit in `package.json` is a git commit.
 - **configs** = the same repo → `/opt/panel` sync `make deploy` performs (compose + traefik + authelia
-  + portfolio + `.env`, secrets substituted, stale route files pruned, panel-api's reduced env file
-  re-derived). A committed config change no longer waits for a deploy, and a `.env` edit is applied here
+  + portfolio + `.env`, secrets substituted, stale route files pruned, the panel-uid services' reduced
+  env files re-derived). A committed config change no longer waits for a deploy, and a `.env` edit is applied here
   too. authelia + traefik read some files only at container start — those services are restarted after
   the recreate **only if their content changed** (a routine update adds no such downtime). A sync failure
   aborts before any container changes.
@@ -210,7 +212,8 @@ How it works (`setup/08-update.sh`, shared helpers in `setup/common.sh`):
   within the ranges in `requirements.txt`, service restarted, then verified serving (`/api/health`) before
   the gates. (The first-install UFW gate in `make api` is deliberately not re-run — on an already-deployed
   server a firewall regression surfaces in the doctor gate → auto-rollback. `.env` edits are applied by
-  the config sync above, which re-derives its reduced env file; the restart here applies them.)
+  the config sync above, which re-derives both reduced env files — panel-api's is applied by this
+  restart, panel-ddns's on its next tick.)
 - **Gate** = every service that was *running before the update* healthy again (compose healthchecks,
   `UPDATE_HEALTH_TIMEOUT=600`s — a deliberately stopped service can't fail the gate, and neither can
   one this update *removed* from compose: its container is already gone by then), then a full
@@ -347,8 +350,8 @@ paths; no `os.Getenv`, no network, no goroutines; separators like `--` are hardc
   public; `172.17.0.1:8010` never reachable externally.
 - [ ] No container mounts `/var/run/docker.sock` — not even `:ro` (a ro-mounted socket still grants full Docker API access). Traefik runs
   the file provider precisely so it needs none.
-- [ ] `chmod 600 /opt/panel/.env /opt/panel/.panel-api.env /opt/panel/traefik/dynamic/middlewares.yml /opt/panel/authelia/users_database.yml` (deploy script does this — verify after manual edits;
-  `.panel-api.env` is derived from `.env` — regenerate with `make api`, never hand-edit).
+- [ ] `chmod 600 /opt/panel/.env /opt/panel/.panel-api.env /opt/panel/.panel-ddns.env /opt/panel/traefik/dynamic/middlewares.yml /opt/panel/authelia/users_database.yml` (deploy script does this — verify after manual edits;
+  `.panel-api.env` / `.panel-ddns.env` are derived from `.env` — regenerate with `make api` / `make ddns`, never hand-edit).
 - [ ] `/opt/panel/authelia/db.sqlite3` mode 600 (TOTP seeds — authelia creates it 0644 at first boot; the next `make deploy`/`make update` re-tightens it, `make doctor` checks it).
 - [ ] CrowdSec + Traefik bouncer plugin (optional, later).
 - [ ] SSH keys-only as break-glass access.
