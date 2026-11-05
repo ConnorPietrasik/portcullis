@@ -35,6 +35,20 @@ sudo docker compose --project-directory "$TARGET" -f "$TARGET/docker-compose.yml
 stack_restart_if_configs_changed "$TARGET"
 sudo docker compose --project-directory "$TARGET" -f "$TARGET/docker-compose.yml" ps
 
+# Tighten the TOTP store on first boot: authelia creates db.sqlite3 0644,
+# AFTER stack_sync_configs' chmod window (the file doesn't exist yet at sync
+# time), so the TOTP seeds would sit world-readable until the next deploy/
+# update without this. stack_sync_configs re-tightens it on every sync.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [[ -f "$TARGET/authelia/db.sqlite3" ]] && break
+  sleep 1
+done
+if [[ -f "$TARGET/authelia/db.sqlite3" ]]; then
+  sudo chmod 600 "$TARGET/authelia/db.sqlite3"
+else
+  warn "authelia db.sqlite3 not created after ~10s — the TOTP store would stay 0644 (world-readable) until the next deploy/update; check: make logs"
+fi
+
 # ── ACME staging → prod auto-promotion ────────────────────────────────────
 # First bring-up runs on LE staging (see .env.example) so DNS-01 debugging
 # can't hit prod's 5-failures/hour rate limit. Once the staging cert issues,

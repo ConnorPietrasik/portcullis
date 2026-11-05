@@ -215,6 +215,17 @@ if [[ -f /opt/panel/.panel-api.env ]]; then
   else
     bad ".panel-api.env missing PANEL_TOKEN"; hint "make api (re-derives from /opt/panel/.env)"
   fi
+  # PANEL_DEV=1 disables the API's own auth checks (local development only —
+  # main.py: DEV_MODE = os.environ.get("PANEL_DEV") == "1"). It is a legal
+  # member of the allowed set, so the whitelist check below would pass a
+  # production deployment with auth turned off. Catch it here. The value must
+  # be exactly 1 (optionally quoted — systemd's EnvironmentFile strips the
+  # quotes), so the pattern is anchored: PANEL_DEV=0/11/true leave auth on.
+  if sudo grep -qE "^[[:space:]]*PANEL_DEV[[:space:]]*=[[:space:]]*[\"']?1[\"']?[[:space:]]*$" /opt/panel/.panel-api.env; then
+    bad "panel-api runs with PANEL_DEV=1 — API auth checks disabled"; hint "remove PANEL_DEV from /opt/panel/.env (and the repo .env — local dev only), then re-run: make api"
+  else
+    ok "PANEL_DEV not enabled in .panel-api.env"
+  fi
   api_allow="${panel_api_env_keys[*]}"; api_allow="${api_allow// /|}"
   if sudo grep -qEv "^[[:space:]]*(${api_allow})[[:space:]]*=" /opt/panel/.panel-api.env; then
     bad ".panel-api.env holds a key outside its allowed set (${panel_api_env_keys[*]})"
