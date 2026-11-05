@@ -28,7 +28,14 @@ make secrets        # writes .env (chmod 600)
 ```
 
 Then edit `.env`: paste the `NAMESILO_API_KEY` from Phase 0 (`ACME_EMAIL` comes pre-filled — change it if you want Let's Encrypt notices
-elsewhere).
+elsewhere). Values are read literally as `KEY=VALUE` lines — no shell execution — and what the deploy scripts use is exactly what the
+containers and the systemd units receive, so keep values free of `$`, backslashes and ` # ` (docker compose and systemd reinterpret those,
+so `make deploy`/`make doctor` refuse them with a clear message; single quotes make a value fully literal). Values with spaces work
+unquoted, but wrap them in a single pair of quotes to be safe. An `export ` prefix is tolerated on container-only keys (docker compose
+strips it), but refused on `NAMESILO_API_KEY`, `PANEL_TOKEN` & co. — systemd drops such lines and panel-ddns/panel-api would silently lose
+the value. A bare `KEY` line without `=` only warns (systemd and the deploy scripts ignore it; docker compose would inherit it only from
+its own environment); any other stray text is refused — docker compose would reject the file at `up` time, or (for yaml-style `KEY:value`)
+parse it as an assignment systemd would ignore.
 
 Create `compose/authelia/users_database.yml` from the template — the real file is gitignored, so password hashes never reach GitHub (a fresh
 clone won't have it):

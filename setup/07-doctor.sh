@@ -4,6 +4,11 @@
 # only — not part of the numbered deploy sequence. Run ON THE SERVER:
 #   make doctor
 set -uo pipefail  # deliberately NOT -e — every check runs; report everything
+# Shared env-file parser (pure function, sets no shell options — safe to
+# source here, where a picked-up `set -e` would break the report-everything
+# design).
+# shellcheck disable=SC1091
+source "$(dirname "$(realpath "$0")")/envload.sh"
 
 C_G=$'\033[1;32m'; C_Y=$'\033[1;33m'; C_R=$'\033[1;31m'; C_D=$'\033[2m'; C_0=$'\033[0m'
 pass=0; fail=0; warnn=0; skipn=0
@@ -46,8 +51,15 @@ section() { printf '\n%s\n' "$*"; }
 section "config (.env)"
 REPO_ROOT="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
 if [[ -f "$REPO_ROOT/.env" ]]; then
-  # shellcheck disable=SC1091
-  set -a; source "$REPO_ROOT/.env"; set +a
+  # Literal parse, never `source` (see setup/envload.sh): a value with a
+  # space, $VAR or backticks must not abort or execute in the doctor while
+  # compose reads the same file — and the parser refuses values compose or
+  # systemd would reinterpret, so the checks below see what the containers
+  # actually receive.
+  if ! env_file_load "$REPO_ROOT/.env"; then
+    bad ".env has unparseable or unsafe lines (see warnings above)"
+    hint "every line must be KEY=VALUE; values: no \$, no backslash, no ' #' (setup/envload.sh)"
+  fi
   if [[ -n "${NAMESILO_API_KEY:-}" && "${NAMESILO_API_KEY:-}" != REPLACE_ME ]]; then
     ok "NAMESILO_API_KEY set"
   else

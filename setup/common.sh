@@ -9,14 +9,35 @@ die()  { printf '%s==>%s %s\n' "$C_R" "$C_0" "$*" >&2; exit 1; }
 
 # Repo root = parent of the directory this script was sourced from.
 REPO_ROOT="$(cd "$(dirname "$(realpath "${BASH_SOURCE[1]}")")/.." && pwd)"
+# Shared env-file parser (pure function, sets no shell options).
+# shellcheck disable=SC1091
+source "$REPO_ROOT/setup/envload.sh"
 
 need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1 (see setup/00-preflight.sh)"; }
+
+# Escape a value for use as the replacement side of `sed 's|...|VALUE|g'`:
+# the only replacement metacharacters are \, & and the | delimiter (the
+# values here are single-line, so no newlines can occur). Unescaped, an & in
+# the value re-inserts the matched text and a | terminates the script.
+sed_escape_replacement() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//&/\\&}"
+  s="${s//|/\\|}"
+  printf '%s' "$s"
+}
 
 # Load .env into the environment and sanity-check the required values.
 load_env() {
   [[ -f "$REPO_ROOT/.env" ]] || die ".env not found — run: make secrets"
-  # shellcheck disable=SC1091
-  set -a; source "$REPO_ROOT/.env"; set +a
+  # Literal KEY=VALUE parse — never `source` (see envload.sh): a pasted value
+  # with a space, $VAR or backticks must abort HERE with a clear message
+  # instead of dying as an unrelated shell error or executing code. The
+  # parser also refuses anything docker compose or systemd would read
+  # differently ($, backslash, ' #' in values), so what the deploy scripts
+  # use is exactly what the containers and systemd units receive.
+  env_file_load "$REPO_ROOT/.env" \
+    || die ".env has unparseable or unsafe lines — every line must be KEY=VALUE; values must not contain \$, backslashes or ' #' (see warnings above)"
   [[ -n "${NAMESILO_API_KEY:-}" && "${NAMESILO_API_KEY:-}" != "REPLACE_ME" ]] \
     || die "Set NAMESILO_API_KEY in .env (NameSilo → Domain Manager → API)"
   [[ -n "${ACME_EMAIL:-}" && "${ACME_EMAIL:-}" != "__ACME_EMAIL__" ]] \
@@ -52,6 +73,7 @@ sync_panel_api_env() { # <target-dir> — derive <target>/.panel-api.env from <t
   for key in PANEL_TOKEN PANEL_DEV PANEL_DISK_MOUNTS; do
     # ^KEY= with optional surrounding whitespace mirrors systemd's EnvironmentFile
     # parser; if a key is duplicated, the last line wins in both — semantics match.
+    # shellcheck disable=SC2024 # sudo is only for reading the 0600 .env; $tmp must stay user-owned
     sudo grep -E "^[[:space:]]*${key}[[:space:]]*=" "$target/.env" >>"$tmp" || true
   done
   sudo install -m 600 "$tmp" "$target/.panel-api.env"   # root:root 0600 — panel can't read it
@@ -116,10 +138,17 @@ stack_sync_configs() { # <target-dir>
     fi
   done <<<"$target_list"
   info "Writing secrets into deployed configs (repo copies keep placeholders)"
+  # Escaped replacements: the values are user-edited .env lines, and an & or
+  # | in one would corrupt the substitution (sed re-inserts the match on &
+  # and ends the script at |) — a mangled PANEL_TOKEN breaks every /api call.
+  local v_acme_email v_acme_ca v_panel_token
+  v_acme_email="$(sed_escape_replacement "$ACME_EMAIL")"
+  v_acme_ca="$(sed_escape_replacement "${ACME_CA_SERVER:-https://acme-v02.api.letsencrypt.org/directory}")"
+  v_panel_token="$(sed_escape_replacement "$PANEL_TOKEN")"
   sudo sed -i \
-    -e "s|__ACME_EMAIL__|${ACME_EMAIL}|g" \
-    -e "s|__ACME_CA_SERVER__|${ACME_CA_SERVER:-https://acme-v02.api.letsencrypt.org/directory}|g" \
-    -e "s|__PANEL_TOKEN__|${PANEL_TOKEN}|g" \
+    -e "s|__ACME_EMAIL__|${v_acme_email}|g" \
+    -e "s|__ACME_CA_SERVER__|${v_acme_ca}|g" \
+    -e "s|__PANEL_TOKEN__|${v_panel_token}|g" \
     "$target/traefik/traefik.yml" \
     "$target/traefik/dynamic/middlewares.yml"
   if sudo grep -RqE '__ACME_EMAIL__|__ACME_CA_SERVER__|__PANEL_TOKEN__' "$target/traefik" "$target/docker-compose.yml" 2>/dev/null; then
@@ -211,7 +240,8 @@ acme_wait_for_cert() { # <target-dir> <timeout-seconds> — poll until a cert la
 
 acme_promote() { # <target-dir> — flip staging→prod. Idempotent; wipes the ACME store.
   local target="$1"
-  local mode="$(acme_mode "$target/traefik/traefik.yml")"
+  local mode
+  mode="$(acme_mode "$target/traefik/traefik.yml")"
   if [[ "$mode" == prod ]]; then
     info "ACME already on production — nothing to promote"
     return 0
@@ -454,6 +484,9 @@ json.dump({"snapshot": sys.argv[1], "status": "in-progress", "services": svcs},
 ' "$ts" "$tmp"
   sudo install -m 644 "$tmp" "$STACK_STATE_FILE"
   rm -f "$tmp"
+  # Global consumed by setup/08-update.sh (which sources this file) —
+  # invisible to a per-file shellcheck run.
+  # shellcheck disable=SC2034
   SNAPSHOT_TS="$ts"
 }
 
