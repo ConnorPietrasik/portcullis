@@ -31,9 +31,13 @@ cat >"$tmp" <<'EOF'
 Defaults:panel !requiretty
 panel ALL=(root) NOPASSWD: /usr/local/libexec/panel-do
 EOF
+# Validate the candidate BEFORE install: plain visudo -c checks the live
+# tree (old order installed first). A broken file drops the panel rule on
+# every sudo call — host-wide lockout on sudo < 1.9.3.
+sudo visudo -c -f "$tmp" >/dev/null \
+  || die "sudoers validation failed — candidate kept at $tmp for inspection"
 sudo install -o root -g root -m 0440 "$tmp" /etc/sudoers.d/panel
 rm -f "$tmp"
-sudo visudo -c >/dev/null || die "sudoers validation failed"
 
 info "Running panel-do self-tests"
 pd() { sudo -u panel sudo -n /usr/local/libexec/panel-do "$@" >/dev/null 2>&1; }
