@@ -44,8 +44,8 @@ load_env() {
 # reads it as root, so the 0600 mode never blocks the unit — the service still
 # cannot open the file itself.
 # Called from 02-deploy-stack.sh (make deploy) AND 03-panel-api.sh (make api)
-# so both the install and the "edit .env → make deploy → restart" rotate flow
-# keep it in sync with .env. Regenerates (overwrites) on every run.
+# so both the install and the "edit .env → make update" rotate flow keep it
+# in sync with .env. Regenerates (overwrites) on every run.
 sync_panel_api_env() { # <target-dir> — derive <target>/.panel-api.env from <target>/.env
   local target="$1" key tmp
   tmp="$(mktemp)"
@@ -65,6 +65,106 @@ ensure_panel_user() {
   if ! id panel >/dev/null 2>&1; then
     info "Creating system user 'panel'"
     sudo useradd -r -s /usr/sbin/nologin -d /opt/panel-api panel
+  fi
+}
+
+# ── Repo → deployed stack sync (make deploy / make update) ────────────────────
+# The ONE place the repo's compose tree reaches /opt/panel and secrets are
+# written into the deployed configs — first boot (02) and gated Day-2 updates
+# (08) must apply the identical sync, so it lives here, not in 02.
+# Idempotent: re-running it on an already-deployed server re-copies the same
+# files and re-derives the env files. Requires load_env (ACME_EMAIL /
+# ACME_CA_SERVER / PANEL_TOKEN for the substitution below).
+#
+# Start-time-only configs (authelia's configuration.yml + users DB — file.watch
+# is off; traefik's STATIC traefik.yml) are read only at container start:
+# `up -d` recreates a service only when its compose *definition* changes, never
+# for bind-mounted file content, and neither service hot-reloads. So the sync
+# snapshots those files first (STACK_CONFIG_SNAP, cleaned on EXIT), and
+# stack_restart_if_configs_changed() — called AFTER `up -d` — restarts the
+# affected services only if the content actually changed. A routine run adds
+# no downtime. (traefik/dynamic/ is exempt — the file provider hot-reloads it.)
+stack_sync_configs() { # <target-dir>
+  local target="$1"
+  local f target_list repo_list
+  if ! sudo docker network inspect edge >/dev/null 2>&1; then
+    info "Creating external docker network 'edge'"
+    sudo docker network create edge
+  fi
+  STACK_CONFIG_SNAP="$(mktemp -d)"
+  trap 'rm -rf "$STACK_CONFIG_SNAP"' EXIT
+  for f in authelia/configuration.yml authelia/users_database.yml traefik/traefik.yml; do
+    if [[ -f "$target/$f" ]]; then
+      sudo cp -p "$target/$f" "$STACK_CONFIG_SNAP/${f//\//_}"
+    fi
+  done
+  info "Copying compose stack to $target (skipping node_modules/dist)"
+  sudo mkdir -p "$target"
+  tar -C "$REPO_ROOT/compose" --exclude=node_modules --exclude=dist -cf - . \
+    | sudo tar -C "$target" -xf -
+  # Remove managed configs deleted from the repo (e.g. a route file taken out
+  # of traefik/dynamic/) — tar overwrites but never prunes. Scoped to traefik/
+  # only: authelia/ holds runtime data (db.sqlite3 with TOTP seeds,
+  # users_database.yml) and is never pruned.
+  target_list="$(cd "$target/traefik" && find . -type f | sed 's|^\./||' | sort)"
+  repo_list="$(cd "$REPO_ROOT/compose/traefik" && find . -type f | sed 's|^\./||' | sort)"
+  [[ -n "$repo_list" ]] || die "repo traefik tree unexpectedly empty — aborting before touching $target"
+  while IFS= read -r f; do
+    if ! grep -Fxq -- "$f" <<<"$repo_list"; then
+      info "Removing stale managed config: traefik/$f"
+      sudo rm -f "$target/traefik/$f"
+    fi
+  done <<<"$target_list"
+  info "Writing secrets into deployed configs (repo copies keep placeholders)"
+  sudo sed -i \
+    -e "s|__ACME_EMAIL__|${ACME_EMAIL}|g" \
+    -e "s|__ACME_CA_SERVER__|${ACME_CA_SERVER:-https://acme-v02.api.letsencrypt.org/directory}|g" \
+    -e "s|__PANEL_TOKEN__|${PANEL_TOKEN}|g" \
+    "$target/traefik/traefik.yml" \
+    "$target/traefik/dynamic/middlewares.yml"
+  if sudo grep -RqE '__ACME_EMAIL__|__ACME_CA_SERVER__|__PANEL_TOKEN__' "$target/traefik" "$target/docker-compose.yml" 2>/dev/null; then
+    die "secret substitution failed — placeholders remain under $target"
+  fi
+  sudo install -m 600 "$REPO_ROOT/.env" "$target/.env"
+  # panel-api must not hold the full secret set in its env (it reads only the
+  # PANEL_* vars) — re-derive its reduced env file so an .env edit stays
+  # one-shot (see sync_panel_api_env).
+  sync_panel_api_env "$target"
+  sudo chmod 600 "$target/traefik/dynamic/middlewares.yml"   # contains PANEL_TOKEN
+  if [[ ! -f "$target/authelia/users_database.yml" ]]; then
+    die "authelia/users_database.yml missing (fresh clone? it's gitignored — hashes stay off GitHub).
+
+Create it from the template:
+  cp compose/authelia/users_database.yml.example compose/authelia/users_database.yml
+…then generate a hash per user (docs/RUNBOOK.md → Phase 1) and re-run."
+  fi
+  if sudo grep -q 'REPLACE_WITH_ARGON2_HASH' "$target/authelia/users_database.yml"; then
+    die "authelia/users_database.yml still has placeholder passwords.
+
+Generate a hash for each user:
+  docker run --rm authelia/authelia:4 authelia crypto hash generate argon2 --password 'YOUR-PASSWORD'
+
+…then edit compose/authelia/users_database.yml and re-run."
+  fi
+}
+
+stack_restart_if_configs_changed() { # <target-dir> — call AFTER `up -d`
+  local target="$1"
+  local f authelia_changed=0 traefik_changed=0 services=()
+  for f in authelia/configuration.yml authelia/users_database.yml; do
+    if [[ -f "$STACK_CONFIG_SNAP/${f//\//_}" ]] && ! sudo cmp -s "$STACK_CONFIG_SNAP/${f//\//_}" "$target/$f"; then
+      authelia_changed=1
+    fi
+  done
+  if [[ -f "$STACK_CONFIG_SNAP/traefik_traefik.yml" ]] \
+     && ! sudo cmp -s "$STACK_CONFIG_SNAP/traefik_traefik.yml" "$target/traefik/traefik.yml"; then
+    traefik_changed=1
+  fi
+  if (( authelia_changed || traefik_changed )); then
+    if (( authelia_changed )); then services+=(authelia); fi
+    if (( traefik_changed )); then services+=(traefik); fi
+    info "Config content changed — restarting ${services[*]} (read only at container start, no hot reload)"
+    sudo docker compose --project-directory "$target" -f "$target/docker-compose.yml" restart "${services[@]}"
   fi
 }
 
@@ -149,4 +249,601 @@ acme_promote() { # <target-dir> — flip staging→prod. Idempotent; wipes the A
   else
     warn "no production cert after ${ACME_PROMOTE_WAIT:-300}s — traefik keeps retrying; check: make logs"
   fi
+}
+
+# ── Stack update / rollback (make update / make rollback) ────────────────────────
+# `make update` is the ONE Day-2 command: it applies the repo's configs
+# (compose/traefik/authelia/portfolio + .env — the same sync as make deploy)
+# AND floats everything that has a *line*: container images on the major line
+# (traefik:v3, authelia/authelia:4, nginx:stable-alpine — see
+# compose/docker-compose.yml), panel-web's base images on theirs (node:22-alpine,
+# nginx:stable-alpine — compose/panel-frontend/Dockerfile), the frontend's npm
+# deps within the ranges declared in package.json, and panel-api's pip deps
+# within the ranges declared in requirements.txt. Patch/minor security releases
+# ride in on every update; a MAJOR — the only line where breaking changes land —
+# stays a deliberate edit (a tag, a FROM, a range). make deploy remains the
+# FIRST-BOOT path (network, secrets, ACME staging→prod, first build); it no
+# longer pulls, and a Day-2 re-run of it applies config ungated (it warns).
+#
+# `make update` (08-update.sh) wraps the whole rollout in a safety net:
+#   0. precondition — `make doctor` is green up front (UPDATE_DOCTOR=0 skips):
+#      a pre-existing doctor failure would otherwise auto-revert the whole
+#      update, so fail before touching anything.
+#   1. snapshot — /opt/panel/.update-snapshot-<ts> + state in
+#      /opt/panel/.update-state: each running image re-tagged
+#      portcullis-rollback/<svc>:<ts> (anchored on the image *ID* — tags move,
+#      IDs don't), the deployed config tree (panel.tar, runtime data excluded),
+#      an exact copy of /opt/panel-api (venv included, so its rollback needs no
+#      network), and the npm files about to be bumped.
+#   2. npm bump (within declared ranges) + config sync + pull — a failure stops
+#      the run before any container is touched.
+#   3. rebuild (bases pulled) + converge the services that should be running:
+#      the pre-update running set + services this update added (deliberately
+#      stopped ones stay down; removed ones' containers are dropped), then
+#      update panel-api (code + pip within ranges + restart).
+#   4. gate — every service that was running before the update healthy again
+#      (a deliberately stopped — or removed — service can't fail the gate),
+#      panel-api serving, then a full 07-doctor pass.
+#   5. gate fails → automatic rollback of all of it: restore the pre-update
+#      config tree, recreate the snapshot's images via a temporary compose
+#      override (--remove-orphans drops containers for services added during
+#      the failed update), restore the exact panel-api copy, restore the npm
+#      files.
+# `make rollback` (09-rollback.sh) applies step 5 on demand. The state file
+# always holds the *pre-update* snapshot, so one `make rollback` undoes the
+# last update.
+
+STACK_STATE_FILE=/opt/panel/.update-state
+STACK_LOCK_FILE=/opt/panel/.update.lock
+ROLLBACK_TAG_PREFIX=portcullis-rollback
+ROLLBACK_RETAIN_DAYS=14
+SNAPSHOT_DIR_PREFIX=/opt/panel/.update-snapshot-   # + <ts>: panel-api copy + npm files
+
+update_snapshot_dir() { # <ts> → that snapshot's dir
+  echo "${SNAPSHOT_DIR_PREFIX}$1"
+}
+
+# Compose command for the deployed stack (project dir /opt/panel). Global so
+# apply_snapshot() can append its override -f.
+COMPOSE_STACK=(sudo docker compose --project-directory /opt/panel -f /opt/panel/docker-compose.yml)
+stack_compose() { "${COMPOSE_STACK[@]}" "$@"; }
+
+stack_services() { # every service defined in the deployed compose, one per line
+  stack_compose config --format json \
+    | python3 -c 'import json,sys
+try:
+    svcs = json.load(sys.stdin).get("services") or {}
+except json.JSONDecodeError:
+    sys.exit(1)
+[print(s) for s in svcs]' \
+    || die "cannot read the deployed compose config (missing env vars? re-run: make deploy)"
+}
+
+stack_pull_services() { # services with an `image:` key (build-only ones are skipped)
+  stack_compose config --format json \
+    | python3 -c 'import json,sys
+try:
+    svcs = json.load(sys.stdin).get("services") or {}
+except json.JSONDecodeError:
+    sys.exit(1)
+[print(s) for s, v in svcs.items() if isinstance(v, dict) and v.get("image")]' \
+    || die "cannot read the deployed compose config (missing env vars? re-run: make deploy)"
+}
+
+stack_image_ids() { # service → image ID of its running container (svc<TAB>id)
+  # Deliberately NOT `docker compose images --format json`: its schema has
+  # moved across compose releases (v2.37/2.38 output a map instead of a list,
+  # and the objects carry ContainerName — never Service), so parsing it is a
+  # version lottery. `ps` template + `inspect` is stable (same idiom as
+  # snapshot_stack, below).
+  local svc name id
+  while IFS='|' read -r svc name; do
+    [[ -n "${name:-}" ]] || continue
+    id="$(sudo docker inspect --format '{{.Image}}' "$name" 2>/dev/null)" || continue
+    printf '%s\t%s\n' "$svc" "$id"
+  done < <(stack_compose ps --format '{{.Service}}|{{.Name}}' 2>/dev/null || true)
+}
+
+image_version_label() { # <image-id> → org.opencontainers.image.version label or ""
+  sudo docker inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$1" 2>/dev/null || true
+}
+
+update_acquire_lock() {
+  # /opt/panel is root-owned, so the lock file is created (once, self-healing)
+  # 666 — its content is irrelevant; only the flock matters.
+  [[ -f "$STACK_LOCK_FILE" ]] || sudo install -m 666 /dev/null "$STACK_LOCK_FILE" \
+    || die "cannot create lock file $STACK_LOCK_FILE"
+  exec 9>>"$STACK_LOCK_FILE" || die "cannot open lock file $STACK_LOCK_FILE"
+  flock -n 9 || die "another update/rollback is already running (lock: $STACK_LOCK_FILE — wait for it, or kill the other run)"
+}
+
+sudo_warm() { # re-warm the sudo timestamp so long operations don't prompt mid-run
+  sudo -n true 2>/dev/null || sudo -v 2>/dev/null || true
+}
+
+update_set_status() { # <status: in-progress|updated|rolled-back> — on the live state file
+  local tmp
+  tmp="$(mktemp)"
+  python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["status"] = sys.argv[2]
+json.dump(d, open(sys.argv[3], "w"), indent=2)
+' "$STACK_STATE_FILE" "$1" "$tmp"
+  sudo install -m 644 "$tmp" "$STACK_STATE_FILE"
+  rm -f "$tmp"
+}
+
+update_gc_old_snapshots() { # prune rollback tags + snapshot dirs older than ROLLBACK_RETAIN_DAYS (never the live ones)
+  local tag now created age live dir d ts live_dir
+  [[ -f "$STACK_STATE_FILE" ]] || return 0
+  now="$(date +%s)"
+  live="$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    [print(i["rollback_image"]) for i in d.get("services", {}).values()]
+except Exception:
+    pass' "$STACK_STATE_FILE" 2>/dev/null || true)"
+  for tag in $(sudo docker image ls --filter "reference=${ROLLBACK_TAG_PREFIX}/*" \
+      --format '{{.Repository}}:{{.Tag}}' 2>/dev/null); do
+    [[ -n "$live" ]] && grep -Fqx "$tag" <<<"$live" && continue
+    created="$(sudo docker image inspect --format '{{.Created}}' "$tag" 2>/dev/null)" || continue
+    created_s="$(date -d "$created" +%s 2>/dev/null)" || continue   # unknown age → skip, never guess "old"
+    age=$(( now - created_s ))
+    if (( age > ROLLBACK_RETAIN_DAYS * 86400 )) \
+       && sudo docker rmi "$tag" >/dev/null 2>&1; then
+      info "Pruned old rollback tag $tag (older than ${ROLLBACK_RETAIN_DAYS} days)"
+    fi
+  done
+  # Snapshot dirs (panel-api copy + npm files) — same retention, keyed by the
+  # ts in the name; never the live snapshot's.
+  live_dir="$(update_snapshot_dir "$(python3 -c '
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("snapshot", ""))
+except Exception:
+    pass' "$STACK_STATE_FILE" 2>/dev/null)")"
+  for dir in /opt/panel/.update-snapshot-*/; do
+    [[ -d "$dir" ]] || continue
+    d="${dir%/}"
+    [[ -n "$live_dir" && "$d" == "$live_dir" ]] && continue
+    ts="${d##"$SNAPSHOT_DIR_PREFIX"}"   # d is <prefix><ts> — the basename is NOT the ts
+    # ts is UTC (date -u at snapshot time) — the trailing Z keeps the age math
+    # exact regardless of the host's timezone.
+    created="$(date -d "${ts:0:4}-${ts:4:2}-${ts:6:2}T${ts:9:2}:${ts:11:2}:${ts:13:2}Z" +%s 2>/dev/null)" || continue
+    age=$(( now - created ))
+    if (( age > ROLLBACK_RETAIN_DAYS * 86400 )) && sudo rm -rf "$d"; then
+      info "Pruned old snapshot dir $d (older than ${ROLLBACK_RETAIN_DAYS} days)"
+    fi
+  done
+}
+
+# Snapshot the running stack: re-tag every running image, write the state file,
+# set $SNAPSHOT_TS. Services without a running container are skipped with a
+# note — the update proceeds, and a later rollback simply leaves them as-is.
+# (Global, not echo: the warns above go to stdout, so command substitution
+# would capture them too.)
+snapshot_stack() {
+  local ts svc container image_id lines="" tmp
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  for svc in $(stack_services); do
+    container="$(stack_compose ps --format '{{.Service}}|{{.Name}}|{{.State}}' 2>/dev/null \
+      | awk -F'|' -v s="$svc" '$1==s && $3=="running" {print $2; exit}' || true)"
+    if [[ -z "$container" ]]; then
+      warn "no running container for $svc — excluded from the rollback snapshot"
+      continue
+    fi
+    image_id="$(sudo docker inspect --format '{{.Image}}' "$container")" \
+      || die "cannot read the running image of $container ($svc)"
+    sudo docker tag "$image_id" "${ROLLBACK_TAG_PREFIX}/${svc}:${ts}" \
+      || die "cannot tag $image_id as ${ROLLBACK_TAG_PREFIX}/${svc}:${ts}"
+    lines+="${svc}|${image_id}|${ROLLBACK_TAG_PREFIX}/${svc}:${ts}"$'\n'
+  done
+  tmp="$(mktemp)"
+  printf '%s' "$lines" | python3 -c '
+import json, sys
+svcs = {}
+for line in sys.stdin:
+    line = line.strip()
+    if line:
+        svc, image_id, rb = line.split("|")
+        svcs[svc] = {"image_id": image_id, "rollback_image": rb}
+json.dump({"snapshot": sys.argv[1], "status": "in-progress", "services": svcs},
+          open(sys.argv[2], "w"), indent=2)
+' "$ts" "$tmp"
+  sudo install -m 644 "$tmp" "$STACK_STATE_FILE"
+  rm -f "$tmp"
+  SNAPSHOT_TS="$ts"
+}
+
+# Wait until every expected service is running (and healthy, if it defines a
+# healthcheck). 0 on success; 1 on exited/dead/restarting/unhealthy or timeout —
+# the reason lands in $HEALTH_GATE_REASON. Reads the full container list
+# (--all), so a crash-loop (state restarting/exited) fails immediately instead
+# of waiting for the healthcheck to declare unhealthy; a service with a serving
+# (running + healthy/none) container passes over any stale remnant.
+wait_stack_healthy() { # <timeout-seconds> <expected service...>
+  local timeout="$1"; shift
+  local deadline out verdict
+  deadline=$(( $(date +%s) + timeout ))
+  while :; do
+    sudo_warm
+    # --all: without it, ps lists only RUNNING containers — a crash-looping
+    # service is invisible and would read as "no container yet", burning the
+    # whole budget before the gate can fail.
+    out="$(stack_compose ps --all --format json 2>/dev/null || true)"
+    # (env var, not a pipe: the heredoc below already owns python's stdin)
+    # A crash here means the ps output is unparseable (compose too old / format
+    # changed) — fail fast with a reason instead of burning the whole budget.
+    if ! verdict="$(PS_JSON="$out" python3 - "$@" <<'PYEOF'
+import json, os, sys
+text = os.environ.get("PS_JSON", "").strip()
+try:
+    data = json.loads(text) if text else []
+except json.JSONDecodeError:
+    data = [json.loads(l) for l in text.splitlines() if l.strip()]
+if not isinstance(data, list):
+    data = [data]
+rows = {}
+for x in data:
+    if isinstance(x, dict) and x.get("Service"):
+        rows.setdefault(x["Service"], []).append(
+            (x.get("State") or "unknown", x.get("Health") or "none"))
+bad, pending = [], []
+for s in sorted(sys.argv[1:]):
+    cs = rows.get(s)
+    if not cs:
+        pending.append(s + " (no container yet)")
+        continue
+    # Serving container wins: with --all, a stale exited remnant must not sink
+    # a service that is running healthy.
+    if any(st == "running" and h in ("healthy", "none") for st, h in cs):
+        continue
+    dead = [f"{s} ({st})" for st, _ in cs
+            if st in ("exited", "dead", "restarting", "paused")]
+    if dead:
+        bad.extend(dead)
+    elif any(h == "unhealthy" for _, h in cs):
+        bad.append(f"{s} (unhealthy)")
+    else:
+        pending.append(s)
+if bad:
+    print("BAD\t" + "; ".join(bad))
+elif pending:
+    print("WAIT\t" + "; ".join(pending))
+else:
+    print("OK")
+PYEOF
+)"; then
+      HEALTH_GATE_REASON="cannot parse the compose ps output (unexpected format — is the compose version too old?)"
+      warn "health gate: $HEALTH_GATE_REASON"
+      return 1
+    fi
+    case "$verdict" in
+      OK*) HEALTH_GATE_REASON=""; return 0 ;;
+      BAD*) HEALTH_GATE_REASON="${verdict#*$'\t'}"; warn "health gate: $HEALTH_GATE_REASON"; return 1 ;;
+    esac
+    if (( $(date +%s) >= deadline )); then
+      HEALTH_GATE_REASON="timeout after ${timeout}s — ${verdict#*$'\t'}"
+      warn "health gate: $HEALTH_GATE_REASON"
+      return 1
+    fi
+    sleep 10
+  done
+}
+
+# Recreate the snapshot's services from the rollback tags recorded in <state-file>,
+# via a temporary compose override (the deployed compose file is never modified).
+# 0 on success (re-gated); 1 on failure — the override file is kept for manual use.
+apply_snapshot() { # <state-file> <timeout-seconds>
+  local state="$1" timeout="$2"
+  local override pairs svc tag svcs=() missing=()
+  sudo_warm
+  override="$(mktemp /tmp/portcullis-rollback.XXXXXX.yml)"
+  pairs="$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+for s, i in d.get("services", {}).items():
+    print(s + "\t" + i["rollback_image"])
+' "$state")"
+  [[ -n "$pairs" ]] || die "snapshot $state records no services — nothing to roll back to"
+  while IFS=$'\t' read -r svc tag; do
+    svcs+=("$svc")
+    sudo docker image inspect "$tag" >/dev/null 2>&1 || missing+=("$tag")
+  done <<<"$pairs"
+  if (( ${#missing[@]} > 0 )); then
+    rm -f "$override"
+    die "rollback image(s) missing locally — the snapshot is unusable (were the tags pruned?):
+  ${missing[*]}"
+  fi
+  python3 - "$state" <<'PYEOF' >"$override"
+import json, sys
+d = json.load(open(sys.argv[1]))
+print("services:")
+for s, i in d["services"].items():
+    print(f"  {s}:")
+    print(f"    image: {i['rollback_image']}")
+PYEOF
+  local -a cmd=("${COMPOSE_STACK[@]}" -f "$override")
+  info "Restoring snapshot images for: ${svcs[*]}"
+  # --remove-orphans: a service ADDED during the failed update is no longer in
+  # the (restored) pre-update compose file — drop its container. Services that
+  # were deliberately stopped pre-update are still in the file, so their (stopped)
+  # containers are kept.
+  "${cmd[@]}" up -d --force-recreate --remove-orphans "${svcs[@]}"
+  if wait_stack_healthy "$timeout" "${svcs[@]}"; then
+    rm -f "$override"
+    return 0
+  fi
+  warn "rollback re-gate failed — override kept at $override for manual use"
+  return 1
+}
+
+# ── Non-container update targets: panel-api (host service) + npm files ──────────
+# `make update` covers the host-side half of the stack too, so one command
+# floats everything that has a line to float:
+#   panel-web frontend — the build context is synced from the repo by the config
+#     sync (08-update.sh step 3) and its npm deps are bumped with
+#     `npm update --package-lock-only` (within the ranges declared in
+#     package.json — the npm analogue of the image policy: a major is a
+#     deliberate range edit).
+#   panel-api — main.py + requirements.txt + the systemd unit re-deployed, pip
+#     deps upgraded with --upgrade within the ranges in requirements.txt
+#     (fastapi>=0.115,<1 style — same policy), service restarted.
+# Both are snapshotted into the update's snapshot dir and both are rolled back
+# with it. panel-do / panel-ddns have no external dependencies (stdlib-only
+# Go/Python) — nothing to float; their update is a repo edit + make target.
+
+# Snapshot the non-image update targets into <snapshot-dir>: the deployed
+# config tree (panel.tar) + panel-api/ + panel-api.service + npm/. Called in
+# step 1, before anything is touched, so a missing piece simply means "not
+# updated yet" — rollback skips it.
+snapshot_host_stack() { # <snapshot-dir>
+  local dir="$1" fe m
+  fe="$REPO_ROOT/compose/panel-frontend"
+  sudo mkdir -p "$dir/npm" || die "cannot create snapshot dir $dir"
+  # The snapshot holds secrets (panel.tar carries .env + .panel-api.env) —
+  # root-only, mirroring the 0600 discipline of the deployed originals.
+  sudo chmod 700 "$dir"
+  if [[ -d /opt/panel-api ]]; then
+    # Exact copy, venv included: what makes the panel-api rollback offline.
+    sudo cp -a /opt/panel-api "$dir/panel-api" \
+      || die "cannot snapshot /opt/panel-api into $dir (disk full?)"
+    sudo cp -a /etc/systemd/system/panel-api.service "$dir/panel-api.service" 2>/dev/null || true
+  fi
+  # The lockfile is gitignored server-local state — snapshot it only if this
+  # server has generated one yet (rollback then restores it too).
+  sudo cp -a "$fe/package.json" "$dir/npm/" \
+    || die "cannot snapshot the npm files ($fe) into $dir"
+  if [[ -f "$fe/package-lock.json" ]]; then
+    sudo cp -a "$fe/package-lock.json" "$dir/npm/" \
+      || die "cannot snapshot the npm files ($fe) into $dir"
+  fi
+  # The deployed config tree (what the update will re-sync from the repo) — a
+  # tarball, so rollback restores it as a unit. Explicit members only, so
+  # runtime data is never in it: authelia/db.sqlite3 (TOTP seeds — see the
+  # RUNBOOK's migration caveat) and panel-frontend's node_modules/dist.
+  local members=()
+  for m in docker-compose.yml traefik portfolio authelia/configuration.yml \
+           authelia/users_database.yml panel-frontend .env .panel-api.env; do
+    [[ -e "/opt/panel/$m" ]] && members+=("$m")
+  done
+  if (( ${#members[@]} > 0 )); then
+    sudo tar -C /opt/panel --exclude=panel-frontend/node_modules --exclude=panel-frontend/dist \
+      -cf "$dir/panel.tar" "${members[@]}" \
+      || die "cannot snapshot the deployed config tree into $dir (disk full?)"
+    sudo chmod 600 "$dir/panel.tar"   # .env + .panel-api.env inside — not for other users
+  fi
+}
+
+# Bump the panel frontend's npm deps within the declared ranges (package.json's
+# ranges are what bound the bump — untouched by design). The lockfile is
+# gitignored SERVER-LOCAL state, not a repo artifact: a fresh clone has none,
+# in which case this generates it from the ranges (`npm install
+# --package-lock-only`, no node_modules) instead of bumping. Step 1's snapshot
+# holds the pre-bump lockfile when one existed (rollback restores it). Runs
+# before the pull so a failure touches nothing.
+npm_bump_panel_frontend() {
+  local fe out
+  fe="$REPO_ROOT/compose/panel-frontend"
+  if [[ ! -f "$fe/package-lock.json" ]]; then
+    if ! out="$(cd "$fe" && npm install --package-lock-only 2>&1)"; then
+      warn "$out"
+      die "npm install --package-lock-only failed — the running stack is untouched; fix the registry/network issue and re-run: make update"
+    fi
+    info "npm: no lockfile on this server yet — generated it from the declared ranges (server-local state, not committed)"
+    return 0
+  fi
+  # --package-lock-only: bump the LOCKFILE only — a plain `npm update` also
+  # materializes node_modules (~100 MB) in the repo dir, where it serves no
+  # purpose (the build runs in Docker) and just goes stale after rollbacks.
+  if ! out="$(cd "$fe" && npm update --package-lock-only 2>&1)"; then
+    warn "$out"
+    die "npm update failed — the running stack is untouched; fix the registry/network issue and re-run: make update"
+  fi
+  info "npm: $(tail -n1 <<<"$out")"
+}
+
+# Wait for panel-api to be active and serving (0 yes; 1 no — reason in
+# $PANEL_API_REASON). Same checks as the doctor's panel-api section.
+wait_panel_api_healthy() { # <timeout-seconds>
+  local timeout="$1" deadline h
+  deadline=$(( $(date +%s) + timeout ))
+  while :; do
+    if systemctl is-active --quiet panel-api 2>/dev/null; then
+      h="$(curl -s --max-time 5 http://172.17.0.1:8010/api/health 2>/dev/null || true)"
+      if grep -q '"ok":true' <<<"$h"; then
+        PANEL_API_REASON=""
+        return 0
+      fi
+    fi
+    if (( $(date +%s) >= deadline )); then
+      PANEL_API_REASON="panel-api not active or /api/health not ok after ${timeout}s (check: systemctl status panel-api)"
+      warn "panel-api: $PANEL_API_REASON"
+      return 1
+    fi
+    sleep 3
+  done
+}
+
+# Update the deployed panel-api in place: new main.py + requirements.txt + unit,
+# pip upgrade within the declared ranges, restart, verify serving. 0 ok; 1
+# failed (reason in $PANEL_API_REASON). Deliberately does NOT re-run
+# 03-panel-api.sh: its UFW gate is first-install protection (panel-api must not
+# BIND before the firewall exists); on an already-deployed server a firewall
+# regression surfaces in the doctor gate → auto-rollback.
+update_panel_api() {
+  PANEL_API_REASON=""
+  local f
+  for f in main.py requirements.txt; do
+    sudo cp -a "$REPO_ROOT/panel-api/$f" /opt/panel-api/ \
+      || { PANEL_API_REASON="cannot install $f into /opt/panel-api"; return 1; }
+  done
+  sudo chown -R panel:panel /opt/panel-api \
+    || { PANEL_API_REASON="chown /opt/panel-api failed"; return 1; }
+  sudo cp -a "$REPO_ROOT/panel-api/panel-api.service" /etc/systemd/system/panel-api.service \
+    || { PANEL_API_REASON="cannot install panel-api.service"; return 1; }
+  sudo systemctl daemon-reload \
+    || { PANEL_API_REASON="systemctl daemon-reload failed"; return 1; }
+  # --upgrade floats within the ranges in requirements.txt (>=x,<MAJOR) and
+  # converges if the installed set violates them — the pip analogue of the
+  # image policy.
+  sudo -u panel /opt/panel-api/venv/bin/pip install --quiet --upgrade -r /opt/panel-api/requirements.txt \
+    || { PANEL_API_REASON="pip install --upgrade failed (registry/network?)"; return 1; }
+  sudo systemctl restart panel-api \
+    || { PANEL_API_REASON="systemctl restart panel-api failed"; return 1; }
+  wait_panel_api_healthy 60 || return 1
+  return 0
+}
+
+# Restore the snapshot's exact panel-api copy (venv included → offline).
+# 0 ok (or not in snapshot — it was never updated); 1 failed.
+rollback_panel_api() { # <snapshot-dir>
+  local dir="$1"
+  if [[ ! -d "$dir/panel-api" ]]; then
+    info "  panel-api: not in snapshot — skipped"
+    return 0
+  fi
+  info "  panel-api: restoring the snapshot copy"
+  sudo systemctl stop panel-api 2>/dev/null || true
+  sudo rm -rf /opt/panel-api
+  sudo cp -a "$dir/panel-api" /opt/panel-api || { warn "  panel-api: restore copy failed"; return 1; }
+  if [[ -f "$dir/panel-api.service" ]]; then
+    sudo cp -a "$dir/panel-api.service" /etc/systemd/system/panel-api.service
+  fi
+  sudo systemctl daemon-reload 2>/dev/null || true
+  # The stop above was explicit, so Restart=on-failure won't bring the unit
+  # back — start it, then verify it actually serves the OLD code.
+  if ! sudo systemctl start panel-api 2>/dev/null; then
+    warn "  panel-api: copy restored but systemctl start failed — check: systemctl status panel-api"
+    return 1
+  fi
+  if wait_panel_api_healthy 60; then
+    info "  panel-api: restored and serving"
+    return 0
+  fi
+  warn "  panel-api: restored but not serving — check: systemctl status panel-api"
+  return 1
+}
+
+# Restore the snapshot's deployed config tree (docker-compose.yml, traefik/,
+# portfolio/, the authelia configs, panel-frontend, .env, .panel-api.env — see
+# snapshot_host_stack). Must run BEFORE the image recreate: the rollback's
+# `compose up` then reads the pre-update compose file + .env, and the re-created
+# containers start with pre-update configs. Runtime data is not in the tar and
+# is untouched. Files created under /opt/panel during the update (e.g. a newly
+# added app dir) are left in place — inert: the restored compose no longer
+# defines them and --remove-orphans already dropped their containers. 0 ok (or
+# not in snapshot — an older-generation snapshot); 1 failed.
+rollback_stack_configs() { # <snapshot-dir>
+  local dir="$1"
+  if [[ ! -f "$dir/panel.tar" ]]; then
+    info "  configs: not in snapshot — skipped"
+    return 0
+  fi
+  info "  configs: restoring the pre-update /opt/panel files"
+  if sudo tar -C /opt/panel -xf "$dir/panel.tar"; then
+    return 0
+  fi
+  warn "  configs: restore failed — the deployed configs may still be the post-update ones"
+  return 1
+}
+
+# Restore the snapshot's npm files in the repo. 0 ok (or not in snapshot).
+rollback_npm() { # <snapshot-dir>
+  local dir="$1" fe
+  fe="$REPO_ROOT/compose/panel-frontend"
+  if [[ ! -f "$dir/npm/package.json" ]]; then
+    info "  npm: not in snapshot — skipped"
+    return 0
+  fi
+  cp -a "$dir/npm/package.json" "$fe/" \
+    || { warn "  npm: file restore failed"; return 1; }
+  # The lockfile is gitignored server-local state — only in the snapshot if
+  # this server had generated one.
+  if [[ -f "$dir/npm/package-lock.json" ]]; then
+    cp -a "$dir/npm/package-lock.json" "$fe/" \
+      || { warn "  npm: lockfile restore failed"; return 1; }
+  fi
+  info "  npm: package.json restored (+ package-lock.json, if it was snapshotted)"
+  return 0
+}
+
+# Auto-rollback + hard stop — used by 08-update.sh when a gate fails.
+# Rolls back everything the update touched (container images, panel-api, npm
+# files), best-effort per component. Never returns.
+update_rollback_or_die() { # <reason>
+  local reason="$1" ts dir failed=()
+  warn "gate failed: $reason"
+  warn "rolling back to the pre-update snapshot (budget ${UPDATE_ROLLBACK_TIMEOUT:-300}s)"
+  sudo -v
+  ts="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("snapshot",""))' "$STACK_STATE_FILE" 2>/dev/null)" \
+    || die "cannot read the snapshot ts from $STACK_STATE_FILE — manual intervention needed"
+  [[ -n "$ts" ]] || die "state file $STACK_STATE_FILE holds no snapshot ts — manual intervention needed"
+  dir="$(update_snapshot_dir "$ts")"
+  # Configs first: the image recreate below must read the PRE-UPDATE compose
+  # file + .env (the restored ones).
+  rollback_stack_configs "$dir" || failed+=("configs")
+  # Subshell: apply_snapshot's die (e.g. rollback image pruned) must not abort
+  # the remaining rollbacks — record it as a failed component instead.
+  ( apply_snapshot "$STACK_STATE_FILE" "${UPDATE_ROLLBACK_TIMEOUT:-300}" ) || failed+=("container images")
+  rollback_panel_api "$dir" || failed+=("panel-api")
+  rollback_npm "$dir" || failed+=("npm files")
+  if (( ${#failed[@]} == 0 )); then
+    update_set_status rolled-back
+    die "update FAILED and the stack was reverted to the pre-update snapshot.
+Investigate, then re-run: make update
+  make logs     # the failing service's logs are the place to start
+  make doctor   # confirm everything is fully green again"
+  fi
+  # leave the status as "in-progress": the stack's state is unknown here and a
+  # later `make update`/`make rollback` will rewrite it.
+  die "update FAILED and the automatic rollback was PARTIAL — not reverted: ${failed[*]}
+Manual intervention needed (the remaining snapshots are intact — see docs/RUNBOOK.md → Updates).
+Snapshot dir: $dir  (panel-api copy + npm files)
+Rollback images: sudo docker image ls  (tags ${ROLLBACK_TAG_PREFIX}/*)
+State file: $STACK_STATE_FILE"
+}
+
+# Old→new per-service report: state file (what was running) vs current images.
+report_stack_update() { # <state-file> <after-ids-file>
+  local state="$1" after="$2" svc old new ov nv st
+  printf '  %-13s %-16s %-16s %s\n' service before after status
+  while IFS=$'\t' read -r svc old; do
+    new="$(awk -F'\t' -v s="$svc" '$1==s {print $2; exit}' "$after")"
+    ov="$(image_version_label "$old")"; ov="${ov:-${old:7:12}}"
+    if [[ -z "$new" ]]; then
+      nv="—"; st="image missing after update?!"
+    elif [[ "$new" == "$old" ]]; then
+      nv="$ov"; st="unchanged"
+    else
+      nv="$(image_version_label "$new")"; nv="${nv:-${new:7:12}}"
+      st="changed"
+    fi
+    printf '  %-13s %-16s %-16s %s\n' "$svc" "$ov" "$nv" "$st"
+  done < <(python3 -c '
+import json, sys
+for s, i in json.load(open(sys.argv[1]))["services"].items():
+    print(s + "\t" + i["image_id"])' "$state")
 }

@@ -6,6 +6,12 @@ compose/authelia/users_database.yml
 # frontend
 node_modules/
 dist/
+# package-lock.json is server-local state: `make update` keeps it current on
+# the server (the Docker build uses it via npm ci there); a fresh clone has no
+# lockfile and the build resolves from package.json's ranges instead. Keeping
+# it out of git also keeps git pull conflict-free between updates and stops
+# publishing exact resolved versions.
+package-lock.json
 package-lock.bak
 
 # go

@@ -66,21 +66,29 @@ RUNBOOK step by step so UFW lands in the window. First login: `https://auth.piet
 # on the server, in one shell:
 cd /opt/panel-api && PANEL_DEV=1 venv/bin/uvicorn main:app --port 8010   # ⚠ auth disabled, loopback only
 # in the repo:
-cd compose/panel-frontend && npm ci && npm run dev   # vite proxies /api → localhost:8010
+cd compose/panel-frontend && npm install && npm run dev   # vite proxies /api → localhost:8010
+# (npm install, not npm ci: the lockfile is gitignored server-local state — a fresh clone has none)
 ```
 
 Never set `PANEL_DEV=1` in production — the systemd unit doesn't, and nothing else should.
 
 ## Day-2 ops
 
-- **Patch updates**: images are pinned at the *minor* line (`traefik:v3.7`, `authelia:4.39`, `nginx:1.31`) — `make deploy` pulls the latest
-  patch (security/bugfixes) within each line. Minor bumps are deliberate edits to `compose/docker-compose.yml` — read the release notes
-  first, one minor at a time.
-- **New app**: compose service on `edge` + router in `compose/traefik/dynamic/` + optional Authelia rule →
-  [RUNBOOK](docs/RUNBOOK.md#add-an-app)
+- **Stack updates** (configs AND versions): `make update` is the one Day-2 command — it syncs every
+  repo change (compose, routes, Authelia config, `.env`, the panel frontend) and floats the stack on the
+  *major* line (`traefik:v3`, `authelia/authelia:4`, `nginx:stable-alpine`) with npm/pip bumps within
+  their declared ranges and pulled base images. It's the safe path: a green `make doctor` is required up
+  front, it snapshots everything (image IDs, the deployed configs, an exact panel-api copy, the npm
+  files), changes only what moved, gates on the pre-update containers' health + panel-api health + a
+  full doctor pass, and auto-rolls-back on failure (offline — the snapshot is local). `make rollback`
+  undoes the last update. Majors stay deliberate edits (a tag in compose, a range in
+  `package.json`/`requirements.txt`). `make deploy` is the first-boot path.
+  Details: [RUNBOOK](docs/RUNBOOK.md#updates)
+- **New app**: compose service on `edge` + router in `compose/traefik/dynamic/` + optional Authelia
+  rule, then `make update` → [RUNBOOK](docs/RUNBOOK.md#add-an-app)
 - **New privileged action**: edit `panel-do/main.go` ACTIONS section → `make panel-do` → [RUNBOOK](docs/RUNBOOK.md#add-a-privileged-action)
   (container control is registry actions too — Services and Actions views both render from `panel-do --list`)
-- **Rotate secrets**: edit `.env`, `make deploy`, `sudo systemctl restart panel-api`
+- **Rotate secrets**: edit `.env`, `make update` (it re-derives panel-api's env file and restarts it)
 - **Logs / status**: `make logs`, `make status`
 
 ## License

@@ -1,4 +1,4 @@
-.PHONY: preflight secrets deploy api panel-do ddns promote stack status logs verify doctor
+.PHONY: preflight secrets deploy api panel-do ddns promote stack status logs verify doctor update rollback
 
 preflight:
 	bash setup/00-preflight.sh
@@ -40,6 +40,18 @@ logs:
 ## post-deploy smoke test — every RUNBOOK check as one pass/fail report (read-only)
 doctor:
 	bash setup/07-doctor.sh
+
+## update: the ONE Day-2 command — sync the repo's configs (compose/traefik/
+## authelia/.env) AND float the whole stack to the newest release within its
+## lines (container images, panel-web npm deps, pulled bases, panel-api pip
+## deps). Doctor precondition, snapshot, change, gate on health + full doctor,
+## auto-rollback on failure
+update:
+	bash setup/08-update.sh
+
+## rollback: restore the edge stack to the snapshot taken at the last `make update`
+rollback:
+	bash setup/09-rollback.sh
 
 ## local sanity checks (no server needed): shell syntax + python syntax
 verify:

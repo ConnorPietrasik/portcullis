@@ -17,7 +17,7 @@ else
   fail=1
 fi
 
-for c in docker openssl curl python3 git; do
+for c in docker openssl curl python3 git flock; do
   if command -v "$c" >/dev/null 2>&1; then info "  ok: $c"; else warn "  MISSING: $c"; fail=1; fi
 done
 
@@ -72,10 +72,15 @@ else
   info "  dig not found (optional — panel-ddns falls back to HTTPS; install bind-tools for parity)"
 fi
 
-if command -v node >/dev/null 2>&1; then
-  info "  ok: node $(node --version) (optional — only for frontend dev; prod builds run in Docker)"
+# make update bumps the panel frontend's npm deps on the host (npm update), so
+# node/npm are required for it. The deploy flow itself does not need them (the
+# frontend builds in Docker), so this WARNS instead of failing — a fresh host
+# can deploy first and install nodejs before its first `make update` (which
+# dies with a clear message if they're missing).
+if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+  info "  ok: node $(node --version) + npm $(npm --version) (make update's npm range bump)"
 else
-  info "  node not found (optional — prod frontend builds run inside Docker)"
+  warn "  MISSING: node/npm (pacman -S nodejs npm) — needed for make update (the deploy flow works without them)"
 fi
 
 if [[ $EUID -eq 0 ]]; then

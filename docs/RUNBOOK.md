@@ -40,7 +40,7 @@ cp compose/authelia/users_database.yml.example compose/authelia/users_database.y
 Then for each user generate a hash
 
 ```bash
-docker run --rm authelia/authelia:4.39 authelia crypto hash generate argon2 --password 'YOUR-PASSWORD'
+docker run --rm authelia/authelia:4 authelia crypto hash generate argon2 --password 'YOUR-PASSWORD'
 ```
 
 and paste it over `REPLACE_WITH_ARGON2_HASH`. Groups: `admins` = you, `friends` = shared-app users.
@@ -142,25 +142,127 @@ dig +short pietrasik.top @ns1.dnsowl.com        # what the authoritative NS says
 
 ## Updates
 
-Images are **pinned at the minor line, patches float** (`traefik:v3.7`, `authelia:4.39`, `nginx:1.31`): patch releases are security/bugfixes
-only, and `make deploy` pulls them — so a routine deploy keeps the edge stack current within the line. Minor bumps are deliberate: edit the
-tag in `compose/docker-compose.yml` (one minor at a time), skim the release notes for deprecations (especially Authelia's config changes),
-then `make deploy`. `docker compose ps` + `make doctor` afterwards.
+`make update` is the one Day-2 command: it applies the repo's configs **and** floats everything that has a *line*:
+
+| Component | Line | A breaking major is a deliberate edit of… |
+|---|---|---|
+| traefik, authelia, portfolio | major tags: `traefik:v3`, `authelia/authelia:4`, `nginx:stable-alpine` | the tag in `compose/docker-compose.yml` |
+| panel-web base images | `node:22-alpine`, `nginx:stable-alpine` | the `FROM` lines in `compose/panel-frontend/Dockerfile` |
+| panel-web npm deps | the ranges in `package.json` (e.g. `react ^18.3.1`) | a range in `compose/panel-frontend/package.json` + commit |
+| panel-api pip deps | the ranges in `requirements.txt` (e.g. `fastapi>=0.115,<1`) | a range in `panel-api/requirements.txt` + commit |
+| stack configs + secrets | whatever is committed in this repo (compose, routes, Authelia ACLs, `.env`) | — the repo edit **is** the change (holding a line = a full-version pin, e.g. `traefik:v3.7.9`) |
+
+Patch/minor security releases within those lines ride in on every update. The internet-facing stack should
+never run stale, so updates are routine and *safe by construction*:
+
+```bash
+make update      # doctor precondition (aborts before touching anything if not green)
+                 # → snapshot everything (image IDs, deployed configs, exact panel-api copy, npm files)
+                 # → npm bump (in-repo, within ranges) → sync configs from the repo → pull → rebuild (bases pulled)
+                 # → recreate what changed (+ restart on start-time config change) → update panel-api
+                 # → gate: pre-update services healthy + panel-api serving + full doctor pass
+                 # → on any failure: automatic rollback of all of it, re-gated
+make rollback    # on demand: undo the last `make update` (same machinery)
+```
+
+How it works (`setup/08-update.sh`, shared helpers in `setup/common.sh`):
+
+- **Snapshot** = `/opt/panel/.update-snapshot-<ts>` (state in `/opt/panel/.update-state`): the exact
+  *image IDs* of what is running (tags move, IDs don't), re-tagged `portcullis-rollback/<svc>:<ts>`;
+  **the deployed config tree** (`/opt/panel`: docker-compose.yml, traefik/, portfolio/, the authelia
+  configs, panel-frontend, `.env`, `.panel-api.env` — a tarball; runtime data like `db.sqlite3` is
+  excluded); an **exact copy of `/opt/panel-api` (venv included)**; and the npm `package.json` + the
+  server's `package-lock.json` (gitignored server-local state — snapshotted when it exists) about to be
+  bumped. A failed npm bump, config sync, or pull stops the run *before* any container is touched.
+- **npm bump** = `npm update --package-lock-only` in `compose/panel-frontend` — floats every dependency within the range
+  declared in `package.json` (the npm analogue of the image policy: a MAJOR is a deliberate range edit).
+  It updates the `package-lock.json` to the newest versions within the declared ranges — the
+  `package.json` ranges are what bound the bump and stay untouched. The lockfile is **gitignored
+  server-local state**, deliberately not a repo artifact: it keeps `git pull` conflict-free between
+  updates and stops publishing the exact resolved versions. A fresh clone has no lockfile — the first
+  update generates it from the ranges, and the Docker build falls back to `npm install` until then
+  (on the server, builds use it via `npm ci`). Rollback restores the pre-update files from the
+  snapshot; only a deliberate range edit in `package.json` is a git commit.
+- **configs** = the same repo → `/opt/panel` sync `make deploy` performs (compose + traefik + authelia
+  + portfolio + `.env`, secrets substituted, stale route files pruned, panel-api's reduced env file
+  re-derived). A committed config change no longer waits for a deploy, and a `.env` edit is applied here
+  too. authelia + traefik read some files only at container start — those services are restarted after
+  the recreate **only if their content changed** (a routine update adds no such downtime). A sync failure
+  aborts before any container changes.
+- **panel-web** = built from the synced build context (committed frontend code + the server's current
+  lockfile ship together), with `--pull` so its `FROM` bases float too — without `--pull`, BuildKit
+  would reuse the local bases from the first build. A build/base-pull failure aborts before any
+  container changes.
+- **Recreate** = `up -d` converges only what should be running after the update: the pre-update
+  running set, plus services this update *added* (the “add an app → `make update`” flow — the new
+  service starts). A service the operator deliberately *stopped* stays stopped (and out of the gate
+  below) — an update doesn't resurrect it; a bare `make deploy` (ungated) still starts everything.
+  Services *removed* from compose have their containers dropped by the recreate, and a rollback
+  brings them back.
+- **panel-api** = `main.py` + `requirements.txt` + the systemd unit re-deployed, `pip install --upgrade`
+  within the ranges in `requirements.txt`, service restarted, then verified serving (`/api/health`) before
+  the gates. (The first-install UFW gate in `make api` is deliberately not re-run — on an already-deployed
+  server a firewall regression surfaces in the doctor gate → auto-rollback. `.env` edits are applied by
+  the config sync above, which re-derives its reduced env file; the restart here applies them.)
+- **Gate** = every service that was *running before the update* healthy again (compose healthchecks,
+  `UPDATE_HEALTH_TIMEOUT=600`s — a deliberately stopped service can't fail the gate, and neither can
+  one this update *removed* from compose: its container is already gone by then), then a full
+  `make doctor` pass (`UPDATE_DOCTOR=0` to skip both). Doctor is also enforced as a *precondition*:
+  the update aborts before touching anything if `make doctor` is not green — a pre-existing doctor
+  failure would otherwise auto-revert every update.
+- **Rollback** = restore the pre-update config tree first (so the recreate below reads the pre-update
+  compose file + `.env`), then recreate the snapshot's images via a temporary compose override (no edits
+  to the compose file for the image swap; `--remove-orphans` drops containers for services that the
+  update added), restore the exact panel-api copy, restore the npm files — all from **local** snapshots,
+  so it needs no registry access: it works on a dead connection. A gate failure triggers it automatically;
+  a component that fails to revert is reported as a PARTIAL rollback (the rest is reverted — fix and
+  re-run `make rollback`).
+- **Runtime data is outside the snapshot**: the rollback restores images, the config tree, the panel-api
+  copy, and the npm files — not runtime state. The one place that matters is authelia: it migrates its sqlite DB in
+  `/opt/panel/authelia/` at startup across minor releases, so a rolled-back image boots against the
+  *already-migrated* DB. Older 4.x images read the newer schema fine in practice, but if a migration ever
+  breaks a rolled-back image, the DB — not the image — is what you restore: back up `/opt/panel/authelia/`
+  (db.sqlite3 + users_database.yml) before an update you don't fully trust.
+- After a *successful* update the state file still holds the pre-update snapshot, so one `make rollback`
+  undoes the last update; the next `make update` replaces the snapshot. Snapshots (rollback tags + dirs,
+  including the ~100 MB panel-api venv copy) are GC'd after 14 days.
+- `make deploy` is the **first-boot** path (network, secrets, ACME staging→prod, first build). It does
+  **not** pull — with floating tags a pull is an upgrade, so image movement only happens through
+  `make update` (gated). A Day-2 re-run of it applies config ungated and warns — `make update` is the
+  Day-2 path for everything.
+
+Escapes:
+
+- A breaking major you didn't want (any line — image tag, `FROM`, npm/pip range): `make rollback`, then pin
+  it in the repo (e.g. `traefik:v3.7.9`, or the old range back in `package.json`/`requirements.txt`),
+  `make update`. (Re-running `make update` without the pin would just retry the same major.)
+- Update interrupted mid-run (Ctrl-C, power loss): the snapshot + rollback tags survive on disk; `make
+  rollback` restores everything, or just re-run `make update`.
+
+What `make update` does **not** touch — by design:
+
+- **Majors** in any line: deliberate edits (a tag, a `FROM`, a range).
+- **panel-do / panel-ddns**: no external dependencies (stdlib-only Go / Python) — nothing to float. Their
+  update is a repo edit + `make panel-do` / `make ddns`.
+- **Host OS packages**: `sudo pacman -Syu` on your normal schedule.
 
 ## Add an app
 
-Two edits in this repo, then deploy. Traefik is file-provider only — it never reads docker labels, so every app needs a route in
+Two edits in this repo, then `make update`. Traefik is file-provider only — it never reads docker labels, so every app needs a route in
 `traefik/dynamic/`:
 
 ```yaml
 # compose/docker-compose.yml — the service, on the edge network
   jellyfin:
-    image: jellyfin/jellyfin
+    image: jellyfin/jellyfin:10   # major-line float, like the edge stack (RUNBOOK → Updates)
     restart: unless-stopped
     networks: [edge]
     labels:
       - panel.manage=Jellyfin        # shows up in the panel's Services view (optional)
 ```
+
+Tag it at the major line (`:10`, not `latest` or a full version): `make update` then floats it with the rest of
+the stack (snapshot + gate + auto-rollback) and never crosses a major on its own.
 
 ```yaml
 # compose/traefik/dynamic/apps.yml — the route (one file can hold many apps;
@@ -178,10 +280,11 @@ http:
           - url: "http://jellyfin:8096"
 ```
 
-`make deploy` (syncs configs + `docker compose up -d`). Default policy: any authenticated user. Add an Authelia rule in
-`compose/authelia/configuration.yml` **above the wildcard** only if it needs group restriction or a public bypass —
-`make deploy` restarts authelia whenever `configuration.yml` or `users_database.yml` content changes (both are read
-only at container start, no hot reload), so no manual recreate step is needed.
+`make update` (syncs configs + recreates what changed, gated + auto-rollback). Default policy: any
+authenticated user. Add an Authelia rule in `compose/authelia/configuration.yml` **above the wildcard**
+only if it needs group restriction or a public bypass — `make update` restarts authelia whenever
+`configuration.yml` or `users_database.yml` content changes (both are read only at container start, no
+hot reload), so no manual recreate step is needed.
 
 ## Add an LLM server (OpenAI-style API)
 
@@ -204,7 +307,7 @@ in with it. The gate is llama-server's own `--api-key` (standard `Authorization:
    middle layer.
 3. Clone the router+service pair in `compose/traefik/dynamic/llm.yml` (new subdomain, new container port). Traefik hot-reloads the file
    provider — no restart.
-4. `make deploy`. The Services view lists it (`panel.manage` label); stop/start/restart work via panel-do — restart = full model reload,
+4. `make update`. The Services view lists it (`panel.manage` label); stop/start/restart work via panel-do — restart = full model reload,
    slow at 300k-context sizes.
 
 The web UI at `https://llm.pietrasik.top/` sits behind the same API key. If you later want Authelia 2FA for humans on top, split the router:
@@ -227,8 +330,8 @@ paths; no `os.Getenv`, no network, no goroutines; separators like `--` are hardc
 
 ## Hardening checklist
 
-- [ ] The clone stays the source of truth — edit tracked files in the repo (commit before `make deploy` for a rollback point),
-  never hand-edit the deployed copies: deploys sync repo → `/opt/panel` one-way (stale managed traefik configs get pruned).
+- [ ] The clone stays the source of truth — edit tracked files in the repo (commit before `make update` for a rollback point),
+  never hand-edit the deployed copies: updates sync repo → `/opt/panel` one-way (stale managed traefik configs get pruned).
   `.gitignore` already keeps `.env`, built binaries, and caches out of git.
 - [ ] Persistent journald — panel-do's audit trail lives there: `sudo mkdir -p /var/log/journal && sudo systemctl restart systemd-journald`
   (skip if `/var/log/journal` already exists).

@@ -33,10 +33,11 @@ x-healthcheck: &healthcheck-opts
 
 services:
   traefik:
-    # Image policy: pinned at the MINOR line, patches float. Patch releases are
-    # security/bugfixes only — they ride in on `make deploy` (which pulls);
-    # minor bumps are deliberate edits here (breaking changes live in minors).
-    image: traefik:v3.7
+    # Image policy: floats on the MAJOR line — every patch/minor security
+    # release rides in on the next `make update` (snapshot + health gate +
+    # auto-rollback; `make rollback` reverts one update). A major is a
+    # deliberate one-word edit — that's where breaking changes live.
+    image: traefik:v3
     restart: unless-stopped
     logging: *default-logging
     ports: ["80:80", "443:443"]
@@ -61,7 +62,7 @@ services:
     networks: [edge]
 
   authelia:
-    image: authelia/authelia:4.39 # same policy: patches float, minors bump deliberately
+    image: authelia/authelia:4 # same policy: floats on the major line (make update / RUNBOOK → Updates)
     restart: unless-stopped
     logging: *default-logging
     volumes: ["./authelia:/config"]
@@ -92,7 +93,7 @@ services:
   # Route: traefik/dynamic/apps.yml (file provider — labels are ignored for
   # routing; see docs/RUNBOOK.md → “add an app”).
   portfolio:
-    image: nginx:1.31-alpine
+    image: nginx:stable-alpine # current stable (oldstable) line, floats; use `alpine` to track mainline
     restart: unless-stopped
     logging: *default-logging
     healthcheck:

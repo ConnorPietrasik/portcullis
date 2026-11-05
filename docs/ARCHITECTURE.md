@@ -48,7 +48,7 @@ UI polls every ~2s; a sudo+docker spawn per cache miss is negligible at this sca
 `connect()` on a unix socket is not a filesystem write, so a `:ro`-mounted socket still grants full control (privileged containers, exec,
 host bind-mounts → root equivalent). Traefik is the only internet-facing process and has the largest attack surface, so it gets zero docker
 access. All routers/services live in reviewed files under `traefik/dynamic/`, versioned in this repo; adding an app = edit a file +
-`make deploy`. The file provider watches that directory, so route changes apply without restarting Traefik.
+`make update`. The file provider watches that directory, so route changes apply without restarting Traefik.
 
 **Dynamic IP, self-healing DNS.** The public IP isn't static, and a stale A record takes down everything at once — including the panel you'd
 fix it with. `panel-ddns` is a ~130-line stdlib-python systemd timer (user `panel`, no root, outbound only): every 10 minutes it detects the

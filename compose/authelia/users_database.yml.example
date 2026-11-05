@@ -5,7 +5,7 @@
 # Setup:
 #   cp users_database.yml.example users_database.yml
 # then replace the placeholder with a real argon2 hash:
-#   docker run --rm authelia/authelia:4.39 authelia crypto hash generate argon2 --password 'YOUR-PASSWORD'
+#   docker run --rm authelia/authelia:4 authelia crypto hash generate argon2 --password 'YOUR-PASSWORD'
 #
 # Groups drive access rules in configuration.yml:
 #   admins  → panel.pietrasik.top
