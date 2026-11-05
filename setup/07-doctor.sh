@@ -248,6 +248,34 @@ else
   skip "edge → API path (panel-web not running)"
 fi
 
+# ── secret file modes ────────────────────────────────────────────────────────
+# tar restores the repo's 0644 on every sync, so the deploy re-tightens the
+# credential files — verify that actually happened (and catch manual edits).
+# db.sqlite3 (TOTP seeds) is created by authelia at first boot, 0644.
+section "secret file modes"
+if [[ -d /opt/panel ]]; then
+  for f in /opt/panel/.env /opt/panel/traefik/dynamic/middlewares.yml /opt/panel/authelia/users_database.yml; do
+    if [[ -f "$f" ]]; then
+      m="$(stat -c %a "$f" 2>/dev/null || true)"
+      if [[ "$m" == 600 ]]; then ok "$f mode 600"
+      else warn "$f mode ${m:-unreadable} (want 600)"; hint "sudo chmod 600 $f (make deploy/update re-tightens it)"
+      fi
+    else
+      bad "$f missing"; hint "make deploy"
+    fi
+  done
+  if [[ -f /opt/panel/authelia/db.sqlite3 ]]; then
+    m="$(stat -c %a /opt/panel/authelia/db.sqlite3 2>/dev/null || true)"
+    if [[ "$m" == 600 ]]; then ok "authelia db.sqlite3 mode 600 (TOTP seeds)"
+    else warn "authelia db.sqlite3 mode ${m:-unreadable} (want 600 — TOTP seeds)"; hint "sudo chmod 600 /opt/panel/authelia/db.sqlite3"
+    fi
+  else
+    warn "authelia db.sqlite3 missing (authelia hasn't booted yet?)"
+  fi
+else
+  skip "secret file modes (no /opt/panel)"
+fi
+
 # ── panel-do ─────────────────────────────────────────────────────────────────
 section "panel-do (privileged dispatcher)"
 if [[ -x /usr/local/libexec/panel-do ]]; then

@@ -175,6 +175,16 @@ Generate a hash for each user:
 
 …then edit compose/authelia/users_database.yml and re-run."
   fi
+  # tar restores the repo's 0644 on every sync, so re-tighten the credential
+  # files HERE (first boot + every Day-2 update) — a manual host chmod alone
+  # would be silently reverted by the next sync. Authelia runs as root in
+  # container (no `user:` in compose), so 600 root:root stays readable by it.
+  sudo chmod 600 "$target/authelia/users_database.yml"   # argon2 master-password hashes
+  # db.sqlite3 (TOTP seeds) is runtime data the tar never touches; tighten it
+  # once it exists (first boot: the container creates it after this sync).
+  if [[ -f "$target/authelia/db.sqlite3" ]]; then
+    sudo chmod 600 "$target/authelia/db.sqlite3"
+  fi
 }
 
 stack_restart_if_configs_changed() { # <target-dir> — call AFTER `up -d`
