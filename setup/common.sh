@@ -701,7 +701,11 @@ snapshot_host_stack() { # <snapshot-dir>
   for m in docker-compose.yml traefik portfolio authelia/configuration.yml \
            authelia/users_database.yml panel-frontend .env .panel-api.env \
            .panel-ddns.env; do
-    [[ -e "/opt/panel/$m" ]] && members+=("$m")
+    # if, not `[[ ]] &&`: when the test fails the &&-list is the loop body's
+    # last command and leaves the loop's exit status at 1. The trailing
+    # if-block below currently clobbers that, but the if-form simply can't
+    # leak a spurious failure status if the ordering ever changes.
+    if [[ -e "/opt/panel/$m" ]]; then members+=("$m"); fi
   done
   if (( ${#members[@]} > 0 )); then
     sudo tar -C /opt/panel --exclude=panel-frontend/node_modules --exclude=panel-frontend/dist \

@@ -1,8 +1,12 @@
-import { useState } from 'react'
-import Overview from './views/Overview'
-import Services from './views/Services'
-import Actions from './views/Actions'
-import Settings from './views/Settings'
+// Views are lazy chunks: only the active tab's code ships to the browser,
+// and the Overview's gauge library (the bulk of the bundle) no longer bloats
+// the initial load. React.lazy + Suspense per view.
+import { Suspense, lazy, useState } from 'react'
+
+const Overview = lazy(() => import('./views/Overview'))
+const Services = lazy(() => import('./views/Services'))
+const Actions = lazy(() => import('./views/Actions'))
+const Settings = lazy(() => import('./views/Settings'))
 
 const TABS = ['Overview', 'Services', 'Actions', 'Settings'] as const
 type Tab = (typeof TABS)[number]
@@ -37,10 +41,12 @@ export default function App() {
         </nav>
       </header>
       <main>
-        {tab === 'Overview' && <Overview intervalMs={intervalMs} />}
-        {tab === 'Services' && <Services intervalMs={intervalMs} />}
-        {tab === 'Actions' && <Actions />}
-        {tab === 'Settings' && <Settings intervalMs={intervalMs} onChange={changeInterval} />}
+        <Suspense fallback={<div className="banner">loading…</div>}>
+          {tab === 'Overview' && <Overview intervalMs={intervalMs} />}
+          {tab === 'Services' && <Services intervalMs={intervalMs} />}
+          {tab === 'Actions' && <Actions />}
+          {tab === 'Settings' && <Settings intervalMs={intervalMs} onChange={changeInterval} />}
+        </Suspense>
       </main>
       <footer>refresh: {(intervalMs / 1000).toFixed(1)}s — set in Settings</footer>
     </div>
