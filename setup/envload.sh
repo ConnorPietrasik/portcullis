@@ -80,7 +80,7 @@
 # prefixed line here breaks DNS tracking / panel-api with no deploy error.
 # Keep in sync with ddns/panel-ddns.service + ddns/ddns.py
 # + sync_panel_api_env().
-__envload_no_export_keys=" NAMESILO_API_KEY DDNS_DOMAIN DDNS_HOSTS PANEL_TOKEN PANEL_DEV PANEL_DISK_MOUNTS "
+__envload_no_export_keys=" NAMESILO_API_KEY DDNS_HOSTS PANEL_TOKEN PANEL_DEV PANEL_DISK_MOUNTS "
 
 __envload_warn() {
   if declare -F warn >/dev/null 2>&1; then

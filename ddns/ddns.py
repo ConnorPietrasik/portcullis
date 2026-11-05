@@ -23,8 +23,13 @@ rejected: it can silently trust a stale assumption, and the API load it saves
 TTL is pinned at 3600 (NameSilo's minimum), so worst-case cutover after an IP
 change ≈ timer interval + 1h of resolver caching.
 
-Env: DDNS_DOMAIN (default pietrasik.top), DDNS_HOSTS (default "@" — the apex;
-set "@,*" only if the wildcard is ever an A record).
+The domain is fixed at pietrasik.top and hardcoded: every other domain-aware
+piece of this project (Traefik Host() rules, the Authelia cookie domain, the
+ACME SAN block, make doctor's checks) is pinned to it, so an env override
+here could only desync the A record from those routes, never match them.
+
+Env: DDNS_HOSTS (default "@" — the apex; set "@,*" only if the wildcard is
+ever an A record).
 """
 
 from __future__ import annotations
@@ -39,7 +44,7 @@ import urllib.request
 from datetime import datetime, timezone
 from xml.etree import ElementTree as ET
 
-DOMAIN = os.environ.get("DDNS_DOMAIN", "pietrasik.top")
+DOMAIN = "pietrasik.top"  # fixed, not an env knob — see module docstring
 HOSTS = [h.strip() for h in os.environ.get("DDNS_HOSTS", "@").split(",") if h.strip()]
 TTL = 3600  # NameSilo's minimum TTL
 API = "https://www.namesilo.com/api"
