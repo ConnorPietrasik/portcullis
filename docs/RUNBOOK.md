@@ -162,6 +162,7 @@ dig +short pietrasik.top @ns1.dnsowl.com        # what the authoritative NS says
 | panel-web npm deps | the ranges in `package.json` (e.g. `react ^18.3.1`) | a range in `compose/panel-frontend/package.json` + commit |
 | panel-api pip deps | the ranges in `requirements.txt` (e.g. `fastapi>=0.115,<1`) | a range in `panel-api/requirements.txt` + commit |
 | stack configs + secrets | whatever is committed in this repo (compose, routes, Authelia ACLs, `.env`) | — the repo edit **is** the change (holding a line = a full-version pin, e.g. `traefik:v3.7.9`) |
+| radiance (LLM fleet) | `latest` — the one component deliberately OUTSIDE the declared-line policy (frequent builds wanted) | the tag in `x-llm-base`; a build that breaks behavior (gates only see health) → `make rollback WHAT=radiance` |
 
 Patch/minor security releases within those lines ride in on every update. The internet-facing stack should
 never run stale, so updates are routine and *safe by construction*:
@@ -173,7 +174,9 @@ make update      # doctor precondition (aborts before touching anything if not g
                  # → recreate what changed (+ restart on start-time config change) → update panel-api
                  # → gate: pre-update services healthy + panel-api serving + full doctor pass
                  # → on any failure: automatic rollback of all of it, re-gated
-make rollback    # on demand: undo the last `make update` (same machinery)
+make rollback              # on demand: undo the last `make update` (same machinery)
+make rollback WHAT=radiance  # or: images ONLY of the services WHAT matches — a name (llm-27b), a
+                             # prefix (llm), or an image name (radiance); everything else stays
 ```
 
 How it works (`setup/08-update.sh`, shared helpers in `setup/common.sh`):
@@ -228,7 +231,12 @@ How it works (`setup/08-update.sh`, shared helpers in `setup/common.sh`):
   update added), restore the exact panel-api copy, restore the npm files — all from **local** snapshots,
   so it needs no registry access: it works on a dead connection. A gate failure triggers it automatically;
   a component that fails to revert is reported as a PARTIAL rollback (the rest is reverted — fix and
-  re-run `make rollback`).
+  re-run `make rollback`). With WHAT (`make rollback WHAT=radiance`) it recreates ONLY the matching
+  services' images — matched against the service name (exact or prefix) or the pre-update image name
+  (substring, recorded in the snapshot) — and leaves the config tree, panel-api, npm files, and every
+  other service in place. That is the escape hatch for a floating image (radiance rides `latest`) that
+  passed the gates but broke behavior; the next `make update` re-anchors the snapshot on the reverted
+  build.
 - **Runtime data is outside the snapshot**: the rollback restores images, the config tree, the panel-api
   copy, and the npm files — not runtime state. The one place that matters is authelia: it migrates its sqlite DB in
   `/opt/panel/authelia/` at startup across minor releases, so a rolled-back image boots against the
@@ -248,6 +256,11 @@ Escapes:
 - A breaking major you didn't want (any line — image tag, `FROM`, npm/pip range): `make rollback`, then pin
   it in the repo (e.g. `traefik:v3.7.9`, or the old range back in `package.json`/`requirements.txt`),
   `make update`. (Re-running `make update` without the pin would just retry the same major.)
+- A floating image that passed the gates but broke behavior (radiance rides `latest` — the gates only
+  see health, not behavior): `make rollback WHAT=radiance` (images only — configs, panel-api, and every
+  other service stay in place). Then either pin the good build's tag in `x-llm-base` + `make update`
+  to hold it, or just `make update` again to re-try `latest` (the snapshot re-anchored on the
+  reverted build in the meantime).
 - Update interrupted mid-run (Ctrl-C, power loss): the snapshot + rollback tags survive on disk; `make
   rollback` restores everything, or just re-run `make update`.
 
@@ -298,33 +311,53 @@ only if it needs group restriction or a public bypass — `make update` restarts
 `configuration.yml` or `users_database.yml` content changes (both are read only at container start, no
 hot reload), so no manual recreate step is needed.
 
-## Add an LLM server (OpenAI-style API)
+## LLM fleet (Radiance instances)
 
-LLM endpoints are machine APIs, not browser apps, so they deliberately skip Authelia: forward-auth is cookie-based and API clients can't log
-in with it. The gate is llama-server's own `--api-key` (standard `Authorization: Bearer`), TLS comes from the wildcard cert at Traefik, and
-`llm-rate` blunts key-guessing. Clients get `base_url=https://llm.pietrasik.top/v1` + `api_key=sk-…` and behave exactly like OpenAI.
+[Radiance](https://codeberg.org/StillDeadcode/radiance) instances on 6 shared R9700s; start/stop
+from the panel's Services view. Machine APIs, not browser apps: no Authelia — the gate is the
+server's own API key (`Authorization: Bearer`) behind the wildcard cert + `llm-rate`; clients use
+`base_url=https://<name>.pietrasik.top/v1` + key, exactly like OpenAI.
 
-1. Build/pull the image on the server; models somewhere host-visible.
-2. Uncomment + adapt the `llm-glm` block in `compose/docker-compose.yml`: mirror the `--device`/`--group-add`/`user` flags from the
-   `docker run` you use today; expand `~` to an absolute path (compose runs no shell); the shared `LLM_API_KEY` from `.env`
-   (`openssl rand -hex 32` — the block fails fast at deploy if the key is unset). The key is visible in `docker inspect` — same exposure
-   class as every secret on this host; use `--api-key-file` + a mounted file if that ever bothers you.
+**An instance = a service block + a router pair**, deployed by `make update`: `llm-<name>` in
+`compose/docker-compose.yml` (merges `x-llm-base`) ↔ `Host(`<name>.pietrasik.top`)` →
+`http://llm-<name>:8000` in `traefik/dynamic/llm.yml`. One subdomain per instance so agents pin
+the right server; the wildcard CNAME + cert make that zero DNS work. Port is always 8000 (own IP
+per container). The display name is the `panel.manage` label — **no commas** in it (`docker ps`
+encodes labels comma-joined and the Services view parses them that way: `cards 0+2+5`).
 
-   Key strategy: **one shared key across all LLM servers** — access policy is uniform per person (a key authorizes LLM use, not a specific
-   server), so per-server keys would only add client-config churn. Keys live on your devices only; a leak means device compromise, where
-   every key burns equally. llama-server reads keys at startup, so a rotate = edit `.env` + restart each server — batch the change in one
-   edit, then cycle them (model reload is slow). If access ever becomes per-person: repeat `--api-key` (or `--api-key-file`, one key per
-   line) and give each person their own value — revocation is still a restart. Only if you need hot revocation, per-person quotas, or usage
-   attribution, put a real LLM gateway (e.g. LiteLLM) on its own subdomain in front — same bearer-auth pattern, and don't hand-roll the
-   middle layer.
-3. Clone the router+service pair in `compose/traefik/dynamic/llm.yml` (new subdomain, new container port). Traefik hot-reloads the file
-   provider — no restart.
-4. `make update`. The Services view lists it (`panel.manage` label); stop/start/restart work via panel-do — restart = full model reload,
-   slow at 300k-context sizes.
+**Cards:** `ROCR_VISIBLE_DEVICES: "i,j,k"` (indices are fixed 0–5; per-card VRAM shows in the
+panel's GPU stats) + `--tp` = card count in the
+set. Everything else in `x-llm-base` is identical for all instances.
 
-The web UI at `https://llm.pietrasik.top/` sits behind the same API key. If you later want Authelia 2FA for humans on top, split the router:
-keep `auth-chain@file` on `Host(…)` and add a higher-priority `Host(…) && PathPrefix(`/v1`)` router with `sec-headers@file` only — API
-clients keep bearer auth, browsers get 2FA.
+**`restart: "no"` on purpose:** after a reboot nothing LLM comes back by itself — you start the
+set you want from the panel. `make update` still starts new/changed instances and leaves
+deliberately-stopped ones down (and out of the health gate).
+
+**Add an instance:** clone a block (name, model, cards, flags) + the router pair, then `make update`
+(first load ~1 min on this hardware, shown in Services). The flags in the committed blocks are
+this host's own tuning — the blocks are the truth, do not reconcile them against upstream. To
+trial a NEW model first: `git clone --depth 1` upstream, run its `deploy/compose/<model>.yaml`
+ad hoc (one at a time), delete the clone — its flags belong to the trial, not to a fleet block.
+
+**Key:** one shared `LLM_API_KEY` for all instances (a key authorizes LLM use, not one instance).
+Rotate = edit `.env` + `make update` (radiance reads it at startup).
+
+**Updates:** a config-only update recreates nothing. When an update DOES recreate an instance
+(radiance moved on `latest`, block edited), its model reload (~1 min on this hardware) sits
+inside the 5m healthcheck start_period, and the default 600s budget (`UPDATE_HEALTH_TIMEOUT`)
+covers both the update gate and the rollback re-gate — they share it — raise it only for a much
+slower model. A new build that is *healthy but behavior-breaking* is different — the gates can't
+see it: `make rollback WHAT=radiance` returns just the instances to the pre-update build (re-gated
+on the same budget; configs and the rest of the stack stay in place), and the next `make update`
+re-anchors the snapshot on it.
+
+**Models:** `/models/llm/*.rad` (self-contained; ro-mounted at `/models`). If `/models` is btrfs
+with compression, keep `.rad` files uncompressed (`chattr +C`) — direct-I/O n-gram reads degrade
+otherwise.
+
+**Later — dynamic GPU allocation:** the pin is just env at start time, so the end state is a
+panel-do action (ledger from running instances' env, conflict check, write the new set, recreate)
++ a six-slot free/held UI; the file's pins become last-allocation defaults.
 
 ## Add a privileged action
 

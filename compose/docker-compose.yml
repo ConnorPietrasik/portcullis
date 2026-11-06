@@ -31,6 +31,50 @@ x-healthcheck: &healthcheck-opts
   retries: 3
   start_period: 1m
 
+# LLM fleet boilerplate — merged into every llm-* block via `<<: *llm-base`.
+# What varies per instance: environment (ROCR_VISIBLE_DEVICES + key), command,
+# labels. Everything else (devices, groups, seccomp, healthcheck, networks) is
+# identical for every radiance server, so it lives once here.
+x-llm-base: &llm-base
+  image: stilldeadcode/radiance:latest # the ONE image that deliberately floats
+  # OUTSIDE the declared-line policy — frequent radiance builds are wanted. The
+  # risk (a build that passes the health + doctor gates but breaks behavior)
+  # is: make rollback WHAT=radiance (RUNBOOK → LLM fleet → Updates)
+  restart: "no" # the fleet must not resurrect itself after a reboot — you pick
+  # the set from the panel (edge services stay unless-stopped)
+  init: true # forwards SIGTERM; the engine finishes its step and releases the cards
+  logging: *default-logging
+  user: "1000:1000" # verify: id crazybot (files the server writes are its user's)
+  devices: ["/dev/kfd", "/dev/dri"] # all cards visible; ROCR_VISIBLE_DEVICES pins the set
+  group_add: ["992", "44"] # verify: getent group render video
+  security_opt:
+    # radiance's io_uring reads + ROCm's NUMA binding (mbind/set_mempolicy) are
+    # refused by Docker's default seccomp. Both paths below are in the UPSTREAM
+    # radiance repo (codeberg.org/StillDeadcode/radiance), not this one: see its
+    # deploy/compose/common.yaml for the why, and the tighter profile it ships,
+    # deploy/compose/seccomp-radiance.json, if you ever want to run confined.
+    - seccomp=unconfined
+  ulimits:
+    memlock: -1
+  volumes:
+    - /models/llm:/models:ro
+    # only if a model needs a CUSTOM chat template (rare — the .rad carries its
+    # own): mount the .jinja and pass --chat-template (radiance upstream)
+  stop_grace_period: 60s # finishes the in-flight step, releases the cards
+  healthcheck:
+    interval: 1m
+    timeout: 10s
+    retries: 3
+    start_period: 5m # the MODEL LOAD is the slow part: ~1m on this hardware,
+    test: ["CMD", "busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8000/health"]
+    # 5m is the margin. A shorter start_period would read unhealthy mid-load —
+    # and make update's 600s health gate auto-rolls-back while a reload is
+    # still loading (raise UPDATE_HEALTH_TIMEOUT only for a much slower model —
+    # RUNBOOK → LLM fleet)
+  networks: [edge] # NO network_mode: host — on the bridge, port 8000 is
+  # reachable only from traefik (no UFW rule, no LAN/WAN exposure), so the
+  # server binds 0.0.0.0 instead of the playground's --host ::
+
 services:
   traefik:
     # Image policy: floats on the MAJOR line — every patch/minor security
@@ -103,29 +147,51 @@ services:
     labels: ["panel.manage=true"] # shows in the panel's Services view
     networks: [edge]
 
-  # ── LLM servers — uncomment + adapt once the image is built on the server ───
-  # Recipe: clone this block per server, give each its own router pair in
-  # traefik/dynamic/llm.yml; all servers share LLM_API_KEY from .env.
-  # Auth = llama-server --api-key (OpenAI-style bearer); deliberately NO
-  # auth-chain — see traefik/dynamic/llm.yml for why.
-  # llm-glm:
-  #   image: llama-rocm # as built/pulled on the server
-  #   restart: unless-stopped
-  #   logging: *default-logging
-  #   # Mirror the flags from the `docker run` you use today:
-  #   # user: "1000:1000"              # only if the image doesn't default to crazybot
-  #   devices: ["/dev/kfd", "/dev/dri"] # ROCm
-  #   # group_add: ["992", "44"]       # render/video GIDs, if your run flags pass them
-  #   volumes: ["/llm:/llm:ro"]        # models — read-only is enough for inference
-  #   command: >-
-  #     /home/crazybot/llama/llama.cpp/build/bin/llama-server
-  #     -m /llm/GLM-5.3-Flash/Q8_0/GLM-5.3-Flash-Q8_0-00001-of-00008.gguf
-  #     -ngl 18 --load-mode none -c 300000 -b 2048 -ub 2048
-  #     --spec-type draft-mtp --spec-draft-n-max 3
-  #     --host 0.0.0.0 --port 8080
-  #     --api-key ${LLM_API_KEY:?set LLM_API_KEY in .env}
-  #   networks: [edge]
-  #   labels: ["panel.manage=GLM-5.3-Flash"] # Services view + start/stop/restart
+  # ── LLM fleet (Radiance) — start/stop instances from the panel ──────────────
+  # An instance = one block here + one router pair in traefik/dynamic/llm.yml:
+  # llm-<name> ↔ <name>.pietrasik.top. Cards: ROCR_VISIBLE_DEVICES "i,j,k"
+  # (fixed 0-5; per-card VRAM in the panel's GPU stats) + --tp = card count.
+  # Port always 8000 (own IP per container). The display name (panel.manage)
+  # shows the card set — no commas in it (docker ps encodes labels comma-joined).
+  # restart "no" so a reboot
+  # never resurrects the set you chose. Model files: /models/llm/*.rad (outside
+  # this repo; ro-mounted at /models). `<<: *llm-base` carries the shared
+  # boilerplate (x-llm-base, top of file). New instance: clone a block + the
+  # router pair — a block's flags are this host's own tuning; the committed
+  # blocks are the truth, not upstream's. Trialing a model first: temp-clone
+  # radiance upstream, run its deploy/compose/<model>.yaml ad hoc, delete the
+  # clone (its flags stay with the trial; RUNBOOK → LLM fleet).
+  #
+  # ── the fleet — uncomment to activate, then: make update
+  #
+  # llm-27b:
+  #   <<: *llm-base
+  #   environment:
+  #     ROCR_VISIBLE_DEVICES: "0,1,2,3" # cards by index (fixed 0-5)
+  #     RADIANCE_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env} # read by --api-key-env,
+  #                                     # so the key never sits in argv (ps / docker inspect)
+  #   command: >
+  #     --model /models/qwen3.8-27b-fp8.rad
+  #     --host 0.0.0.0 --port 8000 --api-key-env RADIANCE_API_KEY
+  #     --tp 4 --max-num-seqs 16 --max-model-len 250000
+  #     --gpu-headroom-mib 96 --prefix-cache-mib 65536 --checkpoint-policy tip-only
+  #     --num-speculative-tokens 3 --max-num-batched-tokens 2048
+  #     --checkpoint-slots auto
+  #   labels: ["panel.manage=Qwen 27B FP8 · cards 0-3"] # Services view name
+  #
+  # llm-flashnext:
+  #   <<: *llm-base
+  #   environment:
+  #     ROCR_VISIBLE_DEVICES: "0,1,2,3" # same four cards as llm-27b — not at the same time
+  #     RADIANCE_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env}
+  #   command: >
+  #     --model /models/qwen3.8-next-flash-fp8-iq4r-moe.rad
+  #     --host 0.0.0.0 --port 8000 --api-key-env RADIANCE_API_KEY
+  #     --tp 4 --max-num-seqs 8 --max-model-len 250000
+  #     --placement expert_tiered --host-pool-mib 24576 --gpu-headroom-mib 96
+  #     --prefix-cache-mib 65536 --checkpoint-policy tip-only
+  #     --num-speculative-tokens 3 --max-num-batched-tokens 2048
+  #   labels: ["panel.manage=Qwen Flash-Next · cards 0-3"] # Services view name
 
 volumes:
   acme: {}

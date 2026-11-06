@@ -35,8 +35,10 @@
 #
 # After a successful update, `make rollback` reverts to the pre-update snapshot
 # (one generation); the next `make update` replaces it. Env:
-#   UPDATE_HEALTH_TIMEOUT=600   health-gate budget (seconds)
-#   UPDATE_ROLLBACK_TIMEOUT=300 rollback re-gate budget (seconds)
+#   UPDATE_HEALTH_TIMEOUT=600   health-gate budget (seconds) — one knob for the
+#                               update's final gate and EVERY rollback re-gate:
+#                               a recreated radiance instance can't read healthy
+#                               until its 5m healthcheck start_period elapses
 #   UPDATE_DOCTOR=1             run the doctor gate (0 = skip). A green `make
 #                               doctor` before updating is the precondition —
 #                               a pre-existing doctor failure would auto-revert
@@ -102,7 +104,7 @@ while IFS= read -r svc; do
     info "  $svc: $summary"
     continue
   fi
-  # Local-only images (e.g. a self-built llama-rocm) 404 on the registry —
+  # Local-only images (built on the server rather than pulled) 404 on the registry —
   # skip those, but a real registry/network failure still stops the run.
   if grep -qiE 'not found|manifest unknown|pull access denied|denied: requested access' <<<"$pull_err"; then
     warn "  $svc: not on a public registry (local image?) — reusing the local image"

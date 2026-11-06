@@ -1,25 +1,37 @@
-# LLM servers — OpenAI-style machine APIs. TLS terminates here (wildcard cert,
-# DNS-01); auth is llama-server's own --api-key (Authorization: Bearer), NOT
-# Authelia: forward-auth is cookie-based and can't serve API clients that only
-# speak bearer tokens. These routers deliberately omit auth-chain@file — that
-# is what makes plain OpenAI clients work with
-#   base_url = https://llm.pietrasik.top/v1
-# The API key is the gate; llm-rate blunts key-guessing and scan traffic.
-# (This host 502s until the matching compose service is up — harmless.)
-# One router+service pair per server: llm2.pietrasik.top → llm-embed:8080, …
+# LLM fleet — OpenAI-style machine APIs, one router per INSTANCE. TLS terminates
+# here (wildcard cert, DNS-01); auth is the server's own API key (Authorization:
+# Bearer), NOT Authelia: forward-auth is cookie-based and can't serve API clients
+# that only speak bearer tokens. These routers deliberately omit auth-chain@file
+# — that is what makes plain OpenAI clients work with
+#   base_url = https://<name>.pietrasik.top/v1
+# The API key is the gate; llm-rate blunts key-guessing and scan traffic. A host
+# 502s until its instance is up — harmless; instances start/stop from the panel's
+# Services view (RUNBOOK → LLM fleet).
+# Rule: service llm-<name> ↔ Host(`<name>.pietrasik.top`) ↔ http://llm-<name>:8000.
 
 http:
   routers:
-    llm-glm:
-      rule: "Host(`llm.pietrasik.top`)"
+    # one pair per instance — clone for each (llm-27b2 → 27b2.pietrasik.top, …)
+    llm-27b:
+      rule: "Host(`27b.pietrasik.top`)"
       middlewares: [sec-headers@file, llm-rate@file]
-      service: llm-glm
+      service: llm-27b
+
+    llm-flashnext:
+      rule: "Host(`flashnext.pietrasik.top`)"
+      middlewares: [sec-headers@file, llm-rate@file]
+      service: llm-flashnext
 
   services:
-    llm-glm:
+    llm-27b:
       loadBalancer:
         servers:
-          - url: "http://llm-glm:8080"
+          - url: "http://llm-27b:8000"
+
+    llm-flashnext:
+      loadBalancer:
+        servers:
+          - url: "http://llm-flashnext:8000"
 
   middlewares:
     llm-rate:

@@ -430,7 +430,7 @@ sudo_warm() { # re-warm the sudo timestamp so long operations don't prompt mid-r
   sudo -n true 2>/dev/null || sudo -v 2>/dev/null || true
 }
 
-update_set_status() { # <status: in-progress|updated|rolled-back> — on the live state file
+update_set_status() { # <status: in-progress|updated|rolled-back|partially-rolled-back> — on the live state file
   local tmp
   tmp="$(mktemp)"
   python3 -c '
@@ -494,7 +494,7 @@ except Exception:
 # (Global, not echo: the warns above go to stdout, so command substitution
 # would capture them too.)
 snapshot_stack() {
-  local ts svc container image_id lines="" tmp
+  local ts svc container image_id image_tags lines="" tmp
   ts="$(date -u +%Y%m%dT%H%M%SZ)"
   for svc in $(stack_services); do
     container="$(stack_compose ps --format '{{.Service}}|{{.Name}}|{{.State}}' 2>/dev/null \
@@ -505,9 +505,16 @@ snapshot_stack() {
     fi
     image_id="$(sudo docker inspect --format '{{.Image}}' "$container")" \
       || die "cannot read the running image of $container ($svc)"
+    # The image's repo:tag(s) AT SNAPSHOT TIME, space-joined (repo:tag carries
+    # no spaces). Captured BEFORE the rollback tag is added, so it records the
+    # upstream identity (e.g. stilldeadcode/radiance:latest) — the tag itself
+    # moves on the next pull, and `make rollback WHAT=<image-name>` matches on this.
+    # An image without a repo tag (run by ID) records none — name matching
+    # then falls back to the service name.
+    image_tags="$(sudo docker inspect --format '{{range .RepoTags}}{{.}} {{end}}' "$image_id" 2>/dev/null || true)"
     sudo docker tag "$image_id" "${ROLLBACK_TAG_PREFIX}/${svc}:${ts}" \
       || die "cannot tag $image_id as ${ROLLBACK_TAG_PREFIX}/${svc}:${ts}"
-    lines+="${svc}|${image_id}|${ROLLBACK_TAG_PREFIX}/${svc}:${ts}"$'\n'
+    lines+="${svc}|${image_id}|${ROLLBACK_TAG_PREFIX}/${svc}:${ts}|${image_tags}"$'\n'
   done
   tmp="$(mktemp)"
   printf '%s' "$lines" | python3 -c '
@@ -516,8 +523,9 @@ svcs = {}
 for line in sys.stdin:
     line = line.strip()
     if line:
-        svc, image_id, rb = line.split("|")
-        svcs[svc] = {"image_id": image_id, "rollback_image": rb}
+        parts = line.split("|")
+        svcs[parts[0]] = {"image_id": parts[1], "rollback_image": parts[2],
+                          "image_tags": parts[3] if len(parts) > 3 else ""}
 json.dump({"snapshot": sys.argv[1], "status": "in-progress", "services": svcs},
           open(sys.argv[2], "w"), indent=2)
 ' "$ts" "$tmp"
@@ -607,19 +615,26 @@ PYEOF
 
 # Recreate the snapshot's services from the rollback tags recorded in <state-file>,
 # via a temporary compose override (the deployed compose file is never modified).
+# With <service...>, only those services are recreated (a targeted rollback —
+# e.g. one image's instances) and the override holds just them; without, all of
+# them.
 # 0 on success (re-gated); 1 on failure — the override file is kept for manual use.
-apply_snapshot() { # <state-file> <timeout-seconds>
-  local state="$1" timeout="$2"
+apply_snapshot() { # <state-file> <timeout-seconds> [service...]
+  local state="$1" timeout="$2"; shift 2
   local override pairs svc tag svcs=() missing=()
   sudo_warm
   override="$(mktemp /tmp/portcullis-rollback.XXXXXX.yml)"
-  pairs="$(python3 -c '
+  pairs="$(python3 - "$state" "$@" <<'PYEOF'
 import json, sys
 d = json.load(open(sys.argv[1]))
+want = sys.argv[2:] or None
 for s, i in d.get("services", {}).items():
+    if want is not None and s not in want:
+        continue
     print(s + "\t" + i["rollback_image"])
-' "$state")"
-  [[ -n "$pairs" ]] || die "snapshot $state records no services — nothing to roll back to"
+PYEOF
+)"
+  [[ -n "$pairs" ]] || die "no snapshot services match the rollback selection — nothing to roll back"
   while IFS=$'\t' read -r svc tag; do
     svcs+=("$svc")
     sudo docker image inspect "$tag" >/dev/null 2>&1 || missing+=("$tag")
@@ -629,14 +644,14 @@ for s, i in d.get("services", {}).items():
     die "rollback image(s) missing locally — the snapshot is unusable (were the tags pruned?):
   ${missing[*]}"
   fi
-  python3 - "$state" <<'PYEOF' >"$override"
-import json, sys
-d = json.load(open(sys.argv[1]))
+  printf '%s\n' "$pairs" | python3 -c '
+import sys
 print("services:")
-for s, i in d["services"].items():
-    print(f"  {s}:")
-    print(f"    image: {i['rollback_image']}")
-PYEOF
+for line in sys.stdin:
+    svc, tag = line.rstrip("\n").split("\t")
+    print(f"  {svc}:")
+    print(f"    image: {tag}")
+' >"$override"
   local -a cmd=("${COMPOSE_STACK[@]}" -f "$override")
   info "Restoring snapshot images for: ${svcs[*]}"
   # --remove-orphans: a service ADDED during the failed update is no longer in
@@ -875,7 +890,7 @@ rollback_npm() { # <snapshot-dir>
 update_rollback_or_die() { # <reason>
   local reason="$1" ts dir failed=()
   warn "gate failed: $reason"
-  warn "rolling back to the pre-update snapshot (budget ${UPDATE_ROLLBACK_TIMEOUT:-300}s)"
+  warn "rolling back to the pre-update snapshot (budget ${UPDATE_HEALTH_TIMEOUT:-600}s)"
   sudo -v
   ts="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("snapshot",""))' "$STACK_STATE_FILE" 2>/dev/null)" \
     || die "cannot read the snapshot ts from $STACK_STATE_FILE — manual intervention needed"
@@ -886,7 +901,7 @@ update_rollback_or_die() { # <reason>
   rollback_stack_configs "$dir" || failed+=("configs")
   # Subshell: apply_snapshot's die (e.g. rollback image pruned) must not abort
   # the remaining rollbacks — record it as a failed component instead.
-  ( apply_snapshot "$STACK_STATE_FILE" "${UPDATE_ROLLBACK_TIMEOUT:-300}" ) || failed+=("container images")
+  ( apply_snapshot "$STACK_STATE_FILE" "${UPDATE_HEALTH_TIMEOUT:-600}" ) || failed+=("container images")
   rollback_panel_api "$dir" || failed+=("panel-api")
   rollback_npm "$dir" || failed+=("npm files")
   if (( ${#failed[@]} == 0 )); then

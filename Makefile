@@ -49,9 +49,13 @@ doctor:
 update:
 	bash setup/08-update.sh
 
-## rollback: restore the edge stack to the snapshot taken at the last `make update`
+## rollback [WHAT=...]: no WHAT — restore the whole stack to the snapshot
+## taken at the last `make update`. WITH WHAT — a service name (llm-27b), a
+## prefix (llm), or an image name (radiance) — roll back ONLY those services'
+## images: `make rollback WHAT=radiance`. Configs, panel-api, npm files, and
+## every other service stay in place.
 rollback:
-	bash setup/09-rollback.sh
+	bash setup/09-rollback.sh $(WHAT)
 
 ## local sanity checks (no server needed): shell syntax + python syntax
 verify:
