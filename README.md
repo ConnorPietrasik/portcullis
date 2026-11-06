@@ -39,6 +39,9 @@ docker.sock — the internet-facing process gets zero docker access.
 
 ## Quickstart (on the server)
 
+**Main target: CachyOS** (Arch-based; UFW ships installed and enabled, so the deploy only adds its two rules and never touches SSH).
+Any other Arch-based distro works: `pacman -S ufw` and enable it before Phase 2 (RUNBOOK → UFW).
+
 **[docs/RUNBOOK.md](docs/RUNBOOK.md) is the deploy guide — follow it in order** (phase 0 is manual DNS prep; phase 5 is the final check from
 an external network). It is the single source of truth for the sequence, so this section is an orientation, not a second copy:
 

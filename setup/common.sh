@@ -769,8 +769,9 @@ wait_panel_api_healthy() { # <timeout-seconds>
 # pip upgrade within the declared ranges, restart, verify serving. 0 ok; 1
 # failed (reason in $PANEL_API_REASON). Deliberately does NOT re-run
 # 03-panel-api.sh: its UFW gate is first-install protection (panel-api must not
-# BIND before the firewall exists); on an already-deployed server a firewall
-# regression surfaces in the doctor gate → auto-rollback.
+# BIND until UFW is active with the edge-scoped 8010 rule in place); on an
+# already-deployed server a firewall regression surfaces in the doctor gate
+# → auto-rollback.
 update_panel_api() {
   PANEL_API_REASON=""
   local f

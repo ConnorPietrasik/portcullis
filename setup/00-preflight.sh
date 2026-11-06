@@ -57,9 +57,9 @@ if command -v ufw >/dev/null 2>&1; then
   if [[ "$ufw_state" == "Status: active" ]]; then
     info "  ok: ufw active"
   elif [[ -n "$ufw_state" ]]; then
-    info "  ufw not active yet — enable it in Phase 2 (RUNBOOK → UFW)"
+    info "  ufw not active — the deploy needs it active: enable it (sudo ufw enable) before Phase 2 (RUNBOOK → UFW)"
   else
-    info "  ufw state unknown (needs working sudo) — enable it in Phase 2 (RUNBOOK → UFW)"
+    info "  ufw state unknown (needs working sudo) — re-check before Phase 2 (RUNBOOK → UFW)"
   fi
 else
   warn "  MISSING: ufw  (pacman -S ufw) — required; the deploy depends on it"

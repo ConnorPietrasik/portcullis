@@ -61,9 +61,11 @@ make logs           # watch: traefik acme lines = cert issuance (NameSilo TTLs a
 sudo docker compose --project-directory /opt/panel logs authelia | grep -i error
 ```
 
-**UFW (required step — do it now)** — configure it before `panel-api` exists: `make deploy` just created the `edge` network the 8010 rule is
-scoped to, and enabling UFW now — before `panel-api` binds 8010 in Phase 4 — means 8010 is never reachable from outside the edge subnet,
-even briefly. Commands at [UFW](#ufw-required); note the 401-JSON verify there only passes once `panel-api` is up (Phase 4). `make doctor`
+**UFW (required step — do it now)** — add the 8010 rule before `panel-api` exists: `make deploy` just created the `edge` network the
+8010 rule is scoped to, and having it in place before `panel-api` binds 8010 in Phase 4 means 8010 is never reachable from outside the
+edge subnet, even briefly. UFW is already active and your SSH rules are untouched — the deploy adds only the
+two rules at [UFW](#ufw-required), never an SSH one; note the 401-JSON verify there only passes once
+`panel-api` is up (Phase 4). `make doctor`
 fails while UFW is inactive or the 8010 rule is missing, and `make api` refuses to run until that is true — so a first deploy can't skip
 this step by accident (a first `make stack` run stops at panel-api until you do it).
 
@@ -354,24 +356,32 @@ paths; no `os.Getenv`, no network, no goroutines; separators like `--` are hardc
   `.panel-api.env` / `.panel-ddns.env` are derived from `.env` — regenerate with `make api` / `make ddns`, never hand-edit).
 - [ ] `/opt/panel/authelia/db.sqlite3` mode 600 (TOTP seeds — authelia creates it 0644 at first boot; `make deploy` tightens it in the same run once it exists, subsequent `make deploy`/`make update` re-tighten it, `make doctor` checks it).
 - [ ] CrowdSec + Traefik bouncer plugin (optional, later).
-- [ ] SSH keys-only as break-glass access.
+- [ ] SSH keys-only as break-glass access — and still reachable under UFW (your existing SSH rule; the deploy
+  never touches SSH rules — see [UFW](#ufw-required)). Active UFW + no SSH rule = console-only.
 - [ ] Backups: `/opt/panel/.env`, `compose/` (this repo), Authelia `/opt/panel/authelia/` (config + `db.sqlite3` — TOTP seeds!), the `acme`
   docker volume, and this git repo.
 
 ## UFW (required)
 
-This host always runs UFW — it is a mandatory deploy step (Phase 2), not an option; `make doctor` fails while it is inactive or the 8010
-rule is missing.
+This host always runs UFW — CachyOS (the target OS) ships it installed and enabled, so the deploy never activates it; the deploy step
+is just adding the two rules the stack needs. If `ufw status` reports inactive: run `sudo ufw enable` first — rules added while inactive
+are stored and load once it activates. `make doctor` fails while UFW is inactive or the 8010 rule is missing, and `make api` refuses to
+bind 8010 until both are true. **The deploy adds exactly two rules (80/443 + the 8010 rule) and never touches SSH** — your existing
+SSH policy (port, source scope) stays as-is.
 
 ```bash
-sudo ufw allow 80,443/tcp comment 'traefik web'   # TCP only — 443/udp is HTTP/3, not served here
-# 8010 is scoped to the edge network's ACTUAL subnet (source) — Docker assigns
+sudo ufw status verbose    # confirm active; eyeball your SSH rules (the deploy never touches them)
+
+# Rule 1: web (TCP only — 443/udp is HTTP/3, not served here):
+sudo ufw allow 80,443/tcp comment 'traefik web'
+# Rule 2: panel-api, scoped to the edge network's ACTUAL subnet (source) — Docker assigns
 # it from a pool that depends on which subnets are already taken (a fresh
 # daemon starts at 172.18.0.0/16); derive, don't guess. The destination is
 # pinned to panel-api's bind IP (keep in sync with panel-api.service):
 EDGE_SUBNET=$(sudo docker network inspect edge -f '{{(index .IPAM.Config 0).Subnet}}')
 sudo ufw allow from "$EDGE_SUBNET" to 172.17.0.1 port 8010 proto tcp comment 'panel-api from edge network'
-sudo ufw enable && sudo ufw status verbose
+
+sudo ufw status verbose    # both rules present; SSH rules unchanged
 ```
 
 Two gotchas:
@@ -382,7 +392,7 @@ Two gotchas:
 - **The 8010 rule is required**, not optional: container → host traffic hits UFW's INPUT chain, and `default deny incoming` turns the panel
   into 502s. Scoped to the edge network's own subnet and to 172.17.0.1, the internet can't touch it.
 
-Verify after enabling (want: 401 JSON = reachable, not a timeout; then refused from outside):
+Verify after adding the rules (want: 401 JSON = reachable, not a timeout; then refused from outside):
 
 ```bash
 docker run --rm --network edge curlimages/curl -s -m 5 http://172.17.0.1:8010/api/metrics  # 401 JSON = reachable, auth enforced

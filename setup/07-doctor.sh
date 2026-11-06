@@ -257,7 +257,7 @@ if [[ -d /opt/panel ]] && sudo docker compose --project-directory /opt/panel ps 
   if grep -q '"ok":true' <<<"$edge_health"; then
     ok "edge container → 172.17.0.1:8010 reachable (real API path)"
   else
-    bad "edge container cannot reach 172.17.0.1:8010 — panel /api/* will 502"; hint "UFW 8010 rule for the edge subnet (RUNBOOK → UFW); bind: sudo ss -tln | grep 8010"
+    bad "edge container cannot reach 172.17.0.1:8010 — panel /api/* will 502"; hint "UFW 8010 rule for the edge subnet (RUNBOOK → UFW); bind: ss -tln | grep 8010"
   fi
 else
   skip "edge → API path (panel-web not running)"
@@ -348,7 +348,9 @@ section "firewall (ufw — required)"
 if command -v ufw >/dev/null 2>&1; then
   ufw_status="$(sudo ufw status 2>/dev/null || true)"
   if grep -q "Status: active" <<<"$ufw_status"; then
-    if grep -q "80,443/tcp" <<<"$ufw_status"; then
+    # ufw renders the multi-port rule as "80,443/tcp" (comma, no space —
+    # set_port() joins ports with ","); also match a spaced form defensively.
+    if grep -qE '80, ?443/tcp' <<<"$ufw_status"; then
       ok "80,443/tcp allowed"
     else
       warn "80,443/tcp rule missing"; hint "RUNBOOK → UFW (docker-published ports bypass ufw — belt-and-suspenders)"
@@ -364,11 +366,24 @@ if command -v ufw >/dev/null 2>&1; then
     else
       ok "8010 rule present and edge-scoped"
     fi
+    # Break-glass: with UFW active and no SSH rule, standard-port SSH is
+    # closed and the hardening checklist's "SSH as break-glass" is
+    # console-only. Non-verbose status renders the app profile as "OpenSSH"
+    # (not 22/tcp), so accept both forms; the anchor is the To column, so a
+    # source-scoped rule ("22/tcp  ALLOW  10.0.0.11") counts too. Only warned
+    # when something actually listens on :22 — a custom SSH port legitimately
+    # has no 22 rule (no false warn). The deploy never adds SSH rules, so the
+    # hint points at the operator, not the scripts.
+    if ! grep -qE '^[[:space:]]*(22/tcp|OpenSSH)' <<<"$ufw_status" \
+       && [[ $(ss -tln 'sport = :22' 2>/dev/null | tail -n +2 | grep -c .) -gt 0 ]]; then
+      warn "no 22/tcp rule — something listens on :22 but SSH is closed while UFW is active (break-glass is console-only)"
+      hint "allow your SSH port manually (the deploy never touches SSH rules): sudo ufw allow 22/tcp"
+    fi
   else
-    bad "UFW not active"; hint "required on this host — RUNBOOK → UFW (add the 80,443 + 8010 rules, then sudo ufw enable)"
+    bad "UFW not active"; hint "enable it (sudo ufw enable), then RUNBOOK → UFW for the two rules"
   fi
 else
-  bad "UFW not installed"; hint "required on this host — pacman -S ufw, then RUNBOOK → UFW (add the 80,443 + 8010 rules, then sudo ufw enable)"
+  bad "UFW not installed"; hint "required on this host — pacman -S ufw && sudo ufw enable, then RUNBOOK → UFW for the two rules"
 fi
 
 # ── audit trail ──────────────────────────────────────────────────────────────

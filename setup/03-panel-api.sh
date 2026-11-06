@@ -19,7 +19,7 @@ if ! command -v ufw >/dev/null 2>&1; then
 fi
 ufw_status="$(sudo ufw status 2>/dev/null || true)"
 if ! grep -q "Status: active" <<<"$ufw_status"; then
-  die "UFW inactive — add the 80,443 + 8010 rules and enable it (RUNBOOK → UFW) before panel-api, then re-run"
+  die "UFW inactive — enable it (sudo ufw enable) + add the 80,443 + 8010 rules (RUNBOOK → UFW) before panel-api, then re-run"
 fi
 # The 8010 rule must be edge-scoped: a "From: Anywhere" rule would leave the
 # API WAN-reachable — exactly what the scoping exists to prevent.
