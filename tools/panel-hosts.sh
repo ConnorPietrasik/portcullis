@@ -13,7 +13,7 @@
 # this side; pinning a name before the server routes it is harmless (Traefik
 # 404s it until you do).
 #
-# USAGE (on the client machine, e.g. the main PC):
+# USAGE (client machines, e.g. the main PC — `make update` re-runs this on the server itself):
 #   tools/panel-hosts.sh                  sync /etc/hosts (auto-sudo if needed)
 #   tools/panel-hosts.sh 10.0.0.99        one-off server-IP override
 #   PANEL_SERVER_IP=10.0.0.99 tools/panel-hosts.sh
@@ -110,17 +110,16 @@ while IFS= read -r h; do
 done <<< "$hosts_raw"
 (( ${#HOSTS[@]} )) || die "no Host(...) rules found in $DYNAMIC_DIR — nothing to pin"
 
-commit="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo nogit)"
-
-# The block is deterministic per (repo commit, server IP): no timestamps, so an
-# unchanged repo → byte-identical /etc/hosts → no write, no backup churn.
+# The block is deterministic per (route set, server IP): no timestamps, no
+# commit hash — a commit that doesn't touch the routes → byte-identical
+# /etc/hosts → no write, no backup churn.
 tmp_block="$(mktemp)"
 proposal="$(mktemp)"
 tmp=""
 trap 'rm -f "$tmp_block" "$proposal" "$tmp"' EXIT
 {
   printf '%s\n' "$BEGIN_MARK"
-  printf '# Routed hosts from this checkout (git %s), pinned to the server LAN IP.\n' "$commit"
+  printf '# Routed hosts from this checkout, pinned to the server LAN IP.\n'
   for h in "${HOSTS[@]}"; do printf '%s  %s\n' "$SERVER_IP" "$h"; done
   printf '%s\n' "$END_MARK"
 } > "$tmp_block"
@@ -178,7 +177,7 @@ else
       info "already in sync — $HOSTS_FILE untouched"
       exit 0
     fi
-    info "managed block as it would be written (server $SERVER_IP, git $commit):"
+    info "managed block as it would be written (server $SERVER_IP):"
     cat "$tmp_block"
     warn "dry run — $HOSTS_FILE was not modified"
     exit 1

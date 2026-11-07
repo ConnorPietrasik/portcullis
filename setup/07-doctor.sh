@@ -122,19 +122,55 @@ else
 fi
 
 # ── dns ──────────────────────────────────────────────────────────────────────
+# Two different questions: do the names resolve ON THIS MACHINE (what the
+# https checks below depend on — with the /etc/hosts pins from
+# tools/panel-hosts.sh, that resolution IS the pin), and is the zone at the
+# registrar healthy (panel-ddns keeps the apex A current; the * CNAME is a
+# one-time manual record). The zone is asked of NameSilo's AUTHORITATIVE name
+# servers: a recursive resolver serves a cached answer that can lag a healthy
+# ddns tick by the record TTL (1h) — "fixed within one tick" must be
+# observable in that tick — and through /etc/hosts the pins would hide
+# everything local anyway.
 section "dns"
+# ns_query <name> — answer from the first reachable authoritative NS (ns1→2→3).
+# Reachability is proven with a SOA probe (always present in an authoritative
+# zone): an empty answer alone can't say whether the NS said "no record" or
+# was simply unreachable, and that distinction is FAIL vs skip. rc 0 = an
+# authoritative NS answered (an empty result is a definite no-record);
+# rc 9 = no NS reachable.
+ns_query() {
+  local out ns
+  for ns in ns1.dnsowl.com ns2.dnsowl.com ns3.dnsowl.com; do
+    dig +short +time=3 +tries=1 SOA pietrasik.top "@$ns" >/dev/null 2>&1 || continue
+    out="$(dig +short +time=3 +tries=1 "$1" "@$ns" 2>/dev/null)"
+    printf '%s' "$out"
+    return 0
+  done
+  return 9
+}
+have_dig=0
+command -v dig >/dev/null 2>&1 && have_dig=1
 apex="$(getent hosts pietrasik.top 2>/dev/null | awk '{print $1; exit}')"
 if [[ -n "$apex" ]]; then
-  ok "apex resolves: pietrasik.top → $apex"
-  if command -v dig >/dev/null 2>&1; then
+  ok "apex resolves locally: pietrasik.top → $apex"
+  if (( have_dig )); then
+    apex_ans="$(ns_query pietrasik.top)"; ns_ok=$?
+    # OpenDNS is kept only for the public-IP echo (our egress address) — not
+    # part of the zone.
     pub="$(dig +short myip.opendns.com @resolver1.opendns.com 2>/dev/null | grep -E '^[0-9.]+$' | head -1)"
-    if [[ -n "$pub" ]]; then
-      if [[ "$apex" == "$pub" ]]; then
+    pub_apex="$(grep -m1 -E '^[0-9.]+$' <<<"$apex_ans" || true)"
+    if (( ns_ok )); then
+      skip "published-zone check skipped (none of ns1..ns3.dnsowl.com reachable)"
+    elif [[ -z "$pub_apex" ]]; then
+      bad "no published apex A for pietrasik.top (authoritative NS)"; hint "apex A is created by panel-ddns (make ddns)"
+    elif [[ -n "$pub" ]]; then
+      if [[ "$pub_apex" == "$pub" ]]; then
         ok "apex A matches public IP ($pub)"
       else
-        warn "apex A ($apex) != public IP ($pub)"; hint "sudo systemctl start panel-ddns.service — fixed within one tick"
+        warn "apex A ($pub_apex) != public IP ($pub)"; hint "sudo systemctl start panel-ddns.service — fixed within one tick"
       fi
     else
+      ok "published apex A: pietrasik.top → $pub_apex"
       skip "public IP detection failed"
     fi
   else
@@ -144,8 +180,22 @@ else
   bad "pietrasik.top does not resolve"; hint "apex A is created by panel-ddns (make ddns); also check the * CNAME exists (Phase 0)"
 fi
 for h in auth.pietrasik.top panel.pietrasik.top; do
+  if (( have_dig )); then
+    ans="$(ns_query "$h")"; rc=$?
+    if (( ! rc )); then
+      # +short prints the CNAME chain then the final record; a line containing
+      # a digit is an IP (a CNAME target like 'pietrasik.top.' has none).
+      if grep -qE '^[0-9a-fA-F:]*[0-9][0-9a-fA-F:.]*$' <<<"$ans"; then
+        ok "$h resolves publicly (wildcard CNAME chain)"
+        continue
+      fi
+      bad "$h does not resolve publicly"; hint "check the * CNAME → pietrasik.top at NameSilo (Phase 0)"
+      continue
+    fi
+  fi
+  # no dig, or no authoritative NS reachable — local check only.
   if getent hosts "$h" >/dev/null 2>&1; then
-    ok "$h resolves (wildcard CNAME chain)"
+    ok "$h resolves locally (weak: an /etc/hosts pin passes this even if the public record is gone)"
   else
     bad "$h does not resolve"; hint "check the * CNAME → pietrasik.top at NameSilo (Phase 0)"
   fi

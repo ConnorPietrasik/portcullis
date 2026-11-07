@@ -1,2 +1,4 @@
+Get rid of the link to the panel on the portfolio site
 Get LLM servers fully set up, with some way to easily configure GPUs per container and what not
 Make the panel overview actually readable and not so ugly
+Make an actual portfolio site

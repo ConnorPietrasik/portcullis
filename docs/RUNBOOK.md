@@ -229,7 +229,9 @@ touching anything, and auto-rolls-back on any failure — updates are routine an
 ```bash
 make update      # doctor precondition (aborts before touching anything if not green)
                  # → snapshot everything (image IDs, deployed configs, exact panel-api copy, npm files)
-                 # → npm bump (in-repo, within ranges) → sync configs from the repo → pull → rebuild (bases pulled)
+                 # → npm bump (in-repo, within ranges) → sync configs from the repo
+                 # → re-pin the server's /etc/hosts (tools/panel-hosts.sh — the route set may have changed)
+                 # → pull → rebuild (bases pulled)
                  # → recreate what changed (+ restart on start-time config change) → update panel-api
                  # → gate: post-update services healthy (pre-update set + added) + panel-api serving + full doctor pass
                  # → on any failure: automatic rollback of all of it, re-gated
@@ -286,6 +288,11 @@ Mechanics in `setup/08-update.sh` (shared helpers in `setup/common.sh`):
   panel-uid reduced env files re-derived — a `.env` edit is applied here too). authelia + traefik read some files only at container
   start — those services are restarted **only if their content changed** (a routine update adds no such downtime). A sync failure
   aborts before any container changes.
+- **hosts pin** = `tools/panel-hosts.sh` re-pins every routed name to the server's LAN IP in the server's own `/etc/hosts` —
+  the router doesn't hairpin, so the doctor's endpoint checks (which curl the public names *from the server*) must resolve
+  locally. Idempotent (no write when the managed block already matches); a shadowed pin aborts the run before any container is
+  touched. Rollback does not restore `/etc/hosts` — a pin left behind for a removed route is harmless (Traefik 404s it) and the
+  next update re-anchors.
 - **panel-web** = built from the synced build context, with `--pull` so its `FROM` bases float too (without it, BuildKit reuses the
   local bases from the first build). A build/base-pull failure aborts before any container changes.
 - **Recreate** = `up -d` converges only what should be running after the update: the pre-update running set, plus services this
@@ -356,7 +363,8 @@ restarts authelia whenever `configuration.yml` or `users_database.yml` content c
 manual recreate step is needed.
 
 If a client machine pins the names via `tools/panel-hosts.sh` (README → From the LAN), re-run it
-there — it reads the new route from its own checkout, no pull or deploy step on that side.
+there — it reads the new route from its own checkout, no pull or deploy step on that side. The server
+re-pins itself automatically as part of `make update` (see Updates).
 
 ## LLM fleet (Radiance instances)
 

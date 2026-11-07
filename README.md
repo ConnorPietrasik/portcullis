@@ -108,6 +108,10 @@ IP defaults to `10.0.0.187` (override: `PANEL_SERVER_IP=…` or positional). `--
 previews; `--remove` unpins. Exits 1 when a `--dry-run` has pending changes, or when an
 earlier line in the file still shadows a pin (checked even on no-op re-runs).
 
+The server pins the names in its own `/etc/hosts` too — its `make doctor` curls the public names
+from the server and the router doesn't hairpin — and `make update` re-runs this pin as part of
+every config sync, so only client machines need the manual run above.
+
 ## License
 
 [GPL-3.0](LICENSE) © Connor Pietrasik

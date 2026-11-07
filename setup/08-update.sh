@@ -71,6 +71,12 @@ info "3/7 syncing the repo's configs to /opt/panel (compose + traefik + authelia
 # nothing is recreated yet, and a sync failure aborts with every container
 # untouched.
 stack_sync_configs /opt/panel
+# The router doesn't hairpin: doctor's endpoint checks curl the public names
+# from this server and must resolve them locally. The pin (tools/panel-hosts.sh)
+# is derived from this checkout's traefik rules, so this step — the only place
+# the route set changes — is where it can go stale. Idempotent: no write when
+# the managed block already matches. Aborts if a pin is shadowed (set -e).
+bash "$REPO_ROOT/tools/panel-hosts.sh"
 
 info "4/7 pulling new images (nothing is touched until every pull succeeds)"
 pull_err=""
