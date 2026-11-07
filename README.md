@@ -40,7 +40,8 @@ docker.sock — the internet-facing process gets zero docker access.
 
 ## Quickstart (on the server)
 
-**Main target: CachyOS** (Arch-based; UFW ships installed and enabled, so the deploy only adds its two rules and never touches SSH).
+**Main target: CachyOS** (Arch-based; UFW ships installed and enabled). The only firewall change in this whole deploy is the two rules
+in [RUNBOOK → UFW](docs/RUNBOOK.md#ufw-required) — a manual step between `make deploy` and `make api` that never touches SSH.
 Any other Arch-based distro works: `pacman -S ufw` and enable it before Phase 2 (RUNBOOK → UFW).
 
 **[docs/RUNBOOK.md](docs/RUNBOOK.md) is the deploy guide — follow it in order** (phase 0 is manual DNS prep; phase 5 is the final check
@@ -54,6 +55,7 @@ make preflight   # phase 1: host tooling
 make secrets     # phase 1: .env (then fill NAMESILO_API_KEY + users_database.yml)
 make deploy      # phase 2: edge stack → /opt/panel (staging cert → auto-promotes to prod)
 make ddns        # phase 2: apex A record self-creates
+# ── phase 2: run the two UFW rules here (RUNBOOK → UFW) — make api refuses to run without them ──
 make panel-do    # phase 3: privileged dispatcher
 make api         # phase 4: host API (gated on UFW)
 make doctor      # any time: whole-stack pass/fail report (read-only)

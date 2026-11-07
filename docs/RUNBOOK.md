@@ -10,10 +10,10 @@ from an external network, so it stays manual.)
 1. NameSilo → Domain Manager → **API** → generate an API key. Keep it handy — Phase 1 pastes it into `.env`.
 2. NameSilo → DNS → add a `*` CNAME → `pietrasik.top`. The apex A record is created automatically by `make ddns` in Phase 2.
 
-   **Why the stack sets `LEGO_DISABLE_CNAME_SUPPORT=true` (traefik env in `compose/docker-compose.yml`):** this CNAME makes
+   **Do not remove `LEGO_DISABLE_CNAME_SUPPORT=true` (traefik env in `compose/docker-compose.yml`) when editing it.** This CNAME makes
    `_acme-challenge.pietrasik.top` a wildcard-synthesized CNAME, which lego would follow while solving DNS-01 and misplace the
-   challenge TXT (go-acme/lego#1816). With the env var set, the TXT always lands at `_acme-challenge.pietrasik.top` itself, where the
-   explicit record takes precedence over the wildcard (RFC 4592). Do not remove it.
+   challenge TXT (go-acme/lego#1816); with the env var set, the TXT always lands at `_acme-challenge.pietrasik.top` itself, where the
+   explicit record takes precedence over the wildcard (RFC 4592).
 
 That's the whole phase. The wildcard cert comes from the DNS-01 challenge, which needs no A records at all. `panel-ddns` keeps the
 apex A current forever after, and the reconciler never touches CNAMEs, so every subdomain follows the apex A automatically. If the
@@ -26,12 +26,13 @@ make preflight      # docker, compose plugin, go, ufw, python3, ports 80/443 fre
 make secrets        # writes .env (chmod 600)
 ```
 
-Then edit `.env`: paste the `NAMESILO_API_KEY` from Phase 0 (`ACME_EMAIL` comes pre-filled). Values are read literally as
-`KEY=VALUE` lines — no shell execution — and what the deploy scripts use is exactly what the containers and systemd units receive,
-so keep values free of `$`, backslashes and ` #` (docker compose and systemd reinterpret those; `make deploy`/`make doctor` refuse
-them with a clear message; single quotes make a value fully literal). An `export ` prefix is tolerated on container-only keys but
-refused on `NAMESILO_API_KEY`, `PANEL_TOKEN` & co. — systemd drops such lines silently. Any other stray text is refused (docker
-compose would reject the file at `up` time).
+Then edit `.env`: paste the `NAMESILO_API_KEY` from Phase 0 — that's the only edit (`ACME_EMAIL` comes pre-filled, and `make secrets`
+already generated the rest). Values land verbatim in the containers and systemd units (no shell execution), so keep them plain
+`KEY=VALUE`:
+
+- no `$`, backslashes, or ` #` inside a value — docker compose and systemd reinterpret those (single quotes make a value fully literal)
+- no `export ` prefix on `NAMESILO_API_KEY`, `PANEL_TOKEN` & co. — systemd drops such lines silently (container-only keys tolerate it)
+- no stray text anywhere — `make deploy`/`make doctor` refuse the file with a clear message (docker compose would reject it at `up` time)
 
 Create `compose/authelia/users_database.yml` from the template — the real file is gitignored, so password hashes never reach GitHub
 (a fresh clone won't have it):
@@ -57,21 +58,83 @@ make logs           # watch: traefik acme lines = cert issuance (NameSilo TTLs a
 sudo docker compose --project-directory /opt/panel logs authelia | grep -i error
 ```
 
-**UFW (required step — do it now)** — add the 8010 rule before `panel-api` exists: `make deploy` just created the `edge` network the
-rule is scoped to, so 8010 is never reachable from outside the edge subnet, even briefly. UFW is already active and your SSH rules
-are untouched — the deploy adds only the two rules at [UFW](#ufw-required), never an SSH one; note the 401-JSON verify there only
-passes once `panel-api` is up (Phase 4). `make doctor` fails while UFW is inactive or the 8010 rule is missing, and `make api`
-refuses to run until that is true — so a first deploy can't skip this step by accident.
+### UFW (required)
 
-**First bring-up runs on the staging ACME directory** (`.env.example` defaults `ACME_CA_SERVER` to it): debugging the NameSilo
-DNS-01 dance against production risks the 5-failures/hour rate limit. `make deploy` then waits up to 10 min (`ACME_STAGING_WAIT`)
-for the staging cert and promotes to production automatically: traefik stops, the ACME store is wiped (the staging account URI
-doesn't exist on prod — reusing it fails JWS verification), the config flips, traefik starts and issues the real cert. If the wait
-times out, `make logs` until the staging cert appears, then finish with:
+The deploy adds **no** firewall rules — these four commands are the whole step. **Do them now** (after `make deploy`, before any
+8010 listener exists): `make api` refuses to run until the rule is in place and `make doctor` checks it too, so a first deploy
+can't skip this by accident. Your SSH rules are never touched.
+
+**1 — confirm UFW is active**
+
+```bash
+sudo ufw status            # want: "Status: active"
+```
+
+Inactive → `sudo ufw enable`, then check again. (CachyOS ships UFW installed and enabled, so on target this is usually just a check.)
+
+**2 — add the web rule** (Traefik only; TCP only — 443/udp is HTTP/3, not served here)
+
+```bash
+sudo ufw allow 80,443/tcp comment 'traefik web'
+```
+
+**3 — add the panel-api rule**, scoped to the edge network's *actual* subnet. Derive the subnet — don't hardcode it: Docker picks
+it from a pool depending on what's already taken (fresh daemon → `172.18.0.0/16`, otherwise something else). The destination is
+`172.17.0.1` — panel-api's bind IP, keep in sync with `panel-api.service`.
+
+```bash
+EDGE_SUBNET=$(sudo docker network inspect edge -f '{{(index .IPAM.Config 0).Subnet}}')
+sudo ufw allow from "$EDGE_SUBNET" to 172.17.0.1 port 8010 proto tcp comment 'panel-api from edge network'
+```
+
+**4 — confirm both rules are present, and your SSH rules unchanged** (this step only ever ADDS — it never deletes or rewrites anything else)
+
+```bash
+sudo ufw status verbose
+```
+
+You should see your existing rules plus these two (an IPv6 mirror line may appear too; column spacing varies):
+
+```
+80,443/tcp                 ALLOW       Anywhere
+172.17.0.1 8010/tcp        ALLOW IN    172.18.0.0/16     ← whatever your EDGE_SUBNET was
+```
+
+Done — continue with the rest of Phase 2, then Phases 3–4 (`make panel-do`, `make api`).
+
+#### If `make api` or `make doctor` complains
+
+| message | fix |
+|---|---|
+| `UFW inactive` | `sudo ufw enable` (the gate checks active first) |
+| `UFW active but no 8010 rule` | step 3 |
+| `8010 rule not edge-scoped (From: Anywhere)` | delete the wrong rule, then re-run step 3 — e.g. `sudo ufw delete allow 8010`, or `sudo ufw delete allow from <old-subnet> to 172.17.0.1 port 8010 proto tcp` |
+| Docker re-allocated the edge subnet | re-derive with step 3, re-add, delete the old rule |
+
+#### Why it's set up this way (read once)
+
+- **The 8010 rule is required, not optional.** Container → host traffic hits UFW's INPUT chain, and with `default deny incoming`
+a missing rule turns every panel → API call into a 502. Scoped to the edge subnet + `172.17.0.1`, the API is unreachable from the
+internet — which is why `make api` refuses to bind 8010 before the rule exists and `make doctor` keeps checking it.
+- **SSH rules are never touched.** The only firewall change this stack makes is the two rules above. Active UFW with no SSH rule =
+console-only access, so don't clean up your 22/tcp rule.
+- **Docker-published ports bypass UFW.** 80/443 pass through Docker's NAT rules regardless of ufw; the real access control for
+containers is what you put in `ports:`. Nothing in this stack publishes a port besides Traefik — keep it that way, and never
+publish the API beyond loopback/bridge IPs.
+- **Enabling HTTP/3 later:** `http3: {}` in the `websecure` entryPoint of `traefik.yml`, `"443:443/udp"` in traefik's ports in
+docker-compose.yml, and `sudo ufw allow 443/udp`.
+
+Nothing to do here in the common case: `make deploy` waits up to 10 min (`ACME_STAGING_WAIT`) for the staging cert and promotes to
+production on its own — watch it happen in `make logs`. If the wait times out: keep watching until the staging cert appears, then:
 
 ```bash
 make promote   # idempotent; also safe to just re-run make deploy
 ```
+
+**Why staging first (read once):** first bring-up runs on the staging ACME directory (`.env.example` defaults `ACME_CA_SERVER` to it)
+so a broken NameSilo DNS-01 config can't burn the production 5-failures/hour rate limit. Promotion is a full re-issue: traefik stops,
+the ACME store is wiped (the staging account URI doesn't exist on prod — reusing it fails JWS verification), the config flips, traefik
+starts and issues the real cert.
 
 Verify (subdomains resolve via the `*` CNAME → apex A; if the apex A was just created, give resolvers a minute):
 - `curl -I https://auth.pietrasik.top` → 200 (valid prod wildcard cert; an *untrusted* staging cert means promotion hasn't run yet —
@@ -111,6 +174,9 @@ AUTH=(-H "X-Panel-Token: $TOKEN" -H "Remote-User: connor" -H 'Remote-Groups: adm
 curl -s http://172.17.0.1:8010/api/health                # {"ok":true,...} — open liveness endpoint
 curl -s http://172.17.0.1:8010/api/metrics               # 401 (expected — auth enforced)
 curl -s "${AUTH[@]}" http://172.17.0.1:8010/api/metrics  # GPUs/CPU/RAM/disks JSON
+
+# From inside the edge network — this is exactly what the panel's containers do, so a timeout here means the UFW 8010 rule is wrong:
+docker run --rm --network edge curlimages/curl -s -m 5 http://172.17.0.1:8010/api/metrics   # 401 JSON (reachable, auth enforced)
 ```
 
 Disk dials: one per mount in `PANEL_DISK_MOUNTS` (`.env` — this server: `/`, `/home`, `/models`). A mount that isn't there
@@ -123,17 +189,14 @@ Then from a browser logged into Authelia: `https://panel.pietrasik.top` → Over
 
 - [ ] panel behind 2FA, only `admins` group works
 - [ ] `curl -H "X-Panel-Token: <wrong>" https://panel.pietrasik.top/api/health` from outside → Authelia login page (never reaches API)
+- [ ] `curl -m 5 http://SERVER_IP:8010/api/health` from outside → **connection refused** (the API is not internet-reachable)
 - [ ] demos/apps you mark public open without an Authelia prompt
 - [ ] `sudo -n /usr/local/libexec/panel-do restart-service foo.service` as a non-panel user → password prompt/denied
 
 ## Dynamic IP
 
-The server's IP isn't static. `panel-ddns` (systemd timer, user `panel`, stdlib python, outbound only, no root) reconciles the apex
-NameSilo A record declaratively every 10 minutes: detect public IP → list records → update stale ones, create missing ones. CNAMEs
-at configured hosts are skipped (`*.pietrasik.top` is a CNAME → apex, so it rides along) — never overwritten. No state file, no
-short-circuit — whatever drifted is fixed within one tick (~6 API calls/hour — trivial). TTL is pinned at 3600 (NameSilo's minimum),
-so worst-case cutover ≈ 10 min + 1 h of resolver caching. Reuses `NAMESILO_API_KEY` (the same key Traefik uses for DNS-01), reaching
-the oneshot via the reduced env file (`.panel-ddns.env`), so the full `.env` secret set never sits in its environ.
+Nothing to do here after Phase 2 (`make ddns` installed it). `panel-ddns` (systemd timer, user `panel`, stdlib python, outbound
+only, no root) reconciles the apex NameSilo A record every 10 minutes on its own; these commands are how you watch it:
 
 ```bash
 journalctl -u panel-ddns -n 50                  # what it did and when
@@ -143,21 +206,18 @@ sudo systemctl start panel-ddns.service         # reconcile now — also the man
 dig +short pietrasik.top @ns1.dnsowl.com        # what the authoritative NS says (check NS at NameSilo)
 ```
 
+**How it works (read once):** the server's IP isn't static. Each tick: detect public IP → list records → update stale ones, create
+missing ones. Declarative, no state file, no short-circuit — whatever drifted is fixed within one tick (~6 API calls/hour —
+trivial). CNAMEs at configured hosts are skipped (`*.pietrasik.top` is a CNAME → apex, so it rides along) — never overwritten. TTL is
+pinned at 3600 (NameSilo's minimum), so worst-case cutover after an IP change ≈ 10 min + 1 h of resolver caching. Reuses
+`NAMESILO_API_KEY` (the same key Traefik uses for DNS-01), reaching the oneshot via the reduced env file (`.panel-ddns.env`), so the
+full `.env` secret set never sits in its environ.
+
 ## Updates
 
-`make update` is the one Day-2 command: it applies the repo's configs **and** floats everything that has a *line*:
-
-| Component | Line | A breaking major is a deliberate edit of… |
-|---|---|---|
-| traefik, authelia, portfolio | major tags: `traefik:v3`, `authelia/authelia:4`, `nginx:stable-alpine` | the tag in `compose/docker-compose.yml` |
-| panel-web base images | `node:22-alpine`, `nginx:stable-alpine` | the `FROM` lines in `compose/panel-frontend/Dockerfile` |
-| panel-web npm deps | the ranges in `package.json` (e.g. `react ^18.3.1`) | a range in `compose/panel-frontend/package.json` + commit |
-| panel-api pip deps | the ranges in `requirements.txt` (e.g. `fastapi>=0.115,<1`) | a range in `panel-api/requirements.txt` + commit |
-| stack configs + secrets | whatever is committed in this repo (compose, routes, Authelia ACLs, `.env`) | — the repo edit **is** the change (holding a line = a full-version pin, e.g. `traefik:v3.7.9`) |
-| radiance (LLM fleet) | `latest` — deliberately OUTSIDE the declared-line policy (frequent builds wanted) | the tag in `x-llm-base`; a build that breaks behavior → `make rollback WHAT=radiance` |
-
-Patch/minor security releases ride in on every update. The internet-facing stack should never run stale, so updates are routine and
-*safe by construction*:
+`make update` is the one Day-2 command: it syncs every repo change to `/opt/panel` (compose, routes, Authelia, `.env`, panel
+frontend) **and** floats everything within its declared *line*. It requires a green `make doctor`, snapshots everything before
+touching anything, and auto-rolls-back on any failure — updates are routine and safe by construction:
 
 ```bash
 make update      # doctor precondition (aborts before touching anything if not green)
@@ -171,7 +231,39 @@ make rollback WHAT=radiance  # or: images ONLY of the services WHAT matches — 
                              # prefix (llm), or an image name (radiance); everything else stays
 ```
 
-How it works (`setup/08-update.sh`, shared helpers in `setup/common.sh`):
+### What it does **not** touch — by design
+
+- **Majors** in any line: deliberate edits (a tag, a `FROM`, a range).
+- **panel-do / panel-ddns**: no external dependencies (stdlib-only Go / Python) — nothing to float. Their update is a repo edit +
+  `make panel-do` / `make ddns`.
+- **Host OS packages**: `sudo pacman -Syu` on your normal schedule.
+
+### The lines — what floats, and how a breaking major happens
+
+Patch/minor security releases ride in on every update — the internet-facing stack should never run stale. A breaking major only
+happens through a deliberate edit of that component's line:
+
+| Component | Line | A breaking major is a deliberate edit of… |
+|---|---|---|
+| traefik, authelia, portfolio | major tags: `traefik:v3`, `authelia/authelia:4`, `nginx:stable-alpine` | the tag in `compose/docker-compose.yml` |
+| panel-web base images | `node:22-alpine`, `nginx:stable-alpine` | the `FROM` lines in `compose/panel-frontend/Dockerfile` |
+| panel-web npm deps | the ranges in `package.json` (e.g. `react ^18.3.1`) | a range in `compose/panel-frontend/package.json` + commit |
+| panel-api pip deps | the ranges in `requirements.txt` (e.g. `fastapi>=0.115,<1`) | a range in `panel-api/requirements.txt` + commit |
+| stack configs + secrets | whatever is committed in this repo (compose, routes, Authelia ACLs, `.env`) | — the repo edit **is** the change (holding a line = a full-version pin, e.g. `traefik:v3.7.9`) |
+| radiance (LLM fleet) | `latest` — deliberately OUTSIDE the declared-line policy (frequent builds wanted) | the tag in `x-llm-base`; a build that breaks behavior → `make rollback WHAT=radiance` |
+
+### If something goes wrong
+
+- A breaking major you didn't want (any line): `make rollback`, then pin it in the repo (e.g. `traefik:v3.7.9`, or the old range back
+  in `package.json`/`requirements.txt`), `make update`. (Re-running `make update` without the pin would just retry the same major.)
+- A floating image that passed the gates but broke behavior: `make rollback WHAT=radiance` (images only). Then either pin the good
+  build's tag in `x-llm-base` + `make update` to hold it, or just `make update` again to re-try `latest`.
+- Update interrupted mid-run (Ctrl-C, power loss): the snapshot + rollback tags survive on disk; `make rollback` restores everything,
+  or just re-run `make update`.
+
+### How it works (read once)
+
+Mechanics in `setup/08-update.sh` (shared helpers in `setup/common.sh`):
 
 - **Snapshot** = `/opt/panel/.update-snapshot-<ts>` (state in `/opt/panel/.update-state`): the exact *image IDs* of what is running
   (tags move, IDs don't), re-tagged `portcullis-rollback/<svc>:<ts>`; **the deployed config tree** (`/opt/panel`: docker-compose.yml,
@@ -216,22 +308,6 @@ How it works (`setup/08-update.sh`, shared helpers in `setup/common.sh`):
 - `make deploy` is the **first-boot** path (network, secrets, ACME staging→prod, first build). It does **not** pull — with floating
   tags a pull is an upgrade, so image movement only happens through `make update` (gated). A Day-2 re-run of it applies config
   ungated and warns.
-
-Escapes:
-
-- A breaking major you didn't want (any line): `make rollback`, then pin it in the repo (e.g. `traefik:v3.7.9`, or the old range back
-  in `package.json`/`requirements.txt`), `make update`. (Re-running `make update` without the pin would just retry the same major.)
-- A floating image that passed the gates but broke behavior: `make rollback WHAT=radiance` (images only). Then either pin the good
-  build's tag in `x-llm-base` + `make update` to hold it, or just `make update` again to re-try `latest`.
-- Update interrupted mid-run (Ctrl-C, power loss): the snapshot + rollback tags survive on disk; `make rollback` restores everything,
-  or just re-run `make update`.
-
-What `make update` does **not** touch — by design:
-
-- **Majors** in any line: deliberate edits (a tag, a `FROM`, a range).
-- **panel-do / panel-ddns**: no external dependencies (stdlib-only Go / Python) — nothing to float. Their update is a repo edit +
-  `make panel-do` / `make ddns`.
-- **Host OS packages**: `sudo pacman -Syu` on your normal schedule.
 
 ## Add an app
 
@@ -332,66 +408,24 @@ check:
 
 ## Hardening checklist
 
+**Do once** (one-time host setup — run any time after Phase 2):
+
+```bash
+sudo mkdir -p /var/log/journal && sudo systemctl restart systemd-journald   # persistent journald — panel-do's audit trail lives there
+sudo systemctl enable --now fstrim.timer                                   # weekly SSD trim (HDDs don't need it)
+```
+
+**Keep true** (invariants — `make doctor` checks what it can; the rest holds by review):
+
 - [ ] The clone stays the source of truth — edit tracked files in the repo (commit before `make update` for a rollback point),
   never hand-edit the deployed copies: updates sync repo → `/opt/panel` one-way (stale managed traefik configs get pruned).
   `.gitignore` keeps `.env`, built binaries, and caches out of git.
-- [ ] Persistent journald — panel-do's audit trail lives there: `sudo mkdir -p /var/log/journal && sudo systemctl restart systemd-journald`.
-- [ ] SSD trim: `sudo systemctl enable --now fstrim.timer` (weekly; HDDs don't need it).
-- [ ] UFW active and configured per [UFW](#ufw-required) below — **required on this host** (no firewalld/iptables fallback); only
+- [ ] UFW active and configured per [UFW](#ufw-required) (Phase 2) — **required on this host** (no firewalld/iptables fallback); only
   80/443 public; `172.17.0.1:8010` never reachable externally.
 - [ ] No container mounts `/var/run/docker.sock` — not even `:ro` (a ro-mounted socket still grants full Docker API access).
   Traefik runs the file provider precisely so it needs none.
-- [ ] `chmod 600 /opt/panel/.env /opt/panel/.panel-api.env /opt/panel/.panel-ddns.env /opt/panel/traefik/dynamic/middlewares.yml /opt/panel/authelia/users_database.yml`
-  (deploy script does this — verify after manual edits; `.panel-api.env` / `.panel-ddns.env` are derived from `.env` — regenerate
-  with `make api` / `make ddns`, never hand-edit).
 - [ ] `/opt/panel/authelia/db.sqlite3` mode 600 (TOTP seeds — authelia creates it 0644 at first boot; `make deploy`/`make update`
   re-tighten it, `make doctor` checks it).
-- [ ] CrowdSec + Traefik bouncer plugin (optional, later).
-- [ ] SSH keys-only as break-glass access — and still reachable under UFW (your existing SSH rule; the deploy never touches SSH
-  rules — see [UFW](#ufw-required)). Active UFW + no SSH rule = console-only.
-- [ ] Backups: `/opt/panel/.env`, `compose/` (this repo), Authelia `/opt/panel/authelia/` (config + `db.sqlite3` — TOTP seeds!), the
-  `acme` docker volume, and this git repo.
-
-## UFW (required)
-
-This host always runs UFW — CachyOS (the target OS) ships it installed and enabled, so the deploy never activates it; the deploy
-step is just adding the two rules the stack needs. If `ufw status` reports inactive: run `sudo ufw enable` first — rules added while
-inactive are stored and load once it activates. `make doctor` fails while UFW is inactive or the 8010 rule is missing, and `make api`
-refuses to bind 8010 until both are true. **The deploy adds exactly two rules (80/443 + the 8010 rule) and never touches SSH** —
-your existing SSH policy stays as-is.
-
-```bash
-sudo ufw status verbose    # confirm active; eyeball your SSH rules (the deploy never touches them)
-
-# Rule 1: web (TCP only — 443/udp is HTTP/3, not served here):
-sudo ufw allow 80,443/tcp comment 'traefik web'
-# Rule 2: panel-api, scoped to the edge network's ACTUAL subnet (source) — Docker assigns
-# it from a pool that depends on which subnets are already taken (a fresh
-# daemon starts at 172.18.0.0/16); derive, don't guess. The destination is
-# pinned to panel-api's bind IP (keep in sync with panel-api.service):
-EDGE_SUBNET=$(sudo docker network inspect edge -f '{{(index .IPAM.Config 0).Subnet}}')
-sudo ufw allow from "$EDGE_SUBNET" to 172.17.0.1 port 8010 proto tcp comment 'panel-api from edge network'
-
-sudo ufw status verbose    # both rules present; SSH rules unchanged
-```
-
-Two gotchas:
-
-- **Docker-published ports bypass UFW.** 80/443 are open via Docker's NAT rules regardless of ufw; the real access control for
-  containers is what you put in `ports:`. Nothing in this stack publishes a port besides Traefik — keep it that way, and never
-  publish the API beyond loopback/bridge IPs.
-- **The 8010 rule is required**, not optional: container → host traffic hits UFW's INPUT chain, and `default deny incoming` turns
-  the panel into 502s. Scoped to the edge network's subnet and to 172.17.0.1, the internet can't touch it.
-
-Verify after adding the rules (want: 401 JSON = reachable, not a timeout; then refused from outside):
-
-```bash
-docker run --rm --network edge curlimages/curl -s -m 5 http://172.17.0.1:8010/api/metrics  # 401 JSON = reachable, auth enforced
-curl -m 5 http://SERVER_IP:8010/api/health                                                  # refused from outside
-```
-
-If you later enable HTTP/3: add `http3: {}` to the `websecure` entryPoint in `traefik.yml`, add `"443:443/udp"` to traefik's ports
-in docker-compose.yml, and `sudo ufw allow 443/udp`.
 
 ## Troubleshooting
 
