@@ -224,6 +224,9 @@ acme_mode() { # <deployed-traefik.yml> → echo: staging | prod | unknown
 }
 
 acme_cert_issued() { # <target-dir> → exit 0 if the ACME store already holds a cert
+  # v3 store layout: {<resolverName>: {"Certificates": [...]}} — a map keyed
+  # by the certificatesResolvers name, "Certificates" an untagged Go field.
+  # Accept any resolver name.
   sudo docker compose --project-directory "$1" -f "$1/docker-compose.yml" \
     exec -T traefik cat /letsencrypt/acme.json 2>/dev/null \
     | python3 -c 'import json,sys
@@ -231,7 +234,8 @@ try:
     d = json.load(sys.stdin)
 except Exception:
     sys.exit(1)  # no store yet (or traefik down) — nothing issued
-sys.exit(0 if (d.get("letsencrypt") or {}).get("certificates") else 1)'
+certs = [v.get("Certificates") for v in d.values() if isinstance(v, dict)]
+sys.exit(0 if any(certs) else 1)'
 }
 
 acme_wait_for_cert() { # <target-dir> <timeout-seconds> — poll until a cert lands
