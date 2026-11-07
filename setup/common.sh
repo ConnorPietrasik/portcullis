@@ -350,9 +350,10 @@ acme_promote() { # <target-dir> — flip staging→prod. Idempotent; wipes the A
 #      the pre-update running set + services this update added (deliberately
 #      stopped ones stay down; removed ones' containers are dropped), then
 #      update panel-api (code + pip within ranges + restart).
-#   4. gate — every service that was running before the update healthy again
-#      (a deliberately stopped — or removed — service can't fail the gate),
-#      panel-api serving, then a full 07-doctor pass.
+#   4. gate — every service that should be running AFTER the update healthy
+#      (the pre-update running set + what this update added; a deliberately
+#      stopped — or removed — service can't fail the gate), panel-api
+#      serving, then a full 07-doctor pass.
 #   5. gate fails → automatic rollback of all of it: restore the pre-update
 #      config tree, recreate the snapshot's images via a temporary compose
 #      override (--remove-orphans drops containers for services added during
@@ -692,7 +693,10 @@ snapshot_host_stack() { # <snapshot-dir>
   sudo mkdir -p "$dir/npm" || die "cannot create snapshot dir $dir"
   # The snapshot holds secrets (panel.tar carries .env + the reduced env
   # files) — root-only, mirroring the 0600 discipline of the deployed
-  # originals.
+  # originals. The rollback functions (which run as the deployer, not root)
+  # therefore access it via sudo — see the `sudo test` guards in rollback_*:
+  # a user-side [[ -f ]] on this tree fails EACCES, not ENOENT, and would
+  # misreport "not in snapshot" for everything it holds.
   sudo chmod 700 "$dir"
   if [[ -d /opt/panel-api ]]; then
     # Exact copy, venv included: what makes the panel-api rollback offline.
@@ -815,7 +819,10 @@ update_panel_api() {
 # 0 ok (or not in snapshot — it was never updated); 1 failed.
 rollback_panel_api() { # <snapshot-dir>
   local dir="$1"
-  if [[ ! -d "$dir/panel-api" ]]; then
+  # The snapshot dir is root:root 700 and this runs as the deployer — sudo the
+  # existence tests: a user-side [[ -d ]] fails EACCES (not ENOENT) and would
+  # misreport "not in snapshot", silently skipping the restore.
+  if ! sudo test -d "$dir/panel-api"; then
     info "  panel-api: not in snapshot — skipped"
     return 0
   fi
@@ -823,7 +830,7 @@ rollback_panel_api() { # <snapshot-dir>
   sudo systemctl stop panel-api 2>/dev/null || true
   sudo rm -rf /opt/panel-api
   sudo cp -a "$dir/panel-api" /opt/panel-api || { warn "  panel-api: restore copy failed"; return 1; }
-  if [[ -f "$dir/panel-api.service" ]]; then
+  if sudo test -f "$dir/panel-api.service"; then
     sudo cp -a "$dir/panel-api.service" /etc/systemd/system/panel-api.service
   fi
   sudo systemctl daemon-reload 2>/dev/null || true
@@ -852,7 +859,9 @@ rollback_panel_api() { # <snapshot-dir>
 # not in snapshot — an older-generation snapshot); 1 failed.
 rollback_stack_configs() { # <snapshot-dir>
   local dir="$1"
-  if [[ ! -f "$dir/panel.tar" ]]; then
+  # sudo the test: the snapshot dir is root-only (see rollback_panel_api) and a
+  # user-side [[ -f ]] would fail EACCES → "not in snapshot" on every rollback.
+  if ! sudo test -f "$dir/panel.tar"; then
     info "  configs: not in snapshot — skipped"
     return 0
   fi
@@ -866,20 +875,30 @@ rollback_stack_configs() { # <snapshot-dir>
 
 # Restore the snapshot's npm files in the repo. 0 ok (or not in snapshot).
 rollback_npm() { # <snapshot-dir>
-  local dir="$1" fe
+  local dir="$1" fe f tmp
   fe="$REPO_ROOT/compose/panel-frontend"
-  if [[ ! -f "$dir/npm/package.json" ]]; then
+  # sudo the tests (root-only snapshot dir — see rollback_panel_api). The
+  # copies must go through a user-owned temp too: a user cp cannot read the
+  # dir, and a direct sudo cp would leave root-owned files in the deployer's
+  # repo.
+  if ! sudo test -f "$dir/npm/package.json"; then
     info "  npm: not in snapshot — skipped"
     return 0
   fi
-  cp -a "$dir/npm/package.json" "$fe/" \
-    || { warn "  npm: file restore failed"; return 1; }
-  # The lockfile is gitignored server-local state — only in the snapshot if
-  # this server had generated one.
-  if [[ -f "$dir/npm/package-lock.json" ]]; then
-    cp -a "$dir/npm/package-lock.json" "$fe/" \
-      || { warn "  npm: lockfile restore failed"; return 1; }
-  fi
+  for f in package.json package-lock.json; do   # lockfile only if this server generated one (gitignored server-local state)
+    sudo test -f "$dir/npm/$f" || continue
+    tmp="$(mktemp)"
+    # no -a: a root `cp -a` chowns the (existing) tmpfile to the source's
+    # owner — a root-owned repo file would leak into /tmp as root:root,
+    # undeletable by the user's rm below (sticky bit).
+    if sudo cp "$dir/npm/$f" "$tmp" && install -m 644 "$tmp" "$fe/$f"; then
+      rm -f "$tmp"
+    else
+      warn "  npm: $f restore failed"
+      rm -f "$tmp"
+      return 1
+    fi
+  done
   info "  npm: package.json restored (+ package-lock.json, if it was snapshotted)"
   return 0
 }

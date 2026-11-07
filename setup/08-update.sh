@@ -28,9 +28,10 @@
 #      (the pre-update running set + what this update added; deliberately
 #      stopped services stay down, removed ones' containers are dropped) +
 #      restart on start-time-only config change, update panel-api
-#   4. gate: every service that was running before the update healthy (a
-#      deliberately stopped — or removed — service can't fail the gate) +
-#      panel-api serving + a full `make doctor`
+#   4. gate: every service that should be running AFTER the update healthy
+#      (the pre-update running set + what this update added; a deliberately
+#      stopped — or removed — service can't fail the gate) + panel-api
+#      serving + a full `make doctor`
 #   5. gate fails → automatic rollback of all of the above (re-gated)
 #
 # After a successful update, `make rollback` reverts to the pre-update snapshot
@@ -69,7 +70,8 @@ fi
 
 info "1/7 snapshotting the running stack (rollback anchor: images + configs + panel-api + npm files)"
 snapshot_stack
-# The pre-update running set (the gate's expectation list, step 7).
+# The pre-update running set — feeds $targets (the gate's expectation list)
+# in step 5 and the "removed from compose" note in step 7.
 snap_services="$(python3 -c 'import json,sys
 for s in json.load(open(sys.argv[1])).get("services", {}):
     print(s)' "$STACK_STATE_FILE")"
@@ -162,23 +164,24 @@ if ! update_panel_api; then
   update_rollback_or_die "panel-api update — $PANEL_API_REASON"
 fi
 
-info "7/7 verifying: every service that was running before the update is healthy again (budget ${UPDATE_HEALTH_TIMEOUT:-600}s)"
-# Gate on the snapshot's services (what was running), not every service in the
-# compose file: a deliberately stopped service must not time out the gate and
-# auto-revert a healthy update (the doctor gate still covers the core stack).
-# A service REMOVED from compose by this update is intentionally gone — its
-# container was already dropped by --remove-orphans above, so waiting for it
-# would burn the whole budget and auto-revert the removal. (A rollback
-# restores it.)
-gate_services=""
+info "7/7 verifying: every service that should be running after the update is healthy again (budget ${UPDATE_HEALTH_TIMEOUT:-600}s)"
+# Gate on $targets — the set step 5's `up -d` was told to converge: the
+# pre-update running set PLUS services this update added. Gating the added
+# services too: a broken NEW app must fail the update (auto-revert) instead
+# of passing green (same intent as the LLM-fleet note in the RUNBOOK — an
+# added instance's model load sits inside its healthcheck start_period, and
+# the 600s budget covers it). A deliberately stopped service is not in
+# $targets (it must not time out the gate and auto-revert a healthy update —
+# the doctor gate still covers the core stack), and neither is a service
+# REMOVED from compose (its container was already dropped by --remove-orphans
+# above; waiting for it would burn the whole budget and auto-revert the
+# removal — a rollback restores it).
 for s in $snap_services; do
-  if grep -qx -- "$s" <<<"$defined_services"; then
-    gate_services+="$s "
-  else
+  if ! grep -qx -- "$s" <<<"$defined_services"; then
     info "  $s: removed from compose — excluded from the gate (a rollback would restore it)"
   fi
 done
-if ! wait_stack_healthy "${UPDATE_HEALTH_TIMEOUT:-600}" $gate_services; then
+if ! wait_stack_healthy "${UPDATE_HEALTH_TIMEOUT:-600}" $targets; then
   update_rollback_or_die "health gate — $HEALTH_GATE_REASON"
 fi
 

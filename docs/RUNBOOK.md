@@ -172,7 +172,7 @@ make update      # doctor precondition (aborts before touching anything if not g
                  # → snapshot everything (image IDs, deployed configs, exact panel-api copy, npm files)
                  # → npm bump (in-repo, within ranges) → sync configs from the repo → pull → rebuild (bases pulled)
                  # → recreate what changed (+ restart on start-time config change) → update panel-api
-                 # → gate: pre-update services healthy + panel-api serving + full doctor pass
+                 # → gate: post-update services healthy (pre-update set + added) + panel-api serving + full doctor pass
                  # → on any failure: automatic rollback of all of it, re-gated
 make rollback              # on demand: undo the last `make update` (same machinery)
 make rollback WHAT=radiance  # or: images ONLY of the services WHAT matches — a name (llm-27b), a
@@ -219,7 +219,8 @@ How it works (`setup/08-update.sh`, shared helpers in `setup/common.sh`):
   server a firewall regression surfaces in the doctor gate → auto-rollback. `.env` edits are applied by
   the config sync above, which re-derives both reduced env files — panel-api's is applied by this
   restart, panel-ddns's on its next tick.)
-- **Gate** = every service that was *running before the update* healthy again (compose healthchecks,
+- **Gate** = every service that should be *running after the update* healthy again (the pre-update
+  running set plus services this update *added* — compose healthchecks,
   `UPDATE_HEALTH_TIMEOUT=600`s — a deliberately stopped service can't fail the gate, and neither can
   one this update *removed* from compose: its container is already gone by then), then a full
   `make doctor` pass (`UPDATE_DOCTOR=0` to skip both). Doctor is also enforced as a *precondition*:

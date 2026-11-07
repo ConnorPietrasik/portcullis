@@ -82,8 +82,9 @@ Never set `PANEL_DEV=1` in production — the systemd unit doesn't, and nothing 
   *major* line (`traefik:v3`, `authelia/authelia:4`, `nginx:stable-alpine`) with npm/pip bumps within
   their declared ranges and pulled base images. It's the safe path: a green `make doctor` is required up
   front, it snapshots everything (image IDs, the deployed configs, an exact panel-api copy, the npm
-  files), changes only what moved, gates on the pre-update containers' health + panel-api health + a
-  full doctor pass, and auto-rolls-back on failure (offline — the snapshot is local). `make rollback`
+  files), changes only what moved, gates on the post-update containers' health (what should be
+  running after the update) + panel-api health + a full doctor pass, and auto-rolls-back on
+  failure (offline — the snapshot is local). `make rollback`
   undoes the last update. Majors stay deliberate edits (a tag in compose, a range in
   `package.json`/`requirements.txt`). `make deploy` is the first-boot path.
   Details: [RUNBOOK](docs/RUNBOOK.md#updates)
