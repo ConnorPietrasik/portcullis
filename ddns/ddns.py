@@ -3,31 +3,25 @@
 
 The default manages the apex only: *.pietrasik.top is a CNAME → the apex
 (one-time manual record), so it follows the A record automatically and must
-NOT get its own A — a CNAME owns its name and no other record can coexist
-with it.
+NOT get its own A (a CNAME owns its name).
 
-Runs as user 'panel' from a systemd timer (stdlib only, no venv, no root,
-outbound network only). Reuses NAMESILO_API_KEY via the unit's EnvironmentFile
-(/opt/panel/.panel-ddns.env, derived from /opt/panel/.env — only this key +
-DDNS_HOSTS) — the same key Traefik uses for the DNS-01 challenge. No new
-secrets, and the key is never logged (URLs are built, never printed).
+Runs as user 'panel' from a systemd timer (stdlib only, no root, outbound
+only). Reuses NAMESILO_API_KEY via the unit's EnvironmentFile
+(/opt/panel/.panel-ddns.env, derived from /opt/panel/.env) — the same key
+Traefik uses for DNS-01; the key is never logged.
 
-Purely declarative, no state: every tick detects the public IPv4 (OpenDNS
-resolver first — plain DNS, no third-party web service — then HTTPS
-fallbacks), lists the domain's records, updates every stale A record and
-creates missing ones. CNAMEs at a configured host are respected and skipped
-(never overwritten, never shadowed by a new A). Whatever drifted — a changed
-IP, a record edited or deleted by hand, an IP that flipped and flipped back
-between ticks — is fixed within one tick. A "nothing changed, skip" short-circuit was deliberately
-rejected: it can silently trust a stale assumption, and the API load it saves
-(~6 tiny list calls/hour) is not worth having a stale-assumption failure mode.
-TTL is pinned at 3600 (NameSilo's minimum), so worst-case cutover after an IP
-change ≈ timer interval + 1h of resolver caching.
+Purely declarative, no state: every tick it detects the public IPv4 (OpenDNS
+resolver first, then HTTPS fallbacks), lists the domain's records, updates
+every stale A record and creates missing ones. CNAMEs at a configured host
+are respected and skipped. Whatever drifted is fixed within one tick — a
+"nothing changed, skip" short-circuit was deliberately rejected: it can
+silently trust a stale assumption, for ~6 tiny API calls/hour saved. TTL is
+pinned at 3600 (NameSilo's minimum), so worst-case cutover ≈ timer interval
++ 1h of resolver caching.
 
-The domain is fixed at pietrasik.top and hardcoded: every other domain-aware
-piece of this project (Traefik Host() rules, the Authelia cookie domain, the
-ACME SAN block, make doctor's checks) is pinned to it, so an env override
-here could only desync the A record from those routes, never match them.
+The domain is fixed at pietrasik.top and hardcoded: every other
+domain-aware piece of this project is pinned to it, so an env override here
+could only desync the A record from those routes.
 
 Env: DDNS_HOSTS (default "@" — the apex; set "@,*" only if the wildcard is
 ever an A record).
@@ -86,7 +80,9 @@ def public_ip() -> str:
 
 
 def api(key: str, op: str, **params: object) -> ET.Element:
-    """Call a NameSilo API op, return its <reply> element. Exits on any error."""
+    """Call a NameSilo API op, return its <reply> element. Exits on any error.
+    Only exception types/reasons are surfaced — never the request URL (which
+    carries the API key)."""
     q = {"version": "1", "type": "xml", "key": key, "domain": DOMAIN}
     q.update({k: v for k, v in params.items() if v is not None})
     url = f"{API}/{op}?" + urllib.parse.urlencode(q)  # contains the key — never logged
@@ -97,19 +93,14 @@ def api(key: str, op: str, **params: object) -> ET.Element:
     except ET.ParseError:
         die(f"{op}: response was not well-formed XML")
     except http.client.HTTPException as e:
-        # Wire-level HTTP errors from the socket read — BadStatusLine,
-        # RemoteDisconnected, IncompleteRead, … (a body truncated mid-XML
-        # usually surfaces as the ParseError above, since ET.parse reads in
-        # bounded chunks that return partial data rather than raising).
-        # Only the exception type is surfaced; the request URL (which carries
-        # the API key) is never part of any message we log.
+        # Wire-level HTTP errors from the socket read (BadStatusLine,
+        # RemoteDisconnected, …). A body truncated mid-XML usually surfaces
+        # as the ParseError above.
         die(f"{op}: malformed HTTP response ({type(e).__name__})")
     except OSError as e:
         # Structured error text, never str(e): an HTTPError's reason is a
-        # server-controlled status phrase (plain string), a connection
-        # error's reason is the underlying socket/SSL/gai exception. Only the
-        # exception-object reasons are surfaced; the request URL (which carries
-        # the API key) is never part of any message we log.
+        # server-controlled status phrase; a connection error's is the
+        # underlying socket/SSL/gai exception.
         status = getattr(e, "code", None)
         reason = getattr(e, "reason", None)
         reason = str(reason) if isinstance(reason, BaseException) else ""
@@ -130,9 +121,9 @@ def api(key: str, op: str, **params: object) -> ET.Element:
 def rel_host(host_field: str) -> str:
     """Normalize a record's host field to the relative form we configure.
 
-    NameSilo shows hosts as 'name.domain.tld' (bare domain for '@'), but be
+    NameSilo shows hosts as 'name.domain.tld' (bare domain for '@'); be
     tolerant of relative display too — matching on the wrong form would make
-    the reconciler think a record is missing and create duplicates.
+    the reconciler create duplicates.
     """
     h = (host_field or "").strip().lower()
     if h in ("", "@", DOMAIN.lower()):
@@ -170,16 +161,13 @@ def reconcile(key: str, ip: str) -> int:
             if (rr.findtext("type") or "").strip().upper() == "A"
             and rel_host(rr.findtext("host") or "") == want_rel
         ]
-        # Apex: send rrhost=@ for the root domain. The docs only show the
-        # subdomain form and are silent on apex handling; @ is what
-        # ddns-go's NameSilo provider sends on both add and update (its
-        # record matching expects dnsListRecords to return @ for the apex),
-        # so it's the best-attested form for both calls below.
+        # Apex: send rrhost=@ for the root domain. The NameSilo docs are
+        # silent on apex handling; @ is what ddns-go's provider sends on both
+        # add and update — the best-attested form.
         rrhost = want_rel or "@"
         if not mine:
-            # rrtype is a documented dnsAddRecord parameter (A/AAAA/CNAME/
-            # MX/TXT/SRV/CAA) that every public NameSilo implementation
-            # passes, so pin it explicitly rather than rely on a default.
+            # rrtype is a documented dnsAddRecord parameter; pin it explicitly
+            # rather than rely on a default.
             api(key, "dnsAddRecord", rrtype="A", rrhost=rrhost, rrvalue=ip, rrttl=str(TTL))
             log(f"created A {full_host(h)} -> {ip}")
             changes += 1

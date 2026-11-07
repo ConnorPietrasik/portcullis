@@ -13,32 +13,25 @@ if [[ -f "$TARGET/docker-compose.yml" ]]; then
 (snapshot + health gate + auto-rollback); this deploy applies them ungated"
 fi
 
-# Copy the repo's compose tree + secrets to $TARGET (shared with make update —
-# see stack_sync_configs in common.sh), snapshotting the start-time-only
-# configs for the post-`up` restart check below.
+# Copy the repo's compose tree + secrets to $TARGET (shared with make update).
 stack_sync_configs "$TARGET"
 
 info "Building + starting stack (first run pulls images and compiles the frontend)"
 # Deliberately NO `pull` here: the edge images float on the major line, so a
 # pull is an *upgrade* of the public edge — that happens in `make update`
-# (snapshot + health gate + auto-rollback), not in a routine config deploy.
-# (If a manual tag edit references an image not yet local, `up -d` below
-# pulls just that one. `make update` is what moves the floats forward, and
-# it also rebuilds panel-web, whose base images float too.)
-# --remove-orphans: services deleted from the compose file (e.g. the old
-# socket-proxy) must not keep running after a deploy.
+# (snapshot + gate + auto-rollback), not in a routine config deploy. (If a
+# manual tag edit references an image not yet local, `up -d` pulls just that
+# one.) --remove-orphans drops containers for services deleted from compose.
 sudo docker compose --project-directory "$TARGET" -f "$TARGET/docker-compose.yml" up -d --build --remove-orphans
 
-# Restart services whose start-time-only config content actually changed (the
-# snapshot was taken by stack_sync_configs). No change → no restart, so routine
-# deploys add no downtime.
+# Restart services whose start-time-only config content changed (snapshot
+# taken by stack_sync_configs). No change → no restart.
 stack_restart_if_configs_changed "$TARGET"
 sudo docker compose --project-directory "$TARGET" -f "$TARGET/docker-compose.yml" ps
 
 # Tighten the TOTP store on first boot: authelia creates db.sqlite3 0644,
 # AFTER stack_sync_configs' chmod window (the file doesn't exist yet at sync
-# time), so the TOTP seeds would sit world-readable until the next deploy/
-# update without this. stack_sync_configs re-tightens it on every sync.
+# time). stack_sync_configs re-tightens it on every later sync.
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   [[ -f "$TARGET/authelia/db.sqlite3" ]] && break
   sleep 1
@@ -51,9 +44,9 @@ fi
 
 # ── ACME staging → prod auto-promotion ────────────────────────────────────
 # First bring-up runs on LE staging (see .env.example) so DNS-01 debugging
-# can't hit prod's 5-failures/hour rate limit. Once the staging cert issues,
-# flip to prod right here. Skip the wait with ACME_STAGING_WAIT=0; finish a
-# timed-out wait later with `make promote` (or just re-run `make deploy`).
+# can't hit prod's rate limit. Once the staging cert issues, flip to prod
+# right here. Skip the wait with ACME_STAGING_WAIT=0; finish a timed-out wait
+# later with `make promote` (or just re-run `make deploy`).
 if [[ "$(acme_mode "$TARGET/traefik/traefik.yml")" == "staging" ]]; then
   wait_secs="${ACME_STAGING_WAIT:-600}"
   if (( wait_secs > 0 )); then

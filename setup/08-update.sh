@@ -1,41 +1,16 @@
 #!/usr/bin/env bash
-# make update — the ONE Day-2 command: apply the repo's configs to the
-# deployed stack AND float everything that has a line to float.
-# (make deploy is the first-boot path — network, secrets, ACME staging→prod,
-# first build; a Day-2 re-run of it applies config ungated and warns.)
+# make update — the one Day-2 command: apply the repo's configs to the
+# deployed stack AND float everything that has a line to float (container
+# images on the major line, panel-web's base images, npm deps within
+# package.json's ranges, panel-api's pip deps within requirements.txt').
+# Safety net: doctor precondition → snapshot (images re-tagged, config tree,
+# exact panel-api copy, npm files) → npm bump + config sync + pull → rebuild
+# + converge → gate (post-update services healthy + panel-api serving + full
+# doctor) → automatic rollback of all of it on failure.
+# make deploy remains the FIRST-BOOT path; a Day-2 re-run of it applies config
+# ungated and warns. Details: docs/RUNBOOK.md → Updates.
 #
-#   - stack configs — the same repo → /opt/panel sync as make deploy:
-#     compose/traefik/authelia/portfolio + .env, secrets substituted, stale
-#     route files pruned, the panel-uid services' reduced env files re-derived
-#   - container images on the major line (traefik:v3, authelia/authelia:4,
-#     nginx:stable-alpine — compose/docker-compose.yml)
-#   - panel-web's frontend: build context synced from the repo, npm deps
-#     bumped within the declared ranges, base images pulled (node:22-alpine,
-#     nginx:stable-alpine — compose/panel-frontend/Dockerfile)
-#   - panel-api: main.py + requirements.txt + unit re-deployed, pip deps
-#     upgraded within the declared ranges, restarted
-# What this adds over a bare pull+up:
-#   0. precondition: `make doctor` green (UPDATE_DOCTOR=0 skips it) — a
-#      pre-existing doctor failure would otherwise auto-revert the update
-#   1. snapshot EVERYTHING about to change — image IDs re-tagged
-#      portcullis-rollback/<svc>:<ts>, the deployed config tree (panel.tar,
-#      runtime data excluded), an exact copy of /opt/panel-api (venv
-#      included), the npm files — under /opt/panel/.update-snapshot-<ts>,
-#      state in /opt/panel/.update-state
-#   2. npm bump + config sync + pull — a failure stops the run before any
-#      container is touched
-#   3. rebuild (bases pulled) + converge the services that should be running
-#      (the pre-update running set + what this update added; deliberately
-#      stopped services stay down, removed ones' containers are dropped) +
-#      restart on start-time-only config change, update panel-api
-#   4. gate: every service that should be running AFTER the update healthy
-#      (the pre-update running set + what this update added; a deliberately
-#      stopped — or removed — service can't fail the gate) + panel-api
-#      serving + a full `make doctor`
-#   5. gate fails → automatic rollback of all of the above (re-gated)
-#
-# After a successful update, `make rollback` reverts to the pre-update snapshot
-# (one generation); the next `make update` replaces it. Env:
+# Env:
 #   UPDATE_HEALTH_TIMEOUT=600   health-gate budget (seconds) — one knob for the
 #                               update's final gate and EVERY rollback re-gate:
 #                               a recreated radiance instance can't read healthy
@@ -75,11 +50,11 @@ snapshot_stack
 snap_services="$(python3 -c 'import json,sys
 for s in json.load(open(sys.argv[1])).get("services", {}):
     print(s)' "$STACK_STATE_FILE")"
-# Every service with a container in ANY state, pre-update: this is what tells
-# a service ADDED by this update (no container yet → `up` must start it, step 5)
-# from one the operator deliberately stopped (a stopped container exists →
-# leave it down). Captured before the config sync below, which replaces the
-# compose file this listing is read against.
+# Every service with a container in ANY state, pre-update: distinguishes a
+# service ADDED by this update (no container yet → `up` must start it) from
+# one the operator deliberately stopped (a stopped container exists → leave
+# it down). Captured before the config sync below, which replaces the compose
+# file this listing is read against.
 pre_containers="$(stack_compose ps --all --format '{{.Service}}' 2>/dev/null | sort -u || true)"
 snapshot_dir="$(update_snapshot_dir "$SNAPSHOT_TS")"
 snapshot_host_stack "$snapshot_dir"
@@ -92,10 +67,9 @@ info "2/7 bumping the panel frontend's npm deps (within the declared ranges — 
 npm_bump_panel_frontend
 
 info "3/7 syncing the repo's configs to /opt/panel (compose + traefik + authelia + portfolio + .env)"
-# The same sync make deploy performs (stack_sync_configs, common.sh): file
-# content only — nothing is recreated yet, and a sync failure aborts with
-# every container untouched. .env is re-copied, so an .env edit is applied
-# here (and re-derives both panel-uid reduced env files).
+# The same sync make deploy performs (stack_sync_configs): file content only —
+# nothing is recreated yet, and a sync failure aborts with every container
+# untouched.
 stack_sync_configs /opt/panel
 
 info "4/7 pulling new images (nothing is touched until every pull succeeds)"
@@ -106,8 +80,8 @@ while IFS= read -r svc; do
     info "  $svc: $summary"
     continue
   fi
-  # Local-only images (built on the server rather than pulled) 404 on the registry —
-  # skip those, but a real registry/network failure still stops the run.
+  # Local-only images (built on the server rather than pulled) 404 on the
+  # registry — skip those, but a real registry/network failure stops the run.
   if grep -qiE 'not found|manifest unknown|pull access denied|denied: requested access' <<<"$pull_err"; then
     warn "  $svc: not on a public registry (local image?) — reusing the local image"
   else
@@ -117,27 +91,18 @@ while IFS= read -r svc; do
 done < <(stack_pull_services)
 
 info "5/7 rebuilding panel-web (bases pulled), converging the services that should be running"
-# build --pull re-pulls the FROM bases (node:22-alpine, nginx:stable-alpine for
-# panel-web): a plain build reuses the local bases from the first build and lets
-# the panel's base images go stale. The subsequent up --build reuses the fresh
-# build (cache hit); a build/base-pull failure aborts with every container
-# untouched.
+# build --pull re-pulls the FROM bases (node:22-alpine, nginx:stable-alpine):
+# a plain build reuses the local bases from the first build. The subsequent
+# up --build reuses the fresh build (cache hit); a failure aborts with every
+# container untouched.
 sudo -v  # re-warm for the `up -d` below: a cold-cache build can outlive the sudo timestamp
 stack_compose build --pull
-# Converge ONLY the services that should be running after this update:
-#   - what was running before (the snapshot) — compose recreates the ones whose
-#     definition/image changed, keeps the rest
-#   - services added by this update (no container before → first start; this is
-#     the "add an app → make update" flow)
-# Deliberately stopped services (a container exists, but they weren't running
-# at the snapshot) are left down — an update must not resurrect what the
-# operator stopped. (A crashed service lands in the same bucket: it stays down
-# here, and the doctor precondition/gate is what catches it — a bare `make
-# deploy` still starts everything, ungated.)
-# --remove-orphans drops containers for services REMOVED from compose. compose
-# defines "orphan" as "service not in the compose file" (independent of the
-# explicit selection above), so stopped-but-defined services keep their
-# containers.
+# Converge ONLY the services that should be running after this update: what
+# was running before (the snapshot) + services added by this update
+# (no container before → first start). Deliberately stopped services stay
+# down — an update must not resurrect them. --remove-orphans drops containers
+# for services REMOVED from compose (stopped-but-defined services keep
+# theirs).
 defined_services="$(stack_services)"
 targets=""
 for s in $defined_services; do
@@ -165,16 +130,11 @@ if ! update_panel_api; then
 fi
 
 info "7/7 verifying: every service that should be running after the update is healthy again (budget ${UPDATE_HEALTH_TIMEOUT:-600}s)"
-# Gate on $targets — the set step 5's `up -d` was told to converge: the
-# pre-update running set PLUS services this update added. Gating the added
-# services too: a broken NEW app must fail the update (auto-revert) instead
-# of passing green (same intent as the LLM-fleet note in the RUNBOOK — an
-# added instance's model load sits inside its healthcheck start_period, and
-# the 600s budget covers it). A deliberately stopped service is not in
-# $targets (it must not time out the gate and auto-revert a healthy update —
-# the doctor gate still covers the core stack), and neither is a service
-# REMOVED from compose (its container was already dropped by --remove-orphans
-# above; waiting for it would burn the whole budget and auto-revert the
+# Gate on $targets — the pre-update running set PLUS services this update
+# added: a broken NEW app must fail the update (auto-revert) instead of
+# passing green. A deliberately stopped service is not in $targets (it must
+# not time out the gate), and neither is one REMOVED from compose (its
+# container was already dropped; waiting for it would auto-revert the
 # removal — a rollback restores it).
 for s in $snap_services; do
   if ! grep -qx -- "$s" <<<"$defined_services"; then

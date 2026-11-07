@@ -1,95 +1,35 @@
 # shellcheck shell=bash
-# Shared env-file parser. Source this, don't execute it. Deliberately sets no
-# shell options — safe to source from anywhere, including 07-doctor.sh, which
-# must not pick up `set -e`.
+# Shared env-file parser. Source this, don't execute it (sets no shell
+# options — safe to source from anywhere, including 07-doctor.sh, which must
+# not pick up `set -e`).
 #
 # env_file_load <file> — load a KEY=VALUE env file into the environment
 # (export) WITHOUT executing it, and refuse anything the file's other readers
-# would parse differently:
-#   - docker compose auto-loads the deployed .env for the containers
-#   - the systemd units read REDUCED files derived from that same .env by
-#     raw-line grep (.panel-api.env for panel-api, .panel-ddns.env for
-#     panel-ddns — see derive_reduced_env, setup/common.sh)
-#   - this parser feeds the deploy scripts' own checks and substitutions
-# If this parser accepts a file, the value the deploy scripts see is EXACTLY
-# the value the containers and the systemd units receive.
-#
-# Never `source` an env file: the file would run as bash, so a hand-pasted
-# value diverges from what the running processes get:
-#   KEY=abc def   → "def: command not found" (deploy aborts, rc=127)
-#   KEY=abc$UNSET → "UNSET: unbound variable" under set -u (deploy aborts)
-#   KEY=a`id`b    → the command executes silently at deploy time (rc=0)
-#
-# Accepted lines (all readers agree on the resulting value):
-#   - blank lines; lines whose first non-space char is #
-#   - KEY=VALUE — KEY is [A-Za-z_][A-Za-z0-9_]*, whitespace around KEY and =
-#     is ok; VALUE is trimmed and one pair of matching enclosing quotes is
-#     stripped (all readers do this)
-#   - an optional leading `export ` — compose strips it (and the old `source`
-#     flow ran it as a builtin), but systemd's EnvironmentFile does not know
-#     the prefix: the key becomes "export KEY", an invalid name, and systemd
-#     drops the variable SILENTLY (journal notice only). Accepted with a
-#     WARNING for container-only keys, REFUSED for the keys in
-#     __envload_no_export_keys — silently losing NAMESILO_API_KEY stops the
-#     apex A record tracking with no deploy error, and losing PANEL_TOKEN
-#     rejects every panel-api request
-#   - a bare KEY line without `=` (the "inherit from environment" form) —
-#     systemd always ignores it (it wants KEY=VALUE) and so does this
-#     parser; docker compose inherits it from its OWN process environment
-#     when the key is set there (compose >= 2.33 feeds os.Environ() into
-#     the .env lookup). `sudo docker compose` runs with sudo's sanitized
-#     environment (PATH/HOME/USER/TERM/...), not the deployer's shell, and
-#     none of this file's secret keys ever sit there — so a bare line here
-#     cannot diverge in practice: warned about and skipped, not a failure
-#
-# Refused lines (one clear message per line, rc=1):
-#   - `=` lines whose key the readers can't share (empty, space in it, `;`,
-#     digit-led, `-`/`.`/brackets in it) — current compose ACCEPTS `-`/`.`
-#     and digit-led keys (the container would get a variable systemd can't
-#     set) but REFUSES empty/space keys; systemd drops all of them as
-#     invalid names (journal error only). No shared value exists, so refuse
-#   - `export KEY=...` where KEY is in __envload_no_export_keys (see above)
-#     — compose keeps it, systemd drops it
-#   - an unterminated enclosing quote (compose refuses the file), or content
-#     after the closing quote (compose drops it / re-parses it; systemd
-#     glues it into the value — `'abc' # c` becomes `abc# c`)
-#   - `$` in an unquoted or double-quoted value — compose interpolates it
-#     from the host environment (plus earlier .env lines), systemd sees it
-#     literally
-#   - `\` in an unquoted or double-quoted value — systemd eats the backslash
-#     (a trailing one continues the line); compose keeps unquoted values
-#     literal and expands escape sequences in double-quoted ones
-#   - a space-`#` sequence in an unquoted value — compose cuts the value
-#     there (inline comment), systemd keeps it
-#   - any other stray line without `=` (multi-word text, `;` comments,
-#     `KEY:value` yaml-style) — compose refuses the file at `up` time
-#     ("key cannot contain a space" / "unexpected character in variable
-#     name") or parses it as an assignment systemd would ignore
-# Single-quoted values are literal in every reader, so their content is
-# unrestricted.
+# (docker compose, the systemd units' EnvironmentFile) would parse
+# differently: $ or backslash in unquoted/double-quoted values, ' #' in
+# unquoted values, keys outside [A-Za-z_][A-Za-z0-9_]*, an `export ` prefix
+# on the reduced-env keys, unterminated quotes, stray lines. If this parser
+# accepts the file, the deploy scripts see EXACTLY the value the containers
+# and systemd units receive. Single-quoted values are literal in every reader
+# and unrestricted.
 #
 # Returns 0 if every line parsed, 1 if any line was refused (each offender
 # warned), 2 if the file is missing. Requires warn() from the caller (falls
-# back to stderr if it is not defined).
+# back to stderr).
 
 # The keys each panel-uid reduced env file may carry — the SINGLE SOURCE of
 # truth, shared by the derivation (sync_*_env, setup/common.sh) and the
-# doctor's whitelist check (setup/07-doctor.sh — it verifies every line of the
-# deployed files is one of these, so a leaked key is caught even if it is a
-# secret added to .env later). Keep in sync with what the services actually
-# read: panel-api/main.py (PANEL_TOKEN, PANEL_DEV, PANEL_DISK_MOUNTS) and
-# ddns/ddns.py (NAMESILO_API_KEY, optional DDNS_HOSTS).
+# doctor's whitelist check (setup/07-doctor.sh — it verifies every line of
+# the deployed files is one of these, so a leaked key is caught even if it
+# is a secret added to .env later). Keep in sync with what the services
+# actually read: panel-api/main.py and ddns/ddns.py.
 panel_api_env_keys=(PANEL_TOKEN PANEL_DEV PANEL_DISK_MOUNTS)
 panel_ddns_env_keys=(NAMESILO_API_KEY DDNS_HOSTS)
 
 # Keys whose line must not carry an `export ` prefix (refused, not merely
-# warned): exactly the keys the REDUCED ENV FILES carry above (union of the
-# two lists) — .panel-ddns.env (panel-ddns.service's EnvironmentFile=, ddns.py's
-# os.environ.get) and .panel-api.env (panel-api.service's EnvironmentFile=),
-# both derived by raw-line grep (derive_reduced_env), whose ^KEY= pattern
-# requires the line to start with the key; systemd would drop an `export `-
-# prefixed copy SILENTLY (journal error only), so an `export `-prefixed line
-# here breaks DNS tracking / panel-api with no deploy error.
+# warned): exactly the reduced-env keys above — systemd's EnvironmentFile
+# drops an `export `-prefixed line SILENTLY, and derive_reduced_env's ^KEY=
+# pattern would simply not match it.
 __envload_no_export_keys=" ${panel_api_env_keys[*]} ${panel_ddns_env_keys[*]} "
 
 __envload_warn() {
@@ -105,10 +45,9 @@ env_file_load() {
   [[ -f "$file" ]] || return 2
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
-    # Optional `export ` prefix: compose strips it (the old `source` flow
-    # ran it as a builtin), but systemd would drop the variable silently.
-    # Warn here; the refusal for keys in __envload_no_export_keys is below,
-    # at key extraction.
+    # Optional `export ` prefix: compose strips it, but systemd would drop
+    # the variable silently. Warn here; refusal for the reduced-env keys
+    # happens at key extraction below.
     exported=0
     if [[ "$line" =~ ^[[:space:]]*export[[:space:]]+(.*)$ ]]; then
       line="${BASH_REMATCH[1]}"
@@ -148,9 +87,9 @@ env_file_load() {
           fi
         fi
       fi
-      # Constructs the readers reinterpret (so the containers would receive
-      # a different value than the deploy scripts) — refuse. Single-quoted
-      # values are literal in every reader and are exempt.
+      # Constructs the readers reinterpret (the containers would receive a
+      # different value than the deploy scripts) — refuse. Single-quoted
+      # values are literal in every reader and exempt.
       if (( line_bad )); then
         :
       elif [[ "$q" == '"' ]]; then
@@ -180,11 +119,9 @@ env_file_load() {
       fi
     elif [[ "$line" != *=* ]]; then
       # Stray line without '='. Only a bare KEY (the "inherit from the
-      # environment" form) is ignored by BOTH readers — everything else
-      # diverges: compose refuses "FOO BAR" ("key cannot contain a space")
-      # and "; note" ("unexpected character ';' in variable name") at up
-      # time, and parses "KEY:value" (yaml-style) as an assignment that
-      # systemd ignores.
+      # environment" form) is ignored by both readers — everything else
+      # diverges (compose refuses it at up time or parses yaml-style
+      # KEY:value, which systemd ignores).
       trimmed="${line#"${line%%[![:space:]]*}"}"
       trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
       if [[ "$trimmed" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
@@ -194,9 +131,8 @@ env_file_load() {
         bad=1
       fi
     else
-      # '=' present but the key the readers can't share (empty, digit-led,
-      # or a char outside [A-Za-z0-9_] like '-', '.', space, ';') — name the
-      # offender instead of a generic "unparseable".
+      # '=' present but the key the readers can't share — name the offender
+      # instead of a generic "unparseable".
       keypart="${line%%=*}"
       keypart="${keypart#"${keypart%%[![:space:]]*}"}"
       keypart="${keypart%"${keypart##*[![:space:]]}"}"

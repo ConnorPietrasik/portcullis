@@ -7,14 +7,12 @@
 #   panel.pietrasik.top/api  → host API :8010 (Authelia + X-Panel-Token, via docker0 gateway 172.17.0.1)
 #   auth.pietrasik.top       → authelia portal
 #
-# Traefik runs the FILE provider only (traefik/dynamic/*.yml) — it has no
-# docker provider and mounts NO docker.sock (a ro-mounted socket still grants
-# full Docker API access, and traefik is the internet-facing process).
-# Adding an app = compose service on `edge` + a router/service in
+# Traefik runs the FILE provider only (traefik/dynamic/*.yml) — no docker
+# provider, no docker.sock (a ro-mounted socket still grants full Docker API
+# access). Adding an app = compose service on `edge` + a router/service in
 # traefik/dynamic/ (see docs/RUNBOOK.md → “add an app”).
 
-# Log rotation — docker's json-file driver grows unbounded by default, and
-# traefik's accessLog writes every request. Applied to every service below.
+# Log rotation — docker's json-file driver grows unbounded by default.
 x-logging: &default-logging
   driver: json-file
   options:
@@ -22,9 +20,8 @@ x-logging: &default-logging
     max-file: "3"
 
 # Healthcheck cadence (shared). Deliberately lazy: one loopback request per
-# container per interval — unmeasurable cost — while a hang still surfaces as
-# unhealthy after interval × retries (~6 min). Shows in docker ps / the
-# panel's Services view. Healthchecks never restart anything; they diagnose.
+# container per interval, while a hang still surfaces as unhealthy after
+# interval × retries (~6 min). Healthchecks diagnose; they never restart.
 x-healthcheck: &healthcheck-opts
   interval: 2m
   timeout: 10s
@@ -33,13 +30,12 @@ x-healthcheck: &healthcheck-opts
 
 # LLM fleet boilerplate — merged into every llm-* block via `<<: *llm-base`.
 # What varies per instance: environment (ROCR_VISIBLE_DEVICES + key), command,
-# labels. Everything else (devices, groups, seccomp, healthcheck, networks) is
-# identical for every radiance server, so it lives once here.
+# labels. Everything else is identical for every radiance server, so it lives
+# once here.
 x-llm-base: &llm-base
-  image: stilldeadcode/radiance:latest # the ONE image that deliberately floats
-  # OUTSIDE the declared-line policy — frequent radiance builds are wanted. The
-  # risk (a build that passes the health + doctor gates but breaks behavior)
-  # is: make rollback WHAT=radiance (RUNBOOK → LLM fleet → Updates)
+  image: stilldeadcode/radiance:latest # the ONE image deliberately OUTSIDE the
+  # declared-line policy — frequent builds are wanted. A build that passes the
+  # gates but breaks behavior: make rollback WHAT=radiance (RUNBOOK → LLM fleet)
   restart: "no" # the fleet must not resurrect itself after a reboot — you pick
   # the set from the panel (edge services stay unless-stopped)
   init: true # forwards SIGTERM; the engine finishes its step and releases the cards
@@ -48,18 +44,18 @@ x-llm-base: &llm-base
   devices: ["/dev/kfd", "/dev/dri"] # all cards visible; ROCR_VISIBLE_DEVICES pins the set
   group_add: ["992", "44"] # verify: getent group render video
   security_opt:
-    # radiance's io_uring reads + ROCm's NUMA binding (mbind/set_mempolicy) are
-    # refused by Docker's default seccomp. Both paths below are in the UPSTREAM
-    # radiance repo (codeberg.org/StillDeadcode/radiance), not this one: see its
-    # deploy/compose/common.yaml for the why, and the tighter profile it ships,
-    # deploy/compose/seccomp-radiance.json, if you ever want to run confined.
+    # radiance's io_uring reads + ROCm's NUMA binding (mbind/set_mempolicy)
+    # are refused by Docker's default seccomp. Both are in the UPSTREAM
+    # radiance repo (codeberg.org/StillDeadcode/radiance) — see its
+    # deploy/compose/common.yaml and the tighter profile it ships
+    # (deploy/compose/seccomp-radiance.json) if you ever want to run confined.
     - seccomp=unconfined
   ulimits:
     memlock: -1
   volumes:
     - /models/llm:/models:ro
-    # only if a model needs a CUSTOM chat template (rare — the .rad carries its
-    # own): mount the .jinja and pass --chat-template (radiance upstream)
+    # only if a model needs a CUSTOM chat template (rare — the .rad carries
+    # its own): mount the .jinja and pass --chat-template (radiance upstream)
   stop_grace_period: 60s # finishes the in-flight step, releases the cards
   healthcheck:
     interval: 1m
@@ -67,19 +63,17 @@ x-llm-base: &llm-base
     retries: 3
     start_period: 5m # the MODEL LOAD is the slow part: ~1m on this hardware,
     test: ["CMD", "busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8000/health"]
-    # 5m is the margin. A shorter start_period would read unhealthy mid-load —
-    # and make update's 600s health gate auto-rolls-back while a reload is
-    # still loading (raise UPDATE_HEALTH_TIMEOUT only for a much slower model —
-    # RUNBOOK → LLM fleet)
+    # 5m is the margin — shorter reads unhealthy mid-load and make update's
+    # 600s gate auto-rolls-back while a reload is still loading (raise
+    # UPDATE_HEALTH_TIMEOUT only for a much slower model — RUNBOOK → LLM fleet)
   networks: [edge] # NO network_mode: host — on the bridge, port 8000 is
   # reachable only from traefik (no UFW rule, no LAN/WAN exposure), so the
   # server binds 0.0.0.0 instead of the playground's --host ::
 
 services:
   traefik:
-    # Image policy: floats on the MAJOR line — every patch/minor security
-    # release rides in on the next `make update` (snapshot + health gate +
-    # auto-rollback; `make rollback` reverts one update). A major is a
+    # Image policy: floats on the MAJOR line — patch/minor security releases
+    # ride in on `make update` (snapshot + gate + auto-rollback); a major is a
     # deliberate one-word edit — that's where breaking changes live.
     image: traefik:v3
     restart: unless-stopped
@@ -95,7 +89,7 @@ services:
       # a wildcard-synthesized CNAME, which lego would follow during DNS-01 and
       # misplace the challenge TXT (go-acme/lego#1816). Disabling CNAME follow
       # pins the standard behavior: TXT at _acme-challenge.pietrasik.top, where
-      # the explicit record wins over the wildcard. Stable upstream option.
+      # the explicit record wins over the wildcard.
       LEGO_DISABLE_CNAME_SUPPORT: "true"
     labels:
       - panel.manage=edge router # shows in the panel's Services view
@@ -134,8 +128,6 @@ services:
   # Public portfolio site (bare domain — Authelia bypass rule for pietrasik.top
   # already lives in configuration.yml). Placeholder page for now; replace
   # compose/portfolio/index.html with the real site whenever it exists.
-  # Route: traefik/dynamic/apps.yml (file provider — labels are ignored for
-  # routing; see docs/RUNBOOK.md → “add an app”).
   portfolio:
     image: nginx:stable-alpine # current stable (oldstable) line, floats; use `alpine` to track mainline
     restart: unless-stopped
@@ -150,17 +142,14 @@ services:
   # ── LLM fleet (Radiance) — start/stop instances from the panel ──────────────
   # An instance = one block here + one router pair in traefik/dynamic/llm.yml:
   # llm-<name> ↔ <name>.pietrasik.top. Cards: ROCR_VISIBLE_DEVICES "i,j,k"
-  # (fixed 0-5; per-card VRAM in the panel's GPU stats) + --tp = card count.
-  # Port always 8000 (own IP per container). The display name (panel.manage)
-  # shows the card set — no commas in it (docker ps encodes labels comma-joined).
-  # restart "no" so a reboot
-  # never resurrects the set you chose. Model files: /models/llm/*.rad (outside
-  # this repo; ro-mounted at /models). `<<: *llm-base` carries the shared
-  # boilerplate (x-llm-base, top of file). New instance: clone a block + the
-  # router pair — a block's flags are this host's own tuning; the committed
-  # blocks are the truth, not upstream's. Trialing a model first: temp-clone
-  # radiance upstream, run its deploy/compose/<model>.yaml ad hoc, delete the
-  # clone (its flags stay with the trial; RUNBOOK → LLM fleet).
+  # (fixed 0-5) + --tp = card count. Port always 8000 (own IP per container).
+  # The display name (panel.manage) shows the card set — no commas in it
+  # (docker ps encodes labels comma-joined). restart "no" so a reboot never
+  # resurrects the set you chose. Model files: /models/llm/*.rad (ro-mounted
+  # at /models). New instance: clone a block + the router pair — a block's
+  # flags are this host's own tuning; the committed blocks are the truth, not
+  # upstream's. Trialing a model first: temp-clone radiance upstream, run its
+  # deploy/compose/<model>.yaml ad hoc, delete the clone (RUNBOOK → LLM fleet).
   #
   # ── the fleet — uncomment to activate, then: make update
   #

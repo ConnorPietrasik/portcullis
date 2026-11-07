@@ -1,12 +1,8 @@
 #!/usr/bin/env bash
 # Doctor — post-deploy smoke test (READ-ONLY: changes nothing). Encodes every
-# verification step from docs/RUNBOOK.md as one pass/fail report. Diagnostic
-# only — not part of the numbered deploy sequence. Run ON THE SERVER:
-#   make doctor
+# verification step from docs/RUNBOOK.md as one pass/fail report.
+# Run ON THE SERVER: make doctor
 set -uo pipefail  # deliberately NOT -e — every check runs; report everything
-# Shared env-file parser (pure function, sets no shell options — safe to
-# source here, where a picked-up `set -e` would break the report-everything
-# design).
 # shellcheck disable=SC1091
 source "$(dirname "$(realpath "$0")")/envload.sh"
 
@@ -51,11 +47,9 @@ section() { printf '\n%s\n' "$*"; }
 section "config (.env)"
 REPO_ROOT="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
 if [[ -f "$REPO_ROOT/.env" ]]; then
-  # Literal parse, never `source` (see setup/envload.sh): a value with a
-  # space, $VAR or backticks must not abort or execute in the doctor while
-  # compose reads the same file — and the parser refuses values compose or
-  # systemd would reinterpret, so the checks below see what the containers
-  # actually receive.
+  # Literal parse, never `source` (setup/envload.sh): the parser refuses values
+  # compose or systemd would reinterpret, so the checks below see what the
+  # containers actually receive.
   if ! env_file_load "$REPO_ROOT/.env"; then
     bad ".env has unparseable or unsafe lines (see warnings above)"
     hint "every line must be KEY=VALUE; values: no \$, no backslash, no ' #' (setup/envload.sh)"
@@ -77,15 +71,10 @@ fi
 # ── edge stack ───────────────────────────────────────────────────────────────
 section "edge stack (docker)"
 if [[ -d /opt/panel ]]; then
-  # `edge` is EXTERNAL to compose — only setup/02-deploy-stack.sh creates it
-  # (make deploy / make stack). If the edge containers are stopped (or
-  # removed) and unused networks are pruned, `edge` is deleted: `docker
-  # system prune` does both in one run (stopped containers first, then the
-  # network); a bare `docker network prune` needs the stopped containers
-  # removed first (their endpoints protect it while they exist). The panel's
-  # prune-docker never touches networks (dangling images + build cache only).
-  # Afterwards `up -d` fails with "network edge declared as external, but
-  # could not be found".
+  # `edge` is EXTERNAL to compose — only make deploy / make stack creates it.
+  # If the edge containers are stopped (or removed) and unused networks are
+  # pruned, `edge` is deleted and `up -d` fails with "network edge declared as
+  # external, but could not be found".
   if sudo docker network inspect edge >/dev/null 2>&1; then
     ok "network: edge present"
   else
@@ -201,10 +190,9 @@ if systemctl is-active --quiet panel-api 2>/dev/null; then
 else
   bad "systemd: panel-api inactive"; hint "sudo journalctl -u panel-api -n 50 (RUNBOOK Phase 4)"
 fi
-# The reduced env file: it must hold the token and ONLY the keys its service
-# reads (whitelist, shared with the derivation — envload.sh: any other key is
-# a leak, including secrets added to .env later; no secret list to maintain).
-# A regression here = the full secret set sitting in a panel-uid /proc environ.
+# The reduced env file: must hold the token and ONLY the keys its service
+# reads (whitelist, shared with the derivation — envload.sh). A regression
+# here = the full secret set sitting in a panel-uid /proc environ.
 if [[ -f /opt/panel/.panel-api.env ]]; then
   env_mode="$(stat -c %a /opt/panel/.panel-api.env 2>/dev/null || true)"
   if [[ "$env_mode" == 600 ]]; then ok ".panel-api.env mode 600"; else
@@ -215,12 +203,10 @@ if [[ -f /opt/panel/.panel-api.env ]]; then
   else
     bad ".panel-api.env missing PANEL_TOKEN"; hint "make api (re-derives from /opt/panel/.env)"
   fi
-  # PANEL_DEV=1 disables the API's own auth checks (local development only —
-  # main.py: DEV_MODE = os.environ.get("PANEL_DEV") == "1"). It is a legal
-  # member of the allowed set, so the whitelist check below would pass a
-  # production deployment with auth turned off. Catch it here. The value must
-  # be exactly 1 (optionally quoted — systemd's EnvironmentFile strips the
-  # quotes), so the pattern is anchored: PANEL_DEV=0/11/true leave auth on.
+  # PANEL_DEV=1 disables the API's own auth checks (local development only).
+  # It is a legal member of the allowed set, so the whitelist check below
+  # would pass a production deployment with auth off — catch it here. The
+  # value must be exactly 1 (optionally quoted), so the pattern is anchored.
   if sudo grep -qE "^[[:space:]]*PANEL_DEV[[:space:]]*=[[:space:]]*[\"']?1[\"']?[[:space:]]*$" /opt/panel/.panel-api.env; then
     bad "panel-api runs with PANEL_DEV=1 — API auth checks disabled"; hint "remove PANEL_DEV from /opt/panel/.env (and the repo .env — local dev only), then re-run: make api"
   else
@@ -248,9 +234,8 @@ if [[ "$code" == 401 ]]; then
 else
   bad "GET /api/metrics unauthenticated → ${code:-000} (expected 401)"
 fi
-# The REAL data path: edge container → host API. The curls above run on the
-# host itself, so they pass even when traefik's route 502s (wrong bind IP or
-# missing UFW rule for the edge subnet).
+# The REAL data path: edge container → host API. The host curls above pass
+# even when traefik's route 502s (wrong bind IP or missing UFW rule).
 if [[ -d /opt/panel ]] && sudo docker compose --project-directory /opt/panel ps --services --status=running 2>/dev/null | grep -qx panel-web; then
   edge_health="$(sudo docker compose --project-directory /opt/panel exec -T panel-web \
     wget -qO- --timeout=5 http://172.17.0.1:8010/api/health 2>/dev/null || true)"
@@ -266,7 +251,6 @@ fi
 # ── secret file modes ────────────────────────────────────────────────────────
 # tar restores the repo's 0644 on every sync, so the deploy re-tightens the
 # credential files — verify that actually happened (and catch manual edits).
-# db.sqlite3 (TOTP seeds) is created by authelia at first boot, 0644.
 section "secret file modes"
 if [[ -d /opt/panel ]]; then
   for f in /opt/panel/.env /opt/panel/traefik/dynamic/middlewares.yml /opt/panel/authelia/users_database.yml; do
@@ -310,10 +294,8 @@ if systemctl is-active --quiet panel-ddns.timer 2>/dev/null; then
 else
   bad "panel-ddns.timer not active"; hint "make ddns (RUNBOOK → Dynamic IP)"
 fi
-# The reduced env file: it must hold the NameSilo key and ONLY the keys its
-# script reads (whitelist, shared with the derivation — envload.sh) — a
-# regression here puts the full secret set in a panel-uid oneshot's environ
-# for a few seconds per tick (same discipline as .panel-api.env).
+# The reduced env file: must hold the NameSilo key and ONLY the keys its
+# script reads (same discipline as .panel-api.env).
 if [[ -f /opt/panel/.panel-ddns.env ]]; then
   env_mode="$(stat -c %a /opt/panel/.panel-ddns.env 2>/dev/null || true)"
   if [[ "$env_mode" == 600 ]]; then ok ".panel-ddns.env mode 600"; else
@@ -342,22 +324,21 @@ else
 fi
 
 # ── firewall ─────────────────────────────────────────────────────────────────
-# UFW is REQUIRED on this host (no firewalld/iptables fallback): the edge→API
-# path and the host's public exposure both depend on it.
+# UFW is REQUIRED on this host (no firewalld/iptables fallback).
 section "firewall (ufw — required)"
 if command -v ufw >/dev/null 2>&1; then
   ufw_status="$(sudo ufw status 2>/dev/null || true)"
   if grep -q "Status: active" <<<"$ufw_status"; then
-    # ufw renders the multi-port rule as "80,443/tcp" (comma, no space —
-    # set_port() joins ports with ","); also match a spaced form defensively.
+    # ufw renders the multi-port rule as "80,443/tcp" (comma, no space); also
+    # match a spaced form defensively.
     if grep -qE '80, ?443/tcp' <<<"$ufw_status"; then
       ok "80,443/tcp allowed"
     else
       warn "80,443/tcp rule missing"; hint "RUNBOOK → UFW (docker-published ports bypass ufw — belt-and-suspenders)"
     fi
     # `ufw status` renders the destination-scoped rule as "172.17.0.1 8010/tcp"
-    # (no /32; a rule without an explicit proto has no /tcp suffix), so match
-    # "8010" anywhere in the line, never ^8010.
+    # (no /32; no /tcp suffix without an explicit proto), so match "8010"
+    # anywhere in the line, never ^8010.
     rules_8010="$(grep '8010' <<<"$ufw_status" || true)"
     if [[ -z "$rules_8010" ]]; then
       bad "no 8010 rule — container→host API calls will 502"; hint "RUNBOOK → UFW: derive the edge subnet and add the rule (required)"
@@ -367,13 +348,12 @@ if command -v ufw >/dev/null 2>&1; then
       ok "8010 rule present and edge-scoped"
     fi
     # Break-glass: with UFW active and no SSH rule, standard-port SSH is
-    # closed and the hardening checklist's "SSH as break-glass" is
-    # console-only. Non-verbose status renders the app profile as "OpenSSH"
-    # (not 22/tcp), so accept both forms; the anchor is the To column, so a
-    # source-scoped rule ("22/tcp  ALLOW  10.0.0.11") counts too. Only warned
-    # when something actually listens on :22 — a custom SSH port legitimately
-    # has no 22 rule (no false warn). The deploy never adds SSH rules, so the
-    # hint points at the operator, not the scripts.
+    # closed and break-glass is console-only. Non-verbose status renders the
+    # app profile as "OpenSSH" (not 22/tcp), so accept both; the anchor is the
+    # To column, so a source-scoped rule counts too. Only warned when
+    # something actually listens on :22 (a custom SSH port legitimately has
+    # no 22 rule). The deploy never adds SSH rules, so the hint points at the
+    # operator.
     if ! grep -qE '^[[:space:]]*(22/tcp|OpenSSH)' <<<"$ufw_status" \
        && [[ $(ss -tln 'sport = :22' 2>/dev/null | tail -n +2 | grep -c .) -gt 0 ]]; then
       warn "no 22/tcp rule — something listens on :22 but SSH is closed while UFW is active (break-glass is console-only)"

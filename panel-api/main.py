@@ -1,20 +1,14 @@
 """Panel API — host-side FastAPI service behind panel.pietrasik.top/api.
 
-Trust model (defense in depth):
-  * Traefik terminates TLS, runs Authelia forward-auth (admins only) and
-    injects X-Panel-Token from /opt/panel/.env (never client-visible; Traefik
-    overwrites any client-supplied value).
-  * This service independently re-verifies X-Panel-Token and the Remote-User /
-    Remote-Groups headers Authelia set.
-  * EVERYTHING privileged — container list/start/stop/restart included — goes
-    through `sudo -n panel-do`, a compiled whitelist dispatcher: one code path,
-    one audit trail (journald). Only sysfs//proc metric reads bypass it.
+Defense in depth: Traefik runs Authelia forward-auth (admins only) and injects
+X-Panel-Token; this service re-verifies both independently. Everything
+privileged — container control included — goes through `sudo -n panel-do`
+(one code path, one journald audit trail); only sysfs//proc metric reads
+bypass it.
 
-Runs as systemd unit `panel-api`: user `panel`, binds 172.17.0.1:8010
-(docker0 bridge gateway — reachable from the edge network, not the internet).
-
-PANEL_DEV=1 disables auth checks for local development ONLY (pair it with
-uvicorn on loopback). The systemd unit never sets it; never set it in prod.
+Runs as user `panel`, binds 172.17.0.1:8010 (docker0 gateway — reachable from
+the edge network, not the internet). PANEL_DEV=1 disables auth for local
+development ONLY (loopback); the systemd unit never sets it.
 """
 
 from __future__ import annotations
@@ -60,11 +54,8 @@ def require_admin(
     remote_user: Optional[str] = Header(default=None),
     remote_groups: Optional[str] = Header(default=None),
 ) -> Optional[str]:
-    """FastAPI dependency: Traefik token + Authelia identity, both re-checked.
-
-    Returns the authenticated username (None in dev mode) so the privileged
-    endpoints can record it in their audit line.
-    """
+    """Re-check the Traefik token + Authelia identity; return the username
+    (None in dev mode) for the audit line."""
     if DEV_MODE:
         return None
     if not PANEL_TOKEN or not x_panel_token or not secrets.compare_digest(
@@ -154,14 +145,9 @@ def ram() -> dict[str, int]:
 
 
 def disks() -> list[dict[str, Any]]:
-    """Usage per mount in DISK_MOUNTS — the thing that kills home servers quietly.
-
-    Every configured mount ALWAYS gets an entry: stats, or an explicit error.
-    If a mountpoint isn't actually mounted (a partition failed at boot),
-    statvfs silently reports the *containing* filesystem — a confidently
-    wrong number under the right label. That case becomes an error entry so
-    the dashboard shouts instead of showing a lie or a silent gap: you listed
-    it in PANEL_DISK_MOUNTS, so its absence is itself the alert.
+    """Usage per mount in DISK_MOUNTS. Every configured mount ALWAYS gets an
+    entry: stats, or an explicit error — an unmounted mountpoint makes statvfs
+    report the *containing* filesystem, so its absence must shout, not lie.
     """
     try:
         root_dev: Optional[int] = os.stat("/").st_dev
@@ -231,18 +217,16 @@ def metrics(_admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
-    # Deliberately UNauthenticated (standard liveness-probe pattern): fixed
-    # minimal body, no state, no privileges — and the bind address (docker0
-    # gateway) is only reachable from this host's containers. Verify auth
-    # enforcement against /api/metrics instead; everything that touches state
-    # or privileges sits behind require_admin.
+    # Deliberately UNauthenticated (liveness-probe pattern): fixed minimal
+    # body, no state, no privileges, and the docker0 bind is only reachable
+    # from this host's containers. Verify auth against /api/metrics instead.
     return {"ok": True, "dev": DEV_MODE, "ts": int(time.time())}
 
 
 # ───────────────────────── containers ────────────────────────────
 # Container control is NOT a second privileged path — these are panel-do
 # actions (list-containers, start/stop/restart-container): same registry,
-# same arg validation, same journald audit as every other action.
+# validation, and journald audit as every other action.
 
 _containers_cache: dict[str, Any] = {"data": None, "at": 0.0}
 
@@ -318,11 +302,8 @@ def _err_detail(proc: subprocess.CompletedProcess) -> str:
 
 def _audit(user: Optional[str], action: str, args: list[str], result: int | str, err: str = "") -> None:
     """One journal line per privileged invocation (stdout → journald).
-
-    sudo's own log only says *panel* ran the command; this records which
-    Authelia user triggered it and the outcome — `journalctl -u panel-api`
-    is the audit trail. On failure, `err` appends the one-line detail.
-    """
+    sudo's own log only says *panel* ran the command; this records the
+    triggering Authelia user and the outcome."""
     line = (
         f"panel-api: audit user={user or 'dev'} action={action} "
         f"args={args!r} result={result}"
@@ -408,7 +389,7 @@ class ActionBody(BaseModel):
 
 @app.post("/api/action/{name}")
 def run_action(name: str, body: ActionBody, _admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
-    # Light sanity checks here (panel-do re-validates authoritatively).
+    # Light sanity checks (panel-do re-validates authoritatively).
     if not ACTION_NAME_RE.match(name):
         raise HTTPException(400, "bad action name")
     registry = {a["name"]: a for a in panel_do_actions()}

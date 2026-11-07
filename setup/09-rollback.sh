@@ -2,27 +2,22 @@
 # make rollback [WHAT=...] — restore the edge stack to the snapshot taken at
 # the last `make update` (state: /opt/panel/.update-state). With NO WHAT it
 # restores the deployed configs, container images, panel-api (exact copy incl.
-# venv), and the npm files — all from LOCAL snapshots, so no registry access
-# is needed: it works on a dead connection. The state file always holds the
-# *pre-update* snapshot, so this undoes the last update — including one that
-# `make update` already auto-reverted (then it is a no-op re-create). Each
-# component rolls back best-effort; a failure is reported as PARTIAL and the
-# remaining snapshots stay intact for a re-run.
+# venv), and the npm files — all from LOCAL snapshots, so it works on a dead
+# connection. Each component rolls back best-effort; a failure is reported as
+# PARTIAL and the remaining snapshots stay intact for a re-run.
 #
-# With WHAT it rolls back IMAGES ONLY: the matching services are
-# re-created on their pre-update images (the same compose-override machinery),
-# while the configs, panel-api, npm files, and every non-matching service stay
-# exactly where the update left them. The value is matched against each
-# snapshot service by NAME (exact, or as a prefix) and by the pre-update IMAGE
-# name (substring):
-#   make rollback WHAT=radiance   every instance of that image (its repo:tag
-#                                 at snapshot time) — the radiance escape hatch
+# With WHAT it rolls back IMAGES ONLY: the matching services are re-created on
+# their pre-update images (the same compose-override machinery) while configs,
+# panel-api, npm files, and every non-matching service stay in place. The value
+# is matched against each snapshot service by NAME (exact, or as a prefix) and
+# by the pre-update IMAGE name (substring):
+#   make rollback WHAT=radiance   every instance of that image
 #   make rollback WHAT=llm        the llm- prefix → the whole radiance fleet
 #   make rollback WHAT=llm-27b    that one instance
 # That is the fix for an image update that passed the health + doctor gates
 # but changed BEHAVIOR (the gates only see health — a broken new `latest`
-# build is green to both): revert the image, keep everything else. The next
-# `make update` re-snapshots the reverted build as the new anchor.
+# build is green to both). The next `make update` re-snapshots the reverted
+# build as the new anchor.
 set -euo pipefail
 source "$(dirname "$(realpath "$0")")/common.sh"
 need docker
@@ -38,8 +33,8 @@ n="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("se
 
 # ── targeted image rollback: make rollback WHAT=<name|prefix|image-name> ────
 # Only the matching services' images are reverted; nothing else is touched, so
-# nothing else is restored either — a config-level change (a service removed
-# from compose, a new config) is a FULL rollback's job.
+# nothing else is restored either — a config-level change is a FULL rollback's
+# job.
 target="${1:-}"
 if [[ -n "$target" ]]; then
   selected="$(python3 - "$STACK_STATE_FILE" "$target" <<'PYEOF'

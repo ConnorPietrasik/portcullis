@@ -1,13 +1,12 @@
-# LLM fleet — OpenAI-style machine APIs, one router per INSTANCE. TLS terminates
-# here (wildcard cert, DNS-01); auth is the server's own API key (Authorization:
-# Bearer), NOT Authelia: forward-auth is cookie-based and can't serve API clients
-# that only speak bearer tokens. These routers deliberately omit auth-chain@file
-# — that is what makes plain OpenAI clients work with
+# LLM fleet — OpenAI-style machine APIs, one router per INSTANCE. TLS
+# terminates here (wildcard cert, DNS-01); auth is the server's own API key
+# (Authorization: Bearer), NOT Authelia — forward-auth is cookie-based and
+# can't serve API clients that only speak bearer tokens. These routers
+# deliberately omit auth-chain@file, so plain OpenAI clients work with
 #   base_url = https://<name>.pietrasik.top/v1
-# The API key is the gate; llm-rate blunts key-guessing and scan traffic. A host
-# 502s until its instance is up — harmless; instances start/stop from the panel's
-# Services view (RUNBOOK → LLM fleet).
-# Rule: service llm-<name> ↔ Host(`<name>.pietrasik.top`) ↔ http://llm-<name>:8000.
+# The API key is the gate; llm-rate blunts key-guessing and scan traffic. A
+# host 502s until its instance is up — harmless. Rule: service llm-<name> ↔
+# Host(`<name>.pietrasik.top`) ↔ http://llm-<name>:8000 (RUNBOOK → LLM fleet).
 
 http:
   routers:

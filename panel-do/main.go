@@ -178,10 +178,10 @@ func main() {
 // ACTIONS — THE ONLY SECTION AN IMPLEMENTER MAY EDIT.
 //
 // Rules for every action (violations = security bug):
-//   1. Exec ONLY via runCmd(ctx, "/absolute/path", ...). Never bash/sh/zsh,
-//      never direct exec.Command, never string-built command lines.
+//   1. Exec ONLY via runCmd(ctx, "/absolute/path", ...). Never bash/sh, never
+//      direct exec.Command, never string-built command lines.
 //   2. Args arrive pre-validated as OPAQUE TOKENS (no '/', no '-', no '..').
-//      Never treat an arg as a file path. Never os.Open/os.Create by arg.
+//      Never treat an arg as a file path.
 //   3. No os.Getenv, no network, no goroutines, no os.Exit, no panic.
 //      Return errors. Keep each action under ~30 lines.
 //   4. Separators like "--" belong hardcoded inside runCmd calls, never as args.
@@ -194,10 +194,9 @@ func restartService(ctx context.Context, args []string, logf func(string, ...any
 	if out, err := runCmd(ctx, "/usr/bin/systemctl", "restart", "--", args[0]); err != nil {
 		return fmt.Errorf("restart %s: %v: %s", args[0], err, out)
 	}
-	// A oneshot unit is *inactive* after a clean run (unless
-	// RemainAfterExit), so is-active would report success as a failure.
-	// systemctl start/restart blocks until a oneshot's run completes, so its
-	// Result is final here: "success" = the main process exited 0.
+	// A oneshot unit is *inactive* after a clean run (unless RemainAfterExit),
+	// so is-active would report success as a failure. start/restart blocks
+	// until a oneshot completes, so its Result is final here.
 	unitType, err := runCmd(ctx, "/usr/bin/systemctl", "show", "-p", "Type", "--value", "--", args[0])
 	if err != nil {
 		return fmt.Errorf("restart %s: cannot read unit Type: %v: %s", args[0], err, unitType)
@@ -220,19 +219,11 @@ func restartService(ctx context.Context, args []string, logf func(string, ...any
 }
 
 // pruneDocker reclaims disk from dangling images and unused build cache.
-// Deliberately NOT `docker system prune`: it also removes (a) stopped
-// containers — e.g. a locally-built LLM server stopped to free RAM, whose
-// locally-built image then dangles and is swept by the image prune in the
-// same run (02-deploy-stack.sh tolerates such images via
-// `pull --ignore-pull-failures`, but re-building isn't free) — and (b)
-// networks unused by any container, pruned AFTER the container removal: with
-// all four edge containers stopped from the panel, the EXTERNAL `edge`
-// network is left with no endpoints and deleted, after which
-// `docker compose up -d` fails ("network edge declared as external, but
-// could not be found"). A bare `docker network prune` can't do that while
-// the stopped containers still exist (their endpoints protect the network);
-// `system prune` removes them first. Containers and networks are never
-// touched here.
+// Deliberately NOT `docker system prune`: it also removes stopped containers
+// (whose locally-built image then dangles and is swept in the same run) and
+// networks unused by any container — with all edge containers stopped from
+// the panel, the EXTERNAL `edge` network is deleted and `up -d` afterwards
+// fails. Containers and networks are never touched here.
 func pruneDocker(ctx context.Context, args []string, logf func(string, ...any)) error {
 	out, err := runCmd(ctx, "/usr/bin/docker", "image", "prune", "-f")
 	logf("image prune: %s", strings.TrimSpace(out))

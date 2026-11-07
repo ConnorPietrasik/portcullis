@@ -19,7 +19,7 @@ host API (user 'panel', systemd) ─┬─ /sys + /proc       → AMD temps/util
 
 panel-ddns (systemd timer, user 'panel') ─→ NameSilo API — the apex A record
    follows the public IP; *.pietrasik.top is a CNAME → apex, so it follows for
-   free (reuses the same API key as the cert's DNS-01; no new secrets)
+   free (reuses the cert's DNS-01 API key; no new secrets)
 
 Traefik runs the file provider only (traefik/dynamic/*.yml) and mounts no
 docker.sock — the internet-facing process gets zero docker access.
@@ -30,10 +30,10 @@ docker.sock — the internet-facing process gets zero docker access.
 | path | what it is |
 |---|---|
 | `setup/` | idempotent setup scripts, run in order (see below) |
-| `compose/` | the edge stack deployed to `/opt/panel` (traefik, authelia, panel UI — traefik is file-provider only) |
+| `compose/` | the edge stack deployed to `/opt/panel` (traefik file-provider only, authelia, panel UI) |
 | `panel-api/` | FastAPI host service → `/opt/panel-api`, run by `panel-api.service` |
 | `panel-do/` | Go whitelist dispatcher — add actions per [RUNBOOK](docs/RUNBOOK.md#add-a-privileged-action) |
-| `ddns/` | stdlib-python systemd timer → keeps the apex NameSilo A record on the current public IP |
+| `ddns/` | stdlib-python systemd timer → keeps the apex NameSilo A record current |
 | `docs/RUNBOOK.md` | phase-by-phase deploy + verify + hardening guide |
 | `docs/ARCHITECTURE.md` | why it's built this way, trust boundaries |
 
@@ -42,12 +42,11 @@ docker.sock — the internet-facing process gets zero docker access.
 **Main target: CachyOS** (Arch-based; UFW ships installed and enabled, so the deploy only adds its two rules and never touches SSH).
 Any other Arch-based distro works: `pacman -S ufw` and enable it before Phase 2 (RUNBOOK → UFW).
 
-**[docs/RUNBOOK.md](docs/RUNBOOK.md) is the deploy guide — follow it in order** (phase 0 is manual DNS prep; phase 5 is the final check from
-an external network). It is the single source of truth for the sequence, so this section is an orientation, not a second copy:
+**[docs/RUNBOOK.md](docs/RUNBOOK.md) is the deploy guide — follow it in order** (phase 0 is manual DNS prep; phase 5 is the final check
+from an external network). It is the single source of truth for the sequence:
 
 - Phase 0 is manual: NameSilo API key + the one-time `*` CNAME → `pietrasik.top`.
-- **UFW is a required step between `make deploy` and `make api`** (RUNBOOK → UFW). `make api` refuses to run until it is in place, so the
-  ordering can't be skipped by accident — but do it in the window, not after.
+- **UFW is a required step between `make deploy` and `make api`** (RUNBOOK → UFW). `make api` refuses to run until it is in place.
 
 ```bash
 make preflight   # phase 1: host tooling
@@ -59,9 +58,8 @@ make api         # phase 4: host API (gated on UFW)
 make doctor      # any time: whole-stack pass/fail report (read-only)
 ```
 
-`make stack` = `deploy` → `ddns` → `panel-do` → `api` (phases 2–4, in order) in one shot, for **re-runs**; the first deploy follows the
-RUNBOOK step by step so UFW lands in the window. First login: `https://auth.pietrasik.top` (registers TOTP), then
-`https://panel.pietrasik.top`.
+`make stack` = `deploy` → `ddns` → `panel-do` → `api` in one shot, for **re-runs**; the first deploy follows the RUNBOOK step by step so
+UFW lands in the window. First login: `https://auth.pietrasik.top` (registers TOTP), then `https://panel.pietrasik.top`.
 
 ## Local dev (no deploy)
 
@@ -77,23 +75,17 @@ Never set `PANEL_DEV=1` in production — the systemd unit doesn't, and nothing 
 
 ## Day-2 ops
 
-- **Stack updates** (configs AND versions): `make update` is the one Day-2 command — it syncs every
-  repo change (compose, routes, Authelia config, `.env`, the panel frontend) and floats the stack on the
-  *major* line (`traefik:v3`, `authelia/authelia:4`, `nginx:stable-alpine`) with npm/pip bumps within
-  their declared ranges and pulled base images. It's the safe path: a green `make doctor` is required up
-  front, it snapshots everything (image IDs, the deployed configs, an exact panel-api copy, the npm
-  files), changes only what moved, gates on the post-update containers' health (what should be
-  running after the update) + panel-api health + a full doctor pass, and auto-rolls-back on
-  failure (offline — the snapshot is local). `make rollback`
-  undoes the last update. Majors stay deliberate edits (a tag in compose, a range in
-  `package.json`/`requirements.txt`). `make deploy` is the first-boot path.
+- **Stack updates**: `make update` is the one Day-2 command — it syncs every repo change (compose, routes, Authelia config, `.env`, the
+  panel frontend) and floats the stack within its declared *lines* (major image tags, npm/pip ranges). It requires a green `make doctor`
+  up front, snapshots everything, changes only what moved, gates on post-update health + panel-api + a full doctor pass, and
+  auto-rolls-back on failure (offline — the snapshot is local). `make rollback` undoes the last update. Majors stay deliberate edits
+  (a tag in compose, a range in `package.json`/`requirements.txt`). `make deploy` is the first-boot path.
   Details: [RUNBOOK](docs/RUNBOOK.md#updates)
-- **New app**: compose service on `edge` + router in `compose/traefik/dynamic/` + optional Authelia
-  rule, then `make update` → [RUNBOOK](docs/RUNBOOK.md#add-an-app)
+- **New app**: compose service on `edge` + router in `compose/traefik/dynamic/` + optional Authelia rule, then `make update` → [RUNBOOK](docs/RUNBOOK.md#add-an-app)
 - **New privileged action**: edit `panel-do/main.go` ACTIONS section → `make panel-do` → [RUNBOOK](docs/RUNBOOK.md#add-a-privileged-action)
   (container control is registry actions too — Services and Actions views both render from `panel-do --list`)
-- **Rotate secrets**: edit `.env`, `make update` (it re-derives the panel-api + panel-ddns env files — panel-api is
-  restarted, panel-ddns picks the new value up on its next tick)
+- **Rotate secrets**: edit `.env`, `make update` (it re-derives the panel-api + panel-ddns env files — panel-api is restarted, panel-ddns
+  picks the new value up on its next tick)
 - **Logs / status**: `make logs`, `make status`
 
 ## License

@@ -7,7 +7,7 @@ info "Panel preflight — checking host tooling"
 fail=0
 
 # Sudo first: cache credentials up front so the ufw check below doesn't
-# prompt mid-list, and know whether sudo-based queries are trustworthy.
+# prompt mid-list.
 sudo_ok=0
 if sudo -v 2>/dev/null; then
   info "  ok: sudo available"
@@ -21,8 +21,7 @@ for c in docker openssl curl python3 git flock; do
   if command -v "$c" >/dev/null 2>&1; then info "  ok: $c"; else warn "  MISSING: $c"; fail=1; fi
 done
 
-# panel-api installs a virtualenv — Arch needs python3-venv for that.
-# Test a real creation (ensurepip included), not just module presence.
+# Test a real venv creation (ensurepip included), not just module presence.
 if command -v python3 >/dev/null 2>&1; then
   venv_test="$(mktemp -d)"
   if python3 -m venv "$venv_test" >/dev/null 2>&1; then
@@ -72,11 +71,8 @@ else
   info "  dig not found (optional — panel-ddns falls back to HTTPS; install bind-tools for parity)"
 fi
 
-# make update bumps the panel frontend's npm deps on the host (npm update), so
-# node/npm are required for it. The deploy flow itself does not need them (the
-# frontend builds in Docker), so this WARNS instead of failing — a fresh host
-# can deploy first and install nodejs before its first `make update` (which
-# dies with a clear message if they're missing).
+# node/npm are needed for `make update`'s npm range bump only — the deploy
+# flow builds the frontend in Docker — so warn, don't fail.
 if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
   info "  ok: node $(node --version) + npm $(npm --version) (make update's npm range bump)"
 else
@@ -93,8 +89,7 @@ else
   warn "  systemctl not found — panel-api install step will not work"
 fi
 
-# Authelia TOTP and the ACME dance both need a correct clock; skew breaks both
-# (browser 401 loop, failed cert issuance).
+# TOTP and ACME both need a correct clock; skew breaks both.
 if command -v timedatectl >/dev/null 2>&1 && timedatectl show -p NTPSynchronized --value >/dev/null 2>&1; then
   if [[ "$(timedatectl show -p NTPSynchronized --value)" == "yes" ]]; then
     info "  ok: clock NTP-synchronized (TOTP 2FA + cert issuance need this)"
@@ -118,9 +113,7 @@ if command -v ss >/dev/null 2>&1; then
 fi
 
 # panel.yml (traefik route) + panel-api.service (bind) hardcode 172.17.0.1 —
-# the docker0 gateway. A non-default bridge = a "successful" deploy whose
-# /api 502s forever. Fail when docker0 is up with the wrong IP; when docker
-# isn't started yet (fresh host, Phase 1), just flag it for a re-check.
+# the docker0 gateway. A non-default bridge = a deploy whose /api 502s forever.
 if command -v ip >/dev/null 2>&1; then
   if ip -4 addr show docker0 >/dev/null 2>&1; then
     if ip -4 -o addr show docker0 | awk '{print $4}' | grep -q '^172\.17\.0\.1/'; then

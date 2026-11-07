@@ -6,7 +6,7 @@ log:
 accessLog: {}
 
 # /ping on the internal :8082 "traefik" entrypoint — used by the compose
-# healthcheck (`traefik healthcheck --ping`). Never published: only 80/443 are.
+# healthcheck. Never published: only 80/443 are.
 ping: {}
 
 providers:

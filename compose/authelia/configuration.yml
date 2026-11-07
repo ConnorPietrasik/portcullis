@@ -18,7 +18,7 @@ authentication_backend:
 
 # Order matters: first match wins. Specific rules BEFORE the wildcard.
 # The bare-domain bypass is deliberately LAST so it can only ever match
-# pietrasik.top itself — anything you add later on a new subdomain is
+# pietrasik.top itself — anything added later on a new subdomain is
 # private-by-default (caught by the *.pietrasik.top rule above it).
 access_control:
   default_policy: deny

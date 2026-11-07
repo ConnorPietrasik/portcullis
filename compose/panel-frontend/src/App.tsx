@@ -1,6 +1,5 @@
-// Views are lazy chunks: only the active tab's code ships to the browser,
-// and the Overview's gauge library (the bulk of the bundle) no longer bloats
-// the initial load. React.lazy + Suspense per view.
+// Views are lazy chunks: only the active tab's code ships to the browser
+// (the Overview's gauge library is the bulk of the bundle).
 import { Suspense, lazy, useState } from 'react'
 
 const Overview = lazy(() => import('./views/Overview'))

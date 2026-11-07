@@ -7,9 +7,8 @@ function ActionCard({ a }: { a: ActionInfo }) {
   const [args, setArgs] = useState<string[]>(() => Array(a.arity).fill(''))
   const [out, setOut] = useState<ActionResult | null>(null)
   const [busy, setBusy] = useState(false)
-  // Empty args would just 400 at panel-api (ARG_RE) / 65 at panel-do — keep
-  // the run button off until every arg is filled. (Whitespace-only also: no
-  // registry pattern ever matches it, and it isn't a real value.)
+  // Empty args would just 400 at panel-api / 65 at panel-do — keep the run
+  // button off until every arg is filled (whitespace-only included).
   const missing = args.some((v) => v.trim() === '')
 
   const run = async () => {

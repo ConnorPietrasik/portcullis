@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Build panel-do (privileged action dispatcher), install it (root-owned, 0755),
-# set up sudoers, and run the negative-test suite from the design doc.
+# Build panel-do (privileged action dispatcher), install it (root-owned,
+# 0755), set up sudoers, and run the negative-test suite.
 set -euo pipefail
 source "$(dirname "$(realpath "$0")")/common.sh"
 need go
@@ -31,9 +31,9 @@ cat >"$tmp" <<'EOF'
 Defaults:panel !requiretty
 panel ALL=(root) NOPASSWD: /usr/local/libexec/panel-do
 EOF
-# Validate the candidate BEFORE install: plain visudo -c checks the live
-# tree (old order installed first). A broken file drops the panel rule on
-# every sudo call — host-wide lockout on sudo < 1.9.3.
+# Validate the candidate BEFORE install: plain visudo -c checks the live tree
+# (old order installed first). A broken file drops the panel rule on every
+# sudo call — host-wide lockout on sudo < 1.9.3.
 sudo visudo -c -f "$tmp" >/dev/null \
   || die "sudoers validation failed — candidate kept at $tmp for inspection"
 sudo install -o root -g root -m 0440 "$tmp" /etc/sudoers.d/panel
