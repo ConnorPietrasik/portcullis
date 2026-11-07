@@ -34,6 +34,7 @@ docker.sock — the internet-facing process gets zero docker access.
 | `panel-api/` | FastAPI host service → `/opt/panel-api`, run by `panel-api.service` |
 | `panel-do/` | Go whitelist dispatcher — add actions per [RUNBOOK](docs/RUNBOOK.md#add-a-privileged-action) |
 | `ddns/` | stdlib-python systemd timer → keeps the apex NameSilo A record current |
+| `tools/` | client-side helpers — `panel-hosts.sh` pins the routed names to the server LAN IP in a machine's /etc/hosts (no-hairpin workaround) |
 | `docs/RUNBOOK.md` | phase-by-phase deploy + verify + hardening guide |
 | `docs/ARCHITECTURE.md` | why it's built this way, trust boundaries |
 
@@ -87,6 +88,23 @@ Never set `PANEL_DEV=1` in production — the systemd unit doesn't, and nothing 
 - **Rotate secrets**: edit `.env`, `make update` (it re-derives the panel-api + panel-ddns env files — panel-api is restarted, panel-ddns
   picks the new value up on its next tick)
 - **Logs / status**: `make logs`, `make status`
+
+## From the LAN — /etc/hosts pin (no-hairpin workaround)
+
+The router doesn't hairpin and can't be controlled, so from inside the LAN the public names
+can't get back to the server. `tools/panel-hosts.sh` pins every routed name (the `Host(...)`
+rules in `compose/traefik/dynamic/` of this checkout) to the server's LAN IP, in **this
+machine's** `/etc/hosts` only. Only the address changes, so TLS/Authelia work as usual.
+
+```bash
+# after editing a route:
+tools/panel-hosts.sh
+```
+
+Auto-sudo, idempotent; rewrites only its own marked block (backup: `/etc/hosts.panel-hosts.bak`).
+IP defaults to `10.0.0.187` (override: `PANEL_SERVER_IP=…` or positional). `--dry-run`
+previews; `--remove` unpins. Exits 1 when a `--dry-run` has pending changes, or when an
+earlier line in the file still shadows a pin (checked even on no-op re-runs).
 
 ## License
 

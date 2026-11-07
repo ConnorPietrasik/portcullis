@@ -272,6 +272,9 @@ http:
 restarts authelia whenever `configuration.yml` or `users_database.yml` content changes (both read only at container start), so no
 manual recreate step is needed.
 
+If a client machine pins the names via `tools/panel-hosts.sh` (README → From the LAN), re-run it
+there — it reads the new route from its own checkout, no pull or deploy step on that side.
+
 ## LLM fleet (Radiance instances)
 
 [Radiance](https://codeberg.org/StillDeadcode/radiance) instances on 6 shared R9700s; start/stop from the panel's Services view.

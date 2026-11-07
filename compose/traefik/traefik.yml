@@ -40,3 +40,9 @@ certificatesResolvers:
       storage: /letsencrypt/acme.json
       dnsChallenge:
         provider: namesilo
+        # Pin lego's recursive propagation checks to public resolvers. Without
+        # this they use the container's /etc/resolv.conf (127.0.0.11 → host
+        # resolver), which can serve the PREVIOUS challenge token from cache
+        # (TTL 3600) — the pre-check then waits out its whole 30-min budget
+        # even though every public resolver and authoritative NS is current.
+        resolvers: ["1.1.1.1:53", "8.8.8.8:53"]
