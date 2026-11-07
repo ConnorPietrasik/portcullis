@@ -22,7 +22,8 @@ info "Building panel-do"
 info "Installing to /usr/local/libexec/panel-do"
 # Protection is root ownership + 0755 (panel-do's self-check re-verifies both
 # on every run). No immutable flag — btrfs/overlayfs don't support it.
-sudo install -o root -g root -m 0755 "$REPO_ROOT/panel-do/panel-do" /usr/local/libexec/panel-do
+# -D: Arch-based hosts (e.g. CachyOS) don't ship /usr/local/libexec.
+sudo install -D -o root -g root -m 0755 "$REPO_ROOT/panel-do/panel-do" /usr/local/libexec/panel-do
 
 info "Installing sudoers rule (/etc/sudoers.d/panel)"
 tmp="$(mktemp)"
