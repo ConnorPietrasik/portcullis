@@ -1,0 +1,2 @@
+Get LLM servers fully set up, with some way to easily configure GPUs per container and what not
+Make the panel overview actually readable and not so ugly

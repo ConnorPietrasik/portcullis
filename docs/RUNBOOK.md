@@ -2,6 +2,8 @@
 
 Phase-by-phase deploy with a verification step after each. Each phase is independently testable — if something breaks, you know which layer.
 
+Commands are written in bash; the two blocks that assign shell variables (UFW step 3, Phase 4 verify) also show a fish variant — everything else runs unchanged in fish.
+
 On the server, `make doctor` runs every server-side check below as a single pass/fail report (read-only). (Phase 5 is by definition
 from an external network, so it stays manual.)
 
@@ -87,6 +89,11 @@ EDGE_SUBNET=$(sudo docker network inspect edge -f '{{(index .IPAM.Config 0).Subn
 sudo ufw allow from "$EDGE_SUBNET" to 172.17.0.1 port 8010 proto tcp comment 'panel-api from edge network'
 ```
 
+```fish
+set EDGE_SUBNET (sudo docker network inspect edge -f '{{(index .IPAM.Config 0).Subnet}}')
+sudo ufw allow from "$EDGE_SUBNET" to 172.17.0.1 port 8010 proto tcp comment 'panel-api from edge network'
+```
+
 **4 — confirm both rules are present, and your SSH rules unchanged** (this step only ever ADDS — it never deletes or rewrites anything else)
 
 ```bash
@@ -100,18 +107,9 @@ You should see your existing rules plus these two (an IPv6 mirror line may appea
 172.17.0.1 8010/tcp        ALLOW IN    172.18.0.0/16     ← whatever your EDGE_SUBNET was
 ```
 
-Done — continue with the rest of Phase 2, then Phases 3–4 (`make panel-do`, `make api`).
+Done — continue with the rest of Phase 2
 
-#### If `make api` or `make doctor` complains
-
-| message | fix |
-|---|---|
-| `UFW inactive` | `sudo ufw enable` (the gate checks active first) |
-| `UFW active but no 8010 rule` | step 3 |
-| `8010 rule not edge-scoped (From: Anywhere)` | delete the wrong rule, then re-run step 3 — e.g. `sudo ufw delete allow 8010`, or `sudo ufw delete allow from <old-subnet> to 172.17.0.1 port 8010 proto tcp` |
-| Docker re-allocated the edge subnet | re-derive with step 3, re-add, delete the old rule |
-
-#### Why it's set up this way (read once)
+#### Why it's set up this way
 
 - **The 8010 rule is required, not optional.** Container → host traffic hits UFW's INPUT chain, and with `default deny incoming`
 a missing rule turns every panel → API call into a 502. Scoped to the edge subnet + `172.17.0.1`, the API is unreachable from the
@@ -131,7 +129,7 @@ production on its own — watch it happen in `make logs`. If the wait times out:
 make promote   # idempotent; also safe to just re-run make deploy
 ```
 
-**Why staging first (read once):** first bring-up runs on the staging ACME directory (`.env.example` defaults `ACME_CA_SERVER` to it)
+**Why staging first:** first bring-up runs on the staging ACME directory (`.env.example` defaults `ACME_CA_SERVER` to it)
 so a broken NameSilo DNS-01 config can't burn the production 5-failures/hour rate limit. Promotion is a full re-issue: traefik stops,
 the ACME store is wiped (the staging account URI doesn't exist on prod — reusing it fails JWS verification), the config flips, traefik
 starts and issues the real cert.
@@ -177,6 +175,15 @@ curl -s "${AUTH[@]}" http://172.17.0.1:8010/api/metrics  # GPUs/CPU/RAM/disks JS
 
 # From inside the edge network — this is exactly what the panel's containers do, so a timeout here means the UFW 8010 rule is wrong:
 docker run --rm --network edge curlimages/curl -s -m 5 http://172.17.0.1:8010/api/metrics   # 401 JSON (reachable, auth enforced)
+```
+
+```fish
+# fish: same curls, fish list instead of a bash array
+set TOKEN (sudo grep '^PANEL_TOKEN=' /opt/panel/.env | cut -d= -f2)
+set -l AUTH -H "X-Panel-Token: $TOKEN" -H "Remote-User: connor" -H "Remote-Groups: admins"
+curl -s http://172.17.0.1:8010/api/health                # {"ok":true,...} — open liveness endpoint
+curl -s http://172.17.0.1:8010/api/metrics               # 401 (expected — auth enforced)
+curl -s $AUTH http://172.17.0.1:8010/api/metrics         # GPUs/CPU/RAM/disks JSON
 ```
 
 Disk dials: one per mount in `PANEL_DISK_MOUNTS` (`.env` — this server: `/`, `/home`, `/models`). A mount that isn't there
