@@ -40,9 +40,12 @@ x-llm-base: &llm-base
   # the set from the panel (edge services stay unless-stopped)
   init: true # forwards SIGTERM; the engine finishes its step and releases the cards
   logging: *default-logging
-  user: "1000:1000" # verify: id crazybot (files the server writes are its user's)
+  user: "1000:1000" # connor on omnissiah (files the server writes are its user's); re-verify: id connor
   devices: ["/dev/kfd", "/dev/dri"] # all cards visible; ROCR_VISIBLE_DEVICES pins the set
-  group_add: ["992", "44"] # verify: getent group render video
+  # Host-LOCAL gids (Arch assigns dynamically — not portable across boxes):
+  # render=987, video=983 on omnissiah. Verify: getent group render video,
+  # then confirm the device owners: stat -c '%n %u:%g' /dev/kfd /dev/dri/*
+  group_add: ["987", "983"]
   security_opt:
     # radiance's io_uring reads + ROCm's NUMA binding (mbind/set_mempolicy)
     # are refused by Docker's default seccomp. Both are in the UPSTREAM
