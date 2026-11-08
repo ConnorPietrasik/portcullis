@@ -68,10 +68,19 @@ export function uptime(s: number | null | undefined): string {
   return `${m}m`
 }
 
-export function relTime(now: number, then: number | null): string {
+/**
+ * "2s ago" style freshness readout. `freshMs` is how recent a sample still
+ * counts as "now" — the poll interval plus headroom, so a healthy box reads
+ * "now" instead of flapping "now / 2s ago" on every poll. Seconds then count
+ * up by whole seconds (floor, so the text changes once per second, never
+ * twice) once the data is actually late.
+ */
+export function relTime(now: number, then: number | null, freshMs = 2000): string {
   if (then == null) return 'never'
-  const s = Math.max(0, Math.round((now - then) / 1000))
-  if (s < 2) return 'now'
+  const ms = now - then
+  if (ms <= freshMs) return 'now'
+  // ≥ 1: a late sample that is under a second old reads "1s ago", never "0s ago"
+  const s = Math.max(1, Math.floor(ms / 1000))
   if (s < 60) return `${s}s ago`
   return `${Math.floor(s / 60)}m ago`
 }

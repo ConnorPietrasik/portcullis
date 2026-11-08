@@ -7,7 +7,6 @@
 // that colour means "this needs you" (amber/red) or "just a reading"
 // (accent/cyan). Anything else is a rainbow you have to decode.
 
-import { useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { axis, clamp01 } from './fmt'
 import type { Tone } from './fmt'
@@ -76,9 +75,15 @@ export interface Series {
 }
 
 /**
- * Pixel-exact SVG (measured, not stretched) so strokes stay 1.5 px and the
- * "now" dot stays round. Nulls are gaps — a missing reading never becomes a
- * dramatic drop to zero.
+ * A series that always spans whatever width it is given: x is drawn in
+ * percentages, y in pixels (the height is fixed), and the svg is width:100%
+ * with no viewBox. Nothing is measured, so nothing can feed back into the
+ * parent's content-based sizing — a measured, pixel-sized <svg> used to be
+ * the engine of a runaway: chart measured container, svg rendered that wide,
+ * the grid track grew to the svg's intrinsic width, the chart re-measured
+ * wider, and the card ended up ~1800 px wide inside a 696 px slot.
+ * No scaling means strokes stay 1.6 px and the "now" dot stays a circle.
+ * Nulls are gaps — a missing reading never becomes a dramatic drop to zero.
  */
 export function Chart({
   series,
@@ -97,12 +102,12 @@ export function Chart({
   dot?: boolean
   padTop?: number
 }) {
-  const [ref, w] = useWidth<HTMLDivElement>()
   const h = height
   const usable = Math.max(1, h - padTop * 2)
   const span = max - min || 1
+  // ≥ 2 so x() never divides by zero (single reading → one point at the left edge)
   const n = Math.max(...series.map((s) => s.values.length), 2)
-  const x = (i: number) => (n <= 1 ? 0 : (i / (n - 1)) * w)
+  const x = (i: number) => (i / (n - 1)) * 100
   const y = (v: number) => padTop + usable - ((Math.max(min, Math.min(max, v)) - min) / span) * usable
 
   const paths = series.map((s) => {
@@ -113,45 +118,43 @@ export function Chart({
         open = false
         return
       }
-      d += `${open ? 'L' : 'M'}${x(i).toFixed(2)} ${y(v).toFixed(2)}`
+      d += `${open ? 'L' : 'M'}${x(i).toFixed(3)}% ${y(v).toFixed(2)}`
       open = true
     })
     const first = s.values.findIndex((v) => v != null)
     const lastIdx = lastIndexOf(s.values)
     const area =
       s.fill && first >= 0 && lastIdx > first
-        ? `${d}L${x(lastIdx).toFixed(2)} ${h}L${x(first).toFixed(2)} ${h}Z`
+        ? `${d}L${x(lastIdx).toFixed(3)}% ${h}L${x(first).toFixed(3)}% ${h}Z`
         : ''
-    let dotAt: [number, number] | null = null
-    if (lastIdx >= 0 && s.values[lastIdx] != null) dotAt = [x(lastIdx), y(s.values[lastIdx] as number)]
+    let dotAt: [string, string] | null = null
+    if (lastIdx >= 0 && s.values[lastIdx] != null) dotAt = [`${x(lastIdx).toFixed(3)}%`, y(s.values[lastIdx] as number).toFixed(2)]
     return { d, area, dotAt, s }
   })
 
   return (
-    <div className="chart" ref={ref} style={{ height: h }}>
-      {w > 8 && (
-        <svg width={w} height={h} role="img">
-          {grid.filter((g) => g > min && g < max).map((g) => (
-            <line key={g} x1={0} x2={w} y1={y(g)} y2={y(g)} className="grid" />
-          ))}
-          {paths.map(({ d, area, dotAt, s }, i) => (
-            <g key={i}>
-              {area && <path d={area} fill={TONE_COLOR[s.tone]} fillOpacity={0.12} stroke="none" />}
-              <path
-                d={d}
-                fill="none"
-                stroke={TONE_COLOR[s.tone]}
-                strokeWidth={1.6}
-                strokeLinejoin="round"
-                strokeLinecap="round"
-                strokeDasharray={s.dashed ? '3 3' : undefined}
-              />
-              {dot && dotAt && <circle cx={dotAt[0]} cy={dotAt[1]} r={2.4} fill={TONE_COLOR[s.tone]} />}
-            </g>
-          ))}
-          {paths.every((p) => !p.d) && <line x1={0} x2={w} y1={h / 2} y2={h / 2} className="grid" strokeDasharray="2 4" />}
-        </svg>
-      )}
+    <div className="chart" style={{ height: h }}>
+      <svg width="100%" height={h} role="img">
+        {grid.filter((g) => g > min && g < max).map((g) => (
+          <line key={g} x1="0" x2="100%" y1={y(g)} y2={y(g)} className="grid" />
+        ))}
+        {paths.map(({ d, area, dotAt, s }, i) => (
+          <g key={i}>
+            {area && <path d={area} fill={TONE_COLOR[s.tone]} fillOpacity={0.12} stroke="none" />}
+            <path
+              d={d}
+              fill="none"
+              stroke={TONE_COLOR[s.tone]}
+              strokeWidth={1.6}
+              strokeLinejoin="round"
+              strokeLinecap="round"
+              strokeDasharray={s.dashed ? '3 3' : undefined}
+            />
+            {dot && dotAt && <circle cx={dotAt[0]} cy={dotAt[1]} r={2.4} fill={TONE_COLOR[s.tone]} />}
+          </g>
+        ))}
+        {paths.every((p) => !p.d) && <line x1="0" x2="100%" y1={h / 2} y2={h / 2} className="grid" strokeDasharray="2 4" />}
+      </svg>
     </div>
   )
 }
@@ -159,22 +162,6 @@ export function Chart({
 function lastIndexOf(values: Num[]): number {
   for (let i = values.length - 1; i >= 0; i--) if (values[i] != null) return i
   return -1
-}
-
-/** Element width, live — charts are drawn in real pixels instead of a stretched viewBox. */
-function useWidth<T extends HTMLElement>() {
-  const ref = useRef<T | null>(null)
-  const [w, setW] = useState(0)
-  useEffect(() => {
-    const el = ref.current
-    if (!el) return
-    const measure = () => setW(el.clientWidth)
-    measure()
-    const ro = new ResizeObserver(measure)
-    ro.observe(el)
-    return () => ro.disconnect()
-  }, [])
-  return [ref, w] as const
 }
 
 export function Pill({ tone = 'muted', children, title }: { tone?: Tone; children: ReactNode; title?: string }) {

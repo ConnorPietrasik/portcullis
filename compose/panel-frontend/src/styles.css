@@ -424,6 +424,9 @@ pre.out.err {
   border-right: 1px solid var(--line-soft);
   min-width: 0;
   display: grid;
+  /* explicit, non-content-sized column: an implicit `auto` column grew to the
+     charts' intrinsic width and pushed the header trend into the next tile */
+  grid-template-columns: minmax(0, 1fr);
   gap: 5px;
   align-content: start;
 }
@@ -463,7 +466,7 @@ pre.out.err {
 .hero .foot {
   display: flex;
   align-items: baseline;
-  font-size: 11.5px;
+  font-size: 11px;
   color: var(--muted);
   min-width: 0;
   margin-top: auto; /* every tile's small print sits on the same line */
@@ -650,9 +653,12 @@ pre.out.err {
 .chart {
   position: relative;
   width: 100%;
+  min-width: 0;
 }
 
 .chart svg {
+  /* width/height come from the svg attributes, not here: the parent .chart div
+     is exactly h px tall, so a height:100% here would say the same thing twice */
   display: block;
   overflow: visible;
 }
@@ -675,6 +681,10 @@ pre.out.err {
   border-radius: 12px;
   padding: 12px 14px 14px;
   display: grid;
+  /* the item must never overflow its .gpus track, and the column must never
+     be sized by its content — the content is what used to eat the neighbour */
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr);
   gap: 12px;
   align-content: start;
 }
@@ -747,7 +757,9 @@ pre.out.err {
   border: 1px solid var(--line-soft);
   border-radius: 10px;
   padding: 9px 11px 10px;
+  min-width: 0;
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 6px;
   align-content: start;
 }
@@ -769,9 +781,13 @@ pre.out.err {
   font-size: 11px;
 }
 
-.gpu .trend {
+/* the 5m section inside a card: header over trace. (Must not be `.trend` —
+   that class is the little trend mark, and a grid in its place splits the
+   arrow off from its number.) */
+.gpu-trend {
   display: grid;
   gap: 4px;
+  min-width: 0;
 }
 
 .trendhead {
@@ -815,7 +831,9 @@ pre.out.err {
 
 .rows {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  /* one mrow needs ≈291 px (label 76 + spark 52 + spark min 50 + value 86 + gaps);
+     a 250 px track let it overflow and print its value on the next label */
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
   gap: 2px 22px;
 }
 
@@ -896,6 +914,7 @@ pre.out.err {
 
 .disk {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 5px;
   padding: 9px 0;
   border-bottom: 1px solid var(--line-soft);

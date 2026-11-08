@@ -117,7 +117,7 @@ export default function Overview({ intervalMs }: { intervalMs: number }) {
             <i />
             {error ? 'API error' : stale ? 'stale' : 'live'}
           </span>
-          <span className="ago">{relTime(now, last)}</span>
+          <span className="ago">{relTime(now, last, intervalMs * 1.5)}</span>
           <span className="ago">up {uptime(data?.uptime_s)}</span>
         </span>
       </div>
@@ -352,9 +352,11 @@ function TileNet({ net, hist, windowN, spanLabel }: { net: NonNullable<Metrics['
         max={top * 1.15}
         height={26}
       />
-      <div className="foot" title={ifaces}>
+      {/* the chart has no axis, so its peak is the only scale it carries — it
+          leads the line, and the (long) interface names ellipsize after it */}
+      <div className="foot" title={`${ifaces} — ${spanLabel} peak ${bitsPerSec(top)}`}>
         <span className="f">
-          {(net.ifaces ?? []).slice(0, 2).join(' ') || '—'} · {spanLabel} peak {bitsPerSec(top)}
+          {spanLabel} peak {bitsPerSec(top)} · {(net.ifaces ?? []).slice(0, 2).join(' ') || '—'}
         </span>
       </div>
     </Tile>
@@ -413,7 +415,7 @@ function GpuCard({ gpu, hist, windowN, intervalS, spanLabel }: { gpu: Gpu; hist:
           <div className="foot">
             <TrendMark {...trend(utilS, intervalS, 0, '%')} />
             <span className="f">
-              avg {num(avg(utilS))}% · max {num(spread(utilS).max)}% · {spanLabel}
+              avg {num(avg(utilS))}% · max {num(spread(utilS).max)}%
             </span>
           </div>
         </div>
@@ -445,7 +447,7 @@ function GpuCard({ gpu, hist, windowN, intervalS, spanLabel }: { gpu: Gpu; hist:
         </div>
       </div>
 
-      <div className="trend">
+      <div className="gpu-trend">
         <div className="trendhead">
           <span className="k">{spanLabel} trend</span>
           <span className="legend">
