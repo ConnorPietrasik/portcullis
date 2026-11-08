@@ -43,6 +43,20 @@ https_check() {
 
 section() { printf '\n%s\n' "$*"; }
 
+# Project name of the deployed stack (compose derives it from the project
+# directory /opt/panel) — compose sets it as a label on every container it
+# creates. The running/health checks below read those LABELS instead of
+# `docker compose ps`: that must interpolate the deployed compose file first,
+# so a .env missing a required var makes the whole command fail and every
+# healthy container masquerades as "not running" (the 4x phantom FAIL after a
+# half-synced update). `docker ps` needs no config at all.
+STACK_PROJECT=panel
+stack_running_services_ids() { # service|id, one per running container
+  sudo docker ps --filter "label=com.docker.compose.project=$STACK_PROJECT" \
+    --format '{{.Label "com.docker.compose.service"}}|{{.ID}}' 2>/dev/null || true
+}
+stack_running_services() { stack_running_services_ids | cut -d'|' -f1; }
+
 # ── config ───────────────────────────────────────────────────────────────────
 section "config (.env)"
 REPO_ROOT="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
@@ -68,6 +82,36 @@ else
   skip ".env not found"; hint "make secrets (RUNBOOK Phase 1)"
 fi
 
+# ── configs render ───────────────────────────────────────────────────────────
+# Both compose trees must interpolate with their .env BEFORE anything runs —
+# a required var a new block needs but .env lacks (a ${LLM_API_KEY:?...} added
+# with a new llm-* block after git pull) would otherwise surface only at
+# pull/up time, after the configs are already half-synced. `config -q`
+# renders the model without touching any container.
+section "configs render"
+if [[ -f "$REPO_ROOT/.env" && -f "$REPO_ROOT/compose/docker-compose.yml" ]]; then
+  if render_out="$(sudo docker compose --env-file "$REPO_ROOT/.env" \
+      -f "$REPO_ROOT/compose/docker-compose.yml" config -q 2>&1)"; then
+    ok "repo compose renders with repo .env (make update preflight)"
+  else
+    bad "repo compose does NOT render with repo .env — make update will be refused"
+    hint "$(head -1 <<<"$render_out") → add the missing key(s) to .env (see .env.example), then re-run"
+  fi
+else
+  skip "repo compose render (.env or compose/ missing — fresh clone: make secrets)"
+fi
+if [[ -f /opt/panel/docker-compose.yml ]]; then
+  if render_out="$(sudo docker compose --project-directory /opt/panel \
+      -f /opt/panel/docker-compose.yml config -q 2>&1)"; then
+    ok "deployed compose renders with /opt/panel/.env"
+  else
+    bad "deployed compose does NOT render with /opt/panel/.env (half-synced state?)"
+    hint "$(head -1 <<<"$render_out") → re-run: make deploy (re-syncs the repo .env; ungated — make update refuses while this check is red) — or make rollback if the last snapshot was known-good"
+  fi
+else
+  skip "deployed compose render (no /opt/panel — make deploy, RUNBOOK Phase 2)"
+fi
+
 # ── edge stack ───────────────────────────────────────────────────────────────
 section "edge stack (docker)"
 if [[ -d /opt/panel ]]; then
@@ -80,7 +124,7 @@ if [[ -d /opt/panel ]]; then
   else
     bad "network: edge missing — `docker compose up -d` will refuse to start"; hint "sudo docker network create edge (make deploy / make stack recreate it automatically)"
   fi
-  running="$(sudo docker compose --project-directory /opt/panel ps --services --status=running 2>/dev/null || true)"
+  running="$(stack_running_services)"
   for svc in traefik authelia panel-web portfolio; do
     if grep -qx "$svc" <<<"$running"; then
       ok "container: $svc running"
@@ -89,24 +133,15 @@ if [[ -d /opt/panel ]]; then
     fi
   done
 
-  # Health status (only containers defining a compose healthcheck report one;
-  # newer compose versions may also omit the field entirely).
-  health_out="$(sudo docker compose --project-directory /opt/panel ps --format json 2>/dev/null \
-    | python3 -c '
-import json, sys
-text = sys.stdin.read().strip()
-if not text:
-    sys.exit(0)
-try:
-    data = json.loads(text)  # newer compose: one JSON array
-    if not isinstance(data, list):
-        data = [data]
-except json.JSONDecodeError:
-    data = [json.loads(line) for line in text.splitlines() if line.strip()]  # JSON lines
-for x in data:
-    if isinstance(x, dict):
-        print(x.get("Service", "?") + "\t" + (x.get("Health") or "none"))
-' 2>/dev/null || true)"
+  # Health status per running container via `docker inspect` (same
+  # config-independence as the running check above — `compose ps` would need
+  # to interpolate the deployed file). Only containers defining a healthcheck
+  # report one; the rest render as "none" → skipped below.
+  health_out="$(stack_running_services_ids | while IFS='|' read -r svc id; do
+    [[ -n "$svc" ]] || continue
+    h="$(sudo docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$id" 2>/dev/null || echo none)"
+    printf '%s\t%s\n' "$svc" "$h"
+  done || true)"
   if [[ -n "$health_out" ]]; then
     while IFS=$'\t' read -r svc h; do
       case "$h" in
@@ -306,8 +341,10 @@ else
 fi
 # The REAL data path: edge container → host API. The host curls above pass
 # even when traefik's route 502s (wrong bind IP or missing UFW rule).
-if [[ -d /opt/panel ]] && sudo docker compose --project-directory /opt/panel ps --services --status=running 2>/dev/null | grep -qx panel-web; then
-  edge_health="$(sudo docker compose --project-directory /opt/panel exec -T panel-web \
+panel_web_id="$(sudo docker ps --filter "label=com.docker.compose.project=$STACK_PROJECT" \
+  --filter 'label=com.docker.compose.service=panel-web' --format '{{.ID}}' 2>/dev/null | head -1 || true)"
+if [[ -d /opt/panel && -n "$panel_web_id" ]]; then
+  edge_health="$(sudo docker exec -T "$panel_web_id" \
     wget -qO- --timeout=5 http://172.17.0.1:8010/api/health 2>/dev/null || true)"
   if grep -q '"ok":true' <<<"$edge_health"; then
     ok "edge container → 172.17.0.1:8010 reachable (real API path)"

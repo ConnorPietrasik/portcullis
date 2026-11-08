@@ -227,8 +227,8 @@ frontend) **and** floats everything within its declared *line*. It requires a gr
 touching anything, and auto-rolls-back on any failure — updates are routine and safe by construction:
 
 ```bash
-make update      # doctor precondition (aborts before touching anything if not green)
-                 # → snapshot everything (image IDs, deployed configs, exact panel-api copy, npm files)
+make update      # preflight (repo compose must render with repo .env) + doctor precondition —
+                 # both abort before touching anything → snapshot everything (image IDs, deployed configs, exact panel-api copy, npm files)
                  # → npm bump (in-repo, within ranges) → sync configs from the repo
                  # → re-pin the server's /etc/hosts (tools/panel-hosts.sh — the route set may have changed)
                  # → pull → rebuild (bases pulled)
@@ -274,6 +274,9 @@ happens through a deliberate edit of that component's line:
 
 Mechanics in `setup/08-update.sh` (shared helpers in `setup/common.sh`):
 
+- **Preflight** = `docker compose config -q` renders the repo's compose against the repo's `.env` before
+  anything is touched (a var a new block needs but `.env` lacks aborts the run pre-snapshot/pre-sync;
+  `make deploy` gates on it too, and `make doctor` checks both trees).
 - **Snapshot** = `/opt/panel/.update-snapshot-<ts>` (state in `/opt/panel/.update-state`): the exact *image IDs* of what is running
   (tags move, IDs don't), re-tagged `portcullis-rollback/<svc>:<ts>`; **the deployed config tree** (`/opt/panel`: docker-compose.yml,
   traefik/, portfolio/, the authelia configs, panel-frontend, `.env`, the reduced env files — a tarball; runtime data like

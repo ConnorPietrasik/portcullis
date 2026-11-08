@@ -6,6 +6,16 @@ source "$(dirname "$(realpath "$0")")/common.sh"
 need docker
 load_env
 
+# Preflight: same render check as make update's — a required var .env lacks
+# must be caught BEFORE the network is created and the configs copied, not
+# at `up -d` after /opt/panel is half-populated.
+if ! preflight_out="$(sudo docker compose --env-file "$REPO_ROOT/.env" \
+    -f "$REPO_ROOT/compose/docker-compose.yml" config -q 2>&1)"; then
+  die "preflight: repo compose does not render with the repo .env — nothing was touched
+$preflight_out
+add the missing key(s) to .env (see .env.example), then re-run: make deploy"
+fi
+
 TARGET=/opt/panel
 
 if [[ -f "$TARGET/docker-compose.yml" ]]; then

@@ -33,6 +33,19 @@ need python3
 load_env
 
 sudo -v
+# Preflight: the repo's compose must render with the repo's .env BEFORE any
+# state is touched. A required var a new block needs but .env lacks (e.g. a
+# ${LLM_API_KEY:?...} in a freshly pulled llm-* block) would otherwise
+# surface at step 4 — AFTER the snapshot, the npm bump, and the config sync
+# of step 3 already replaced the deployed configs: /opt/panel left
+# half-synced (new compose, old .env). Read-only; aborts before the lock, the
+# snapshot GC, and the doctor. `make doctor` runs the same render check.
+if ! preflight_out="$(sudo docker compose --env-file "$REPO_ROOT/.env" \
+    -f "$REPO_ROOT/compose/docker-compose.yml" config -q 2>&1)"; then
+  die "preflight: repo compose does not render with the repo .env — nothing was touched
+$preflight_out
+add the missing key(s) to .env (see .env.example), then re-run: make update"
+fi
 update_acquire_lock
 update_gc_old_snapshots
 

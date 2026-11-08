@@ -1,3 +1,4 @@
-Get LLM servers fully set up, with some way to easily configure GPUs per container and what not
+Add a generic llm.pietrasik.top that can be set in the admin panel to point to specific endpoints in order, going down the list until it finds one that's up (so I can set things that don't need to use multiple at once to just use the best one available)
+Some way to easily configure GPUs per container and what not
 Make the panel overview actually readable and not so ugly
 Make an actual portfolio site
