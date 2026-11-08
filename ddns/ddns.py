@@ -60,7 +60,10 @@ def public_ip() -> str:
     """Current public IPv4. OpenDNS resolver first (no web service involved)."""
     try:
         out = subprocess.run(
-            ["dig", "+short", "myip.opendns.com", "@resolver1.opendns.com"],
+            # +v4: resolver1 is dual-stack and address selection (RFC 3484)
+            # may try its v6 address first — keep the echo on IPv4 so broken
+            # v6 egress can't burn the timeout before falling back to v4.
+            ["dig", "+short", "+v4", "myip.opendns.com", "@resolver1.opendns.com"],
             capture_output=True, text=True, timeout=15,
         ).stdout.split()
         for candidate in out:

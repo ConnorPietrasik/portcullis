@@ -137,12 +137,14 @@ section "dns"
 # zone): an empty answer alone can't say whether the NS said "no record" or
 # was simply unreachable, and that distinction is FAIL vs skip. rc 0 = an
 # authoritative NS answered (an empty result is a definite no-record);
-# rc 9 = no NS reachable.
+# rc 9 = no NS reachable. +v4: these names are dual-stack and address
+# selection (RFC 3484) may try a v6 address first — on a box with broken v6
+# egress that burns the full timeout per address before falling back.
 ns_query() {
   local out ns
   for ns in ns1.dnsowl.com ns2.dnsowl.com ns3.dnsowl.com; do
-    dig +short +time=3 +tries=1 SOA pietrasik.top "@$ns" >/dev/null 2>&1 || continue
-    out="$(dig +short +time=3 +tries=1 "$1" "@$ns" 2>/dev/null)"
+    dig +short +v4 +time=3 +tries=1 SOA pietrasik.top "@$ns" >/dev/null 2>&1 || continue
+    out="$(dig +short +v4 +time=3 +tries=1 "$1" "@$ns" 2>/dev/null)"
     printf '%s' "$out"
     return 0
   done
@@ -157,7 +159,7 @@ if [[ -n "$apex" ]]; then
     apex_ans="$(ns_query pietrasik.top)"; ns_ok=$?
     # OpenDNS is kept only for the public-IP echo (our egress address) — not
     # part of the zone.
-    pub="$(dig +short myip.opendns.com @resolver1.opendns.com 2>/dev/null | grep -E '^[0-9.]+$' | head -1)"
+    pub="$(dig +short +v4 myip.opendns.com @resolver1.opendns.com 2>/dev/null | grep -E '^[0-9.]+$' | head -1)"
     pub_apex="$(grep -m1 -E '^[0-9.]+$' <<<"$apex_ans" || true)"
     if (( ns_ok )); then
       skip "published-zone check skipped (none of ns1..ns3.dnsowl.com reachable)"
@@ -183,13 +185,31 @@ for h in auth.pietrasik.top panel.pietrasik.top; do
   if (( have_dig )); then
     ans="$(ns_query "$h")"; rc=$?
     if (( ! rc )); then
-      # +short prints the CNAME chain then the final record; a line containing
-      # a digit is an IP (a CNAME target like 'pietrasik.top.' has none).
+      # +short prints only the Answer section, and dig does NOT follow CNAMEs.
+      # A recursive resolver chases the chain server-side (why local `dig`
+      # shows the final A), but an authoritative NS answers "A auth" with the
+      # CNAME RR alone — so walk the chain ourselves: re-query the last line
+      # until it is an IP (bounded, so a CNAME cycle can't spin). A line with
+      # a digit in it is an IP (a CNAME target like 'pietrasik.top.' has none).
+      chained=0  # 1 once we actually had to re-query a CNAME target
+      for _ in 1 2 3 4 5 6 7 8; do
+        grep -qE '^[0-9a-fA-F:]*[0-9][0-9a-fA-F:.]*$' <<<"$ans" && break
+        chained=1
+        next="$(tail -1 <<<"$ans")"
+        [[ -z "$next" ]] && break
+        more="$(ns_query "${next%.}")" || break
+        [[ -z "$more" ]] && break
+        ans+=$'\n'"$more"
+      done
       if grep -qE '^[0-9a-fA-F:]*[0-9][0-9a-fA-F:.]*$' <<<"$ans"; then
-        ok "$h resolves publicly (wildcard CNAME chain)"
-        continue
+        if (( chained )); then
+          ok "$h resolves publicly (wildcard CNAME chain)"
+        else
+          ok "$h resolves publicly (direct A record)"
+        fi
+      else
+        bad "$h does not resolve publicly"; hint "check the * CNAME → pietrasik.top at NameSilo (Phase 0)"
       fi
-      bad "$h does not resolve publicly"; hint "check the * CNAME → pietrasik.top at NameSilo (Phase 0)"
       continue
     fi
   fi
