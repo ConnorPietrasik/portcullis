@@ -162,6 +162,7 @@ services:
   #     ROCR_VISIBLE_DEVICES: "0,1,2,3" # cards by index (fixed 0-5)
   #     RADIANCE_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env} # read by --api-key-env,
   #                                     # so the key never sits in argv (ps / docker inspect)
+  #     RADIANCE_LOG: "warn" # per-request INFO lines (tok/s, cache, ttft) are chatty — radiance docs §6.5
   #   command: >
   #     --model /models/qwen3.8-27b-fp8.rad
   #     --host 0.0.0.0 --port 8000 --api-key-env RADIANCE_API_KEY
@@ -176,6 +177,7 @@ services:
   #   environment:
   #     ROCR_VISIBLE_DEVICES: "0,1,2,3" # same four cards as llm-27b — not at the same time
   #     RADIANCE_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env}
+  #     RADIANCE_LOG: "warn"
   #   command: >
   #     --model /models/qwen3.8-next-flash-fp8-iq4r-moe.rad
   #     --host 0.0.0.0 --port 8000 --api-key-env RADIANCE_API_KEY

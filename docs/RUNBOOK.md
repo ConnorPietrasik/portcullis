@@ -392,6 +392,12 @@ ad hoc (one at a time), delete the clone — its flags belong to the trial, not 
 **Key:** one shared `LLM_API_KEY` for all instances (a key authorizes LLM use, not one instance). Rotate = edit `.env` +
 `make update` (radiance reads it at startup).
 
+**Logs:** every instance sets `RADIANCE_LOG: warn` in its own `environment` (it can't live in `x-llm-base` — YAML `<<:`
+merges top level only, and an instance's `environment` replaces the base's whole map). Per-request INFO lines (token
+counts, cache, tok/s, ttft) are the chattiest thing on the box and carry nothing the API's timings/metrics don't; `warn`
+keeps errors + ROCm warnings. Raise one instance to `info` (or `debug`, `-v`) when debugging it. json-file rotation caps each
+instance at ~30 MB regardless (`x-logging`).
+
 **Updates:** a config-only update recreates nothing. When an update DOES recreate an instance (radiance moved on `latest`, block
 edited), its model reload (~1 min) sits inside the 5m healthcheck start_period, and the default 600s budget
 (`UPDATE_HEALTH_TIMEOUT`) covers both the update gate and the rollback re-gate — they share it — raise it only for a much slower
@@ -423,12 +429,14 @@ check:
 
 ## Hardening checklist
 
-**Do once** (one-time host setup — run any time after Phase 2):
+**Do once** (one-time host setup — `make doctor` verifies both and prints the exact commands if
+either is missing; on CachyOS both are distro defaults, so this is usually a no-op):
 
-```bash
-sudo mkdir -p /var/log/journal && sudo systemctl restart systemd-journald   # persistent journald — panel-do's audit trail lives there
-sudo systemctl enable --now fstrim.timer                                   # weekly SSD trim (HDDs don't need it)
-```
+- **persistent journald** — panel-do's audit trail lives there; stock Arch is volatile by default.
+  Note CachyOS caps the journal at 50 MB (`SystemMaxUse` in
+  `/usr/lib/systemd/journald.conf.d/00-journal-size.conf`) — hours of a busy box, not days; bump
+  it via an `/etc/systemd/journald.conf.d/` drop-in if the audit trail must outlast that.
+- **fstrim.timer** — weekly SSD trim (HDDs don't need it).
 
 **Keep true** (invariants — `make doctor` checks what it can; the rest holds by review):
 

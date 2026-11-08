@@ -445,6 +445,15 @@ else
   hint "sudo mkdir -p /var/log/journal && sudo systemctl restart systemd-journald"
 fi
 
+# ── host maintenance ─────────────────────────────────────────────────────────
+# CachyOS ships fstrim.timer enabled — this is the cross-distro catch-all.
+section "host maintenance"
+if systemctl is-active --quiet fstrim.timer 2>/dev/null; then
+  ok "fstrim.timer active (weekly SSD trim)"
+else
+  warn "fstrim.timer not active — SSDs skip weekly TRIM"; hint "sudo systemctl enable --now fstrim.timer (RUNBOOK → Hardening)"
+fi
+
 # ── summary ──────────────────────────────────────────────────────────────────
 section "summary"
 printf '  %d pass, %d fail, %d warn, %d skip\n' "$pass" "$fail" "$warnn" "$skipn"
