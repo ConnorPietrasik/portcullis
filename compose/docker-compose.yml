@@ -40,7 +40,7 @@ x-llm-base: &llm-base
   # the set from the panel (edge services stay unless-stopped)
   init: true # forwards SIGTERM; the engine finishes its step and releases the cards
   logging: *default-logging
-  user: "1000:1000" # connor on omnissiah (files the server writes are its user's); re-verify: id connor
+  user: "1000:1000"
   devices: ["/dev/kfd", "/dev/dri"] # all cards visible; ROCR_VISIBLE_DEVICES pins the set
   # Host-LOCAL gids (Arch assigns dynamically — not portable across boxes):
   # render=987, video=983 on omnissiah. Verify: getent group render video,
@@ -156,21 +156,21 @@ services:
   #
   # ── the fleet — uncomment to activate, then: make update
   #
-  # llm-27b:
-  #   <<: *llm-base
-  #   environment:
-  #     ROCR_VISIBLE_DEVICES: "0,1,2,3" # cards by index (fixed 0-5)
-  #     RADIANCE_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env} # read by --api-key-env,
-  #                                     # so the key never sits in argv (ps / docker inspect)
-  #     RADIANCE_LOG: "warn" # per-request INFO lines (tok/s, cache, ttft) are chatty — radiance docs §6.5
-  #   command: >
-  #     --model /models/qwen3.8-27b-fp8.rad
-  #     --host 0.0.0.0 --port 8000 --api-key-env RADIANCE_API_KEY
-  #     --tp 4 --max-num-seqs 16 --max-model-len 250000
-  #     --gpu-headroom-mib 96 --prefix-cache-mib 65536 --checkpoint-policy tip-only
-  #     --num-speculative-tokens 3 --max-num-batched-tokens 2048
-  #     --checkpoint-slots auto
-  #   labels: ["panel.manage=Qwen 27B FP8 · cards 0-3"] # Services view name
+  llm-27b:
+    <<: *llm-base
+    environment:
+      ROCR_VISIBLE_DEVICES: "0,1,2,3" # cards by index (fixed 0-5)
+      RADIANCE_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env} # read by --api-key-env, so the key
+      # never sits in argv (ps / docker inspect)
+      RADIANCE_LOG: "warn" # per-request INFO lines (tok/s, cache, ttft) are chatty — radiance docs §6.5
+    command: >
+      --model /models/qwen3.8-27b-fp8.rad
+      --host 0.0.0.0 --port 8000 --api-key-env RADIANCE_API_KEY
+      --tp 4 --max-num-seqs 16 --max-model-len 250000
+      --gpu-headroom-mib 96 --prefix-cache-mib 65536 --checkpoint-policy tip-only
+      --num-speculative-tokens 3 --max-num-batched-tokens 2048
+      --checkpoint-slots auto
+    labels: ["panel.manage=Qwen 27B FP8 · cards 0-3"] # Services view name
   #
   # llm-flashnext:
   #   <<: *llm-base
