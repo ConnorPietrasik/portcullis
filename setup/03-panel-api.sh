@@ -32,6 +32,20 @@ fi
 if grep -q 'Anywhere' <<<"$rules_8010"; then
   die "8010 rule not edge-scoped (From: Anywhere) — the API would be WAN-reachable; re-add it per RUNBOOK → UFW, then re-run"
 fi
+# A scoped rule exists — but scoped to the LIVE edge subnet? `edge` is
+# auto-subnetted at creation (RUNBOOK: derive, don't hardcode — a fresh
+# daemon picks 172.18.0.0/16, a busy one something else); a rule for a stale
+# subnet binds the API fine but 502s every panel → API call until doctor
+# catches it. From column = last field after the trailing "# comment"; a (v6)
+# mirror line carries the same IPv4 From. Skipped when the subnet can't be
+# derived (docker/network absent — make deploy runs first anyway).
+edge_subnet="$(sudo docker network inspect edge -f '{{(index .IPAM.Config 0).Subnet}}' 2>/dev/null || true)"
+if [[ -n "$edge_subnet" ]]; then
+  rule_sources="$(sed -E 's/#.*$//; s/\(v6\)//' <<<"$rules_8010" | awk 'NF {print $NF}' | sort -u)"
+  if ! grep -qxF "$edge_subnet" <<<"$rule_sources"; then
+    die "8010 rule scoped to $(paste -sd, <<<"$rule_sources") but the live edge network is $edge_subnet — binding now would 502 every panel → API call; re-add the rule with the live subnet (RUNBOOK → UFW), then re-run"
+  fi
+fi
 info "UFW active with the edge-scoped 8010 rule — safe to bind 172.17.0.1:8010"
 
 ensure_panel_user

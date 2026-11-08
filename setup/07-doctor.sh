@@ -344,12 +344,23 @@ fi
 panel_web_id="$(sudo docker ps --filter "label=com.docker.compose.project=$STACK_PROJECT" \
   --filter 'label=com.docker.compose.service=panel-web' --format '{{.ID}}' 2>/dev/null | head -1 || true)"
 if [[ -d /opt/panel && -n "$panel_web_id" ]]; then
+  # Probe with busybox-wget-compatible options ONLY: panel-web is
+  # nginx:stable-alpine, whose wget has no --timeout (GNU-only). Passing it
+  # makes the probe abort at argument parsing (usage on stderr, no request
+  # ever made, stdout empty) — a permanent false FAIL with the network
+  # perfectly healthy. Busybox wget also has no connect timeout (-T only
+  # caps reads), so a genuinely DROPped port would hang the doctor forever:
+  # cap the whole probe with the timeout applet. 2>&1 so a real failure
+  # (refused/no route) surfaces in the hint instead of masquerading as an
+  # empty response.
   edge_health="$(sudo docker exec -T "$panel_web_id" \
-    wget -qO- --timeout=5 http://172.17.0.1:8010/api/health 2>/dev/null || true)"
+    timeout 5 wget -q -O - http://172.17.0.1:8010/api/health 2>&1 || true)"
   if grep -q '"ok":true' <<<"$edge_health"; then
     ok "edge container → 172.17.0.1:8010 reachable (real API path)"
   else
-    bad "edge container cannot reach 172.17.0.1:8010 — panel /api/* will 502"; hint "UFW 8010 rule for the edge subnet (RUNBOOK → UFW); bind: ss -tln | grep 8010"
+    bad "edge container cannot reach 172.17.0.1:8010 — panel /api/* will 502"
+    probe_err="$(head -1 <<<"$edge_health")"
+    hint "${probe_err:+$probe_err | }compare the 8010 rule's From with the live subnet: sudo docker network inspect edge -f '{{(index .IPAM.Config 0).Subnet}}' (stale scope → RUNBOOK → UFW); bind: ss -tln | grep 8010"
   fi
 else
   skip "edge → API path (panel-web not running)"
@@ -451,6 +462,21 @@ if command -v ufw >/dev/null 2>&1; then
       bad "no 8010 rule — container→host API calls will 502"; hint "RUNBOOK → UFW: derive the edge subnet and add the rule (required)"
     elif grep -q 'Anywhere' <<<"$rules_8010"; then
       bad "8010 rule not edge-scoped (From: Anywhere) — API is WAN-reachable"; hint "RUNBOOK → UFW: re-add it scoped to the edge subnet"
+    elif edge_subnet="$(sudo docker network inspect edge -f '{{(index .IPAM.Config 0).Subnet}}' 2>/dev/null || true)" && [[ -n "$edge_subnet" ]]; then
+      # A scoped rule exists — but scoped to WHICH subnet? `edge` is auto-subnetted
+      # at creation (RUNBOOK: derive, don't hardcode — a fresh daemon picks
+      # 172.18.0.0/16, a busy one something else), and a rule for a STALE subnet
+      # reads "present and edge-scoped" while silently dropping every container→
+      # API call (host curls stay green: local delivery bypasses INPUT). The
+      # From column is the last field after the trailing "# comment"; a (v6)
+      # mirror line carries the same IPv4 From, so strip the marker too.
+      rule_sources="$(sed -E 's/#.*$//; s/\(v6\)//' <<<"$rules_8010" | awk 'NF {print $NF}' | sort -u)"
+      if grep -qxF "$edge_subnet" <<<"$rule_sources"; then
+        ok "8010 rule present and scoped to the live edge subnet ($edge_subnet)"
+      else
+        bad "8010 rule is scoped to $(paste -sd, <<<"$rule_sources") but the live edge network is $edge_subnet — container→API traffic is dropped (panel /api/* 502s)"
+        hint "delete the stale rule (sudo ufw status numbered, sudo ufw delete <n>) and re-add it: sudo ufw allow from $edge_subnet to 172.17.0.1 port 8010 proto tcp (RUNBOOK → UFW)"
+      fi
     else
       ok "8010 rule present and edge-scoped"
     fi
