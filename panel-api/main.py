@@ -21,6 +21,7 @@ import os
 import re
 import secrets
 import subprocess
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -34,7 +35,7 @@ from pydantic import BaseModel
 PANEL_TOKEN = os.environ.get("PANEL_TOKEN", "")
 PANEL_DO = "/usr/local/libexec/panel-do"
 DEV_MODE = os.environ.get("PANEL_DEV") == "1"
-# Filesystems the Overview shows dials for (comma-separated; .env: PANEL_DISK_MOUNTS).
+# Filesystems the Overview shows a storage row for (comma-separated; .env: PANEL_DISK_MOUNTS).
 DISK_MOUNTS = [m.strip() for m in os.environ.get("PANEL_DISK_MOUNTS", "/").split(",") if m.strip()]
 
 # LLM fallback router (llm.pietrasik.top → this service): the fleet's shared
@@ -105,6 +106,12 @@ def require_admin(
 
 
 # ──────────────────────────── metrics ────────────────────────────
+#
+# /sys + /proc reads only — no privileges, no subprocess. Everything the panel
+# cannot know from one sample (CPU %, net and disk throughput) is a difference
+# between two polls: the FIRST sample of a counter is null and the UI's 2 s
+# poll fills it a tick later. Nothing here raises — a metric that can't be read
+# is null (or absent), which the Overview renders as "—", never a 500.
 
 def _rd(path: str | Path, cast: Callable[[str], Any] = str, default: Any = None) -> Any:
     try:
@@ -131,6 +138,26 @@ def _temp(path: Optional[str]) -> Optional[float]:
     return v if isinstance(v, float) else None
 
 
+# Monotonic counters (jiffies, bytes, sectors) for _rate() below. A lock only
+# keeps concurrent pollers from reading each other's half-written sample — a
+# wrong-instantaneous-value race would be harmless, a KeyError would not.
+_counters: dict[str, tuple[float, float]] = {}
+_counter_lock = threading.Lock()
+
+
+def _rate(key: str, value: float) -> Optional[float]:
+    """Per-second rate of a monotonic counter; None on a key's first sample or
+    after a reset (reboot, interface re-created — the counter went backwards)."""
+    now = time.monotonic()
+    with _counter_lock:
+        prev = _counters.get(key)
+        _counters[key] = (value, now)
+    if prev is None or value < prev[0]:
+        return None
+    dt = now - prev[1]
+    return (value - prev[0]) / dt if dt > 0 else None
+
+
 def amd_gpus() -> list[dict[str, Any]]:
     """AMD GPU stats from sysfs — no ROCm / amd-smi needed."""
     out: list[dict[str, Any]] = []
@@ -142,10 +169,19 @@ def amd_gpus() -> list[dict[str, Any]]:
         if not hwmons and _rd(f"{dev}/gpu_busy_percent") is None:
             continue
         hw = hwmons[0] if hwmons else None
+        # No product_name on many kernels — the PCI id + slot at least make the
+        # two identical cards distinguishable in the UI (name falls back to cardN).
+        uevent = _rd(f"{dev}/uevent", default="") or ""
+        ue = dict(
+            line.split("=", 1) for line in uevent.splitlines() if "=" in line
+        )
         out.append(
             {
                 "card": os.path.basename(card),
                 "name": _rd(f"{dev}/product_name") or _rd(f"{dev}/label") or os.path.basename(card),
+                "driver": ue.get("DRIVER", ""),
+                "pci_id": ue.get("PCI_ID", ""),
+                "pci_slot": ue.get("PCI_SLOT_NAME", ""),
                 "temp_edge_c": _temp(f"{hw}/temp1_input" if hw else None),
                 "temp_junction_c": _temp(f"{hw}/temp2_input" if hw else None),
                 "temp_mem_c": _temp(f"{hw}/temp3_input" if hw else None),
@@ -153,7 +189,13 @@ def amd_gpus() -> list[dict[str, Any]]:
                 "vram_used_mib": _rd(f"{dev}/mem_info_vram_used", lambda v: int(v) // 2**20),
                 "vram_total_mib": _rd(f"{dev}/mem_info_vram_total", lambda v: int(v) // 2**20),
                 "power_w": _hwrd(hw, "power1_average", lambda v: round(int(v) / 1e6, 1)),
+                # The card's own power limit (some firmware only exposes the
+                # ceiling): lets the Overview show W as % of the allowed budget.
+                "power_cap_w": _hwrd(hw, "power1_cap", lambda v: round(int(v) / 1e6, 1))
+                or _hwrd(hw, "power1_cap_max", lambda v: round(int(v) / 1e6, 1)),
                 "fan_rpm": _hwrd(hw, "fan1_input", int),
+                "clock_mhz": _hwrd(hw, "freq1_input", lambda v: int(v) // 10**6),
+                "mem_clock_mhz": _hwrd(hw, "freq2_input", lambda v: int(v) // 10**6),
             }
         )
     return out
@@ -166,43 +208,295 @@ def cpu_temp_c() -> Optional[float]:
     return None
 
 
-def ram() -> dict[str, int]:
+def _cpu_cores() -> int:
+    try:
+        return len(os.sched_getaffinity(0)) or 1
+    except (AttributeError, OSError):
+        return os.cpu_count() or 1
+
+
+_cpu_model_cache = ""
+
+
+def _cpu_model() -> str:
+    """/proc/cpuinfo 'model name' — constant for the process's lifetime, so read once."""
+    global _cpu_model_cache
+    if _cpu_model_cache:
+        return _cpu_model_cache
+    model = ""
+    try:
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            key, _, val = line.partition(":")
+            if key.strip() == "model name":
+                model = val.strip()
+                break
+    except OSError:
+        pass
+    _cpu_model_cache = model
+    return model
+
+
+def _cpu_freq_mhz() -> Optional[float]:
+    # amd-pstate exposes the current clock under cpufreq/policyN, intel-pstate
+    # under cpuN/cpufreq — whichever the driver is, one of these exists.
+    for p in (
+        "/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq",
+        "/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq",
+    ):
+        v = _rd(p, cast=lambda x: round(int(x) / 1000))  # kHz → MHz
+        if v is not None:
+            return v
+    return None
+
+
+def cpu_block() -> dict[str, Any]:
+    """Everything the CPU itself reports: temp, utilisation, clock, task counts.
+
+    usage_pct is a Δ of /proc/stat's aggregate line (idle+iowait vs total
+    jiffies). procs_blocked > 0 means tasks stuck in uninterruptible IO — the
+    usual explanation for "everything is slow" and worth its own tile.
+    """
+    out: dict[str, Any] = {
+        "temp_c": cpu_temp_c(),
+        "cores": _cpu_cores(),
+        "model": _cpu_model(),
+        "freq_mhz": _cpu_freq_mhz(),
+        "usage_pct": None,
+        "procs_running": None,
+        "procs_blocked": None,
+    }
+    try:
+        lines = Path("/proc/stat").read_text().splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        key, _, val = line.partition(" ")
+        if key == "cpu":
+            # Fields user..steal only: guest/guest_nice are already counted in
+            # user/nice, so summing them twice would understate utilisation.
+            f = val.split()
+            try:
+                nums = [int(x) for x in f[:8]]
+            except ValueError:
+                continue
+            if len(nums) >= 5:
+                idle = nums[3] + nums[4]
+                dtot = _rate("cpu:total", float(sum(nums)))
+                didle = _rate("cpu:idle", float(idle))
+                if dtot and didle is not None and dtot > 0:
+                    out["usage_pct"] = round(max(0.0, min(100.0, 100.0 * (1 - didle / dtot))), 1)
+        elif key in ("procs_running", "procs_blocked"):
+            try:
+                out[key] = int(val.strip())
+            except ValueError:
+                pass
+    return out
+
+
+def _meminfo() -> dict[str, int]:
+    """/proc/meminfo as key → kB (empty if unreadable)."""
     info: dict[str, int] = {}
     try:
         for line in Path("/proc/meminfo").read_text().splitlines():
             key, _, val = line.partition(":")
-            info[key] = int(val.strip().split()[0])  # kB
-    except (OSError, ValueError, IndexError):
+            try:
+                info[key] = int(val.strip().split()[0])  # kB
+            except (ValueError, IndexError):
+                continue
+    except OSError:
+        pass
+    return info
+
+
+def ram(mi: dict[str, int]) -> dict[str, int]:
+    """RAM split so the segments ADD UP TO THE STICK: 'used' is memory the
+    kernel can't hand back (total − MemAvailable), 'cache' is reclaimable page
+    cache/buffers, 'free' is untouched. Calling page cache 'used' is the classic
+    way to make a healthy box look nearly full.
+    """
+    total = mi.get("MemTotal", 0) // 1024
+    if total <= 0:
         return {}
-    total = info.get("MemTotal", 0) // 1024
-    avail = info.get("MemAvailable", 0) // 1024
-    return {"total_mib": total, "used_mib": max(0, total - avail), "avail_mib": avail}
+    avail = mi.get("MemAvailable", 0) // 1024
+    free = mi.get("MemFree", 0) // 1024
+    used = max(0, total - avail)
+    return {
+        "total_mib": total,
+        "used_mib": used,
+        "avail_mib": avail,
+        "free_mib": free,
+        "cache_mib": max(0, total - used - free),
+    }
+
+
+def swap(mi: dict[str, int]) -> dict[str, int]:
+    """{} when there is no swap configured (then the Overview shows no tile)."""
+    total = mi.get("SwapTotal", 0) // 1024
+    if total <= 0:
+        return {}
+    return {"total_mib": total, "used_mib": max(0, total - mi.get("SwapFree", 0) // 1024)}
+
+
+# Interfaces the network tile must not count: loopback, and anything whose
+# traffic is already counted somewhere else — docker/veth/libvirt/k8s plumbing,
+# bridges, bonds, VLANs and tunnels (a stacked device is exactly one that has
+# lower_* symlinks next to it in /sys/class/net). Counting them alongside the
+# physical NIC double-counts and buries the real link.
+NET_VIRTUAL_RE = re.compile(r"^(lo|docker|veth|br|virbr|vnet|tap|tun|wg|zt|kube|flannel|cali|cni|lxc|nerd|dummy|ifb|gre|gretap|ip6gre|sit|ppp)")
+
+
+def net_rates() -> dict[str, Any]:
+    """Bits/s in and out over the physical interfaces (Δ of their byte counters)."""
+    names: list[str] = []
+    rx = tx = 0
+    for path in sorted(glob.glob("/sys/class/net/*"), key=_natural_key):
+        name = os.path.basename(path)
+        if NET_VIRTUAL_RE.match(name) or glob.glob(f"{path}/lower_*"):
+            continue
+        r, t = _rd(f"{path}/statistics/rx_bytes", int), _rd(f"{path}/statistics/tx_bytes", int)
+        if r is None or t is None:
+            continue
+        names.append(name)
+        rx += r
+        tx += t
+    if not names:
+        return {}
+    key = "net:" + ",".join(names)  # interface set changed → restart the delta
+    out: dict[str, Any] = {"ifaces": names}
+    for field, suffix, total in (("rx_bits_s", "rx", rx), ("tx_bits_s", "tx", tx)):
+        v = _rate(f"{key}:{suffix}", float(total))
+        if v is not None:
+            out[field] = max(0.0, v * 8)
+    return out
+
+
+def _block_name(maj_min: str) -> str:
+    """'259:3' → 'nvme0n1p3' — the kernel name, i.e. the /proc/diskstats key."""
+    try:
+        return os.path.basename(os.readlink(f"/sys/dev/block/{maj_min}"))
+    except OSError:
+        return ""
+
+
+def sensors() -> list[dict[str, Any]]:
+    """Every hwmon chip and its HOTTEST sensor, reported raw for the UI to curate.
+
+    Deliberately not filtered here: the kernel already tells us what a chip is
+    (nvme, spd5118 = DDR5 DIMM sensors, r8169 = NIC, …), and which of those are
+    worth a human's attention is a display decision. The API's job is to say
+    what the box knows; the Overview decides what it's worth showing.
+    """
+    out: list[dict[str, Any]] = []
+    for hm in sorted(glob.glob("/sys/class/hwmon/hwmon*"), key=_natural_key):
+        chip = _rd(f"{hm}/name", default="") or ""
+        try:
+            # .../nvme/nvme1 → nvme1, .../27-0050 → 27-0050: what identifies the chip.
+            device = os.path.basename(os.path.realpath(f"{hm}/device"))
+        except OSError:
+            device = ""
+        readings: list[tuple[float, str]] = []
+        for inp in sorted(glob.glob(f"{hm}/temp*_input"), key=_natural_key):
+            key = os.path.basename(inp)[: -len("_input")]
+            t = _temp(inp)
+            if t is not None:
+                readings.append((t, _rd(f"{hm}/{key}_label", default="") or ""))
+        if not readings:
+            continue
+        temp, label = max(readings)
+        out.append({"chip": chip, "device": device, "label": label, "temp_c": temp})
+    return out
+
+
+def nvme_temps() -> dict[str, float]:
+    """nvme controller (nvme1) → drive temperature, for the storage rows."""
+    return {s["device"]: s["temp_c"] for s in sensors() if s["chip"] == "nvme" and s["device"].startswith("nvme")}
+
+
+def _mountinfo() -> dict[str, dict[str, str]]:
+    """mountpoint → {device, fstype, block} from /proc/self/mountinfo (the last
+    entry for a mountpoint wins, which is the most specific one). Octal-escaped
+    spaces in paths aren't decoded — no configured mount uses them."""
+    out: dict[str, dict[str, str]] = {}
+    try:
+        lines = Path("/proc/self/mountinfo").read_text().splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        f = line.split()
+        try:
+            sep = f.index("-")  # fields before it are optional, this one is the divider
+        except ValueError:
+            continue
+        if sep < 6 or len(f) < sep + 3:
+            continue
+        out[f[4]] = {"device": f[sep + 2], "fstype": f[sep + 1], "block": _block_name(f[2])}
+    return out
+
+
+def _diskstats() -> dict[str, tuple[int, int]]:
+    """block device → (bytes read, bytes written); sectors are always 512 bytes."""
+    out: dict[str, tuple[int, int]] = {}
+    try:
+        for line in Path("/proc/diskstats").read_text().splitlines():
+            f = line.split()
+            if len(f) < 10:
+                continue
+            try:
+                out[f[2]] = (int(f[5]) * 512, int(f[9]) * 512)
+            except ValueError:
+                continue
+    except OSError:
+        pass
+    return out
 
 
 def disks() -> list[dict[str, Any]]:
     """Usage per mount in DISK_MOUNTS. Every configured mount ALWAYS gets an
     entry: stats, or an explicit error — an unmounted mountpoint makes statvfs
     report the *containing* filesystem, so its absence must shout, not lie.
+    Each entry also says WHAT it is — block device, filesystem, and throughput
+    since the previous poll (model loads make a storage tile worth watching).
     """
     try:
         root_dev: Optional[int] = os.stat("/").st_dev
     except OSError:
         root_dev = None
+    mounts, io_stats = _mountinfo(), _diskstats()
+    temps = nvme_temps()
     out: list[dict[str, Any]] = []
     for mount in DISK_MOUNTS:
+        info = mounts.get(mount, {})
+        entry: dict[str, Any] = {
+            "mount": mount,
+            "device": info.get("block") or os.path.basename(info.get("device", "")),
+            "fstype": info.get("fstype", ""),
+        }
+        # An NVMe that cooks throttles and dies young — the drive's own temp
+        # belongs next to its mount, not buried in a sensor dump.
+        drive = re.match(r"^(nvme\d+)", entry["device"] or "")
+        if drive and drive.group(1) in temps:
+            entry["temp_c"] = temps[drive.group(1)]
+        blk = info.get("block", "")
+        if blk in io_stats:
+            rd = _rate(f"io:{blk}:r", float(io_stats[blk][0]))
+            wr = _rate(f"io:{blk}:w", float(io_stats[blk][1]))
+            if rd is not None:
+                entry["read_bytes_s"] = max(0.0, rd)
+            if wr is not None:
+                entry["write_bytes_s"] = max(0.0, wr)
         try:
             st = os.statvfs(mount)
             dev = os.stat(mount).st_dev
         except OSError:
-            out.append({"mount": mount, "error": "path does not exist"})
+            out.append({**entry, "error": "path does not exist"})
             print(f"panel-api: disk: {mount} unavailable (stat failed)", flush=True)
             continue
         if st.f_blocks == 0:
-            out.append({"mount": mount, "error": "not a mountable filesystem (no blocks)"})
+            out.append({**entry, "error": "not a mountable filesystem (no blocks)"})
             print(f"panel-api: disk: {mount} reports no blocks (pseudo-fs?)", flush=True)
             continue
         if mount != "/" and root_dev is not None and dev == root_dev:
-            out.append({"mount": mount, "error": "NOT MOUNTED — partition failed to mount?"})
+            out.append({**entry, "error": "NOT MOUNTED — partition failed to mount?"})
             print(f"panel-api: disk: {mount} is on /'s device — not mounted", flush=True)
             continue
         total = st.f_blocks * st.f_frsize
@@ -210,7 +504,7 @@ def disks() -> list[dict[str, Any]]:
         avail = st.f_bavail * st.f_frsize  # usable by non-root (excludes reserved)
         out.append(
             {
-                "mount": mount,
+                **entry,
                 "total_mib": total // 2**20,
                 "used_mib": max(0, total - free) // 2**20,
                 "avail_mib": avail // 2**20,
@@ -239,14 +533,20 @@ def uptime_s() -> Optional[float]:
 
 @app.get("/api/metrics")
 def metrics(_admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
+    mi = _meminfo()
+    uname = os.uname()
     return {
         "ts": int(time.time()),
+        "host": {"hostname": uname.nodename, "kernel": uname.release},
         "gpus": amd_gpus(),
-        "cpu_temp_c": cpu_temp_c(),
-        "ram": ram(),
+        "cpu": cpu_block(),
+        "ram": ram(mi),
+        "swap": swap(mi),
         "disks": disks(),
         "load": load_avg(),
         "uptime_s": uptime_s(),
+        "net": net_rates(),
+        "sensors": sensors(),
     }
 
 

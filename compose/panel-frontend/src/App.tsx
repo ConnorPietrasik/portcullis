@@ -1,5 +1,6 @@
-// Views are lazy chunks: only the active tab's code ships to the browser
-// (the Overview's gauge library is the bulk of the bundle).
+// Views are lazy chunks: only the active tab's code ships to the browser. The
+// Overview draws its own bars and traces in SVG/CSS, so it is a normal-sized
+// chunk now — no chart library in the bundle at all.
 import { Suspense, lazy, useState } from 'react'
 
 const Overview = lazy(() => import('./views/Overview'))

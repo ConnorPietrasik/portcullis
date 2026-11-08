@@ -1,6 +1,7 @@
 # portcullis
 
-Home-server admin panel: AMD temps/usage dials, container control, whitelisted privileged actions — behind Traefik + Authelia 2FA.
+Home-server admin panel: an AMD GPU + host instrument dashboard (load, thermals, VRAM, storage I/O, thermometry), container control,
+whitelisted privileged actions — behind Traefik + Authelia 2FA.
 
 *The name is the architecture: one gated entrance to the host (Traefik), one privileged path through it (`panel-do`), everything else
 default-deny.*
@@ -15,7 +16,8 @@ Traefik ─┬─ pietrasik.top            → portfolio container (public)
          ├─ auth.pietrasik.top       → Authelia portal
          └─ *.pietrasik.top          → future apps (per-group rules, private by default)
 
-host API (user 'panel', systemd) ─┬─ /sys + /proc       → AMD temps/util/VRAM, RAM, load (read-only)
+host API (user 'panel', systemd) ─┬─ /sys + /proc       → AMD temp/util/VRAM/power/clocks, RAM+swap, disk space/I/O + drive
+                                  │                        temps, board thermometry, net, load (all read-only)
                                   ├─ llm router         → llm.pietrasik.top: first-up instance in the
                                   │                         panel-configured order (Settings)
                                   └─ sudo -n panel-do   → compiled whitelist dispatcher — the ONLY

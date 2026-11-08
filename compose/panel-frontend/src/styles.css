@@ -1,13 +1,18 @@
 :root {
   --bg: #0f141a;
   --panel: #171e26;
+  --panel-2: #1c2530;
   --line: #243040;
+  --line-soft: #1e2836;
+  --track: #0b1016;
   --fg: #dbe2ea;
   --muted: #8b98a5;
+  --dim: #55636f;
   --green: #3ddc84;
   --amber: #f6c344;
   --red: #ff5252;
   --accent: #4da3ff;
+  --cyan: #4fd1c5;
 }
 
 * {
@@ -19,12 +24,13 @@ body {
   background: var(--bg);
   color: var(--fg);
   font: 14px/1.5 system-ui, -apple-system, 'Segoe UI', sans-serif;
+  -webkit-font-smoothing: antialiased;
 }
 
 .app {
-  max-width: 1100px;
+  max-width: 1440px;
   margin: 0 auto;
-  padding: 0 16px 40px;
+  padding: 0 18px 44px;
 }
 
 header {
@@ -109,38 +115,13 @@ footer {
   padding: 14px 16px;
 }
 
-.card h3 {
+.card h3,
+.panelish > header h3 {
   margin: 0 0 6px;
   font-size: 15px;
   display: flex;
   align-items: center;
   gap: 8px;
-}
-
-.dials {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-  justify-content: space-around;
-}
-
-figure {
-  margin: 0;
-  text-align: center;
-}
-
-figcaption {
-  color: var(--muted);
-  font-size: 12px;
-}
-
-.dial-na {
-  width: 150px;
-  height: 90px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--muted);
 }
 
 .kv {
@@ -156,7 +137,8 @@ figcaption {
   font-weight: 600;
 }
 
-.muted {
+.muted,
+.dim {
   color: var(--muted);
 }
 
@@ -302,4 +284,913 @@ pre.out.ok {
 
 pre.out.err {
   border-color: var(--red);
+}
+
+/* ══════════════════════════════ Overview ══════════════════════════════
+   Layout: a host strip you read standing, GPU cards you read close, then the
+   two things that fill up over time (storage, fleet). Everything shares one
+   hairline grid and one set of type sizes so the eye can scan down columns.
+   ═════════════════════════════════════════════════════════════════════ */
+
+.ov {
+  display: grid;
+  gap: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ov.stale {
+  opacity: 0.72;
+}
+
+.ov .dim {
+  color: var(--dim);
+}
+
+/* tints: colour is a signal, so exactly five meanings exist (see ui.tsx) */
+.t-ok {
+  color: var(--green);
+}
+.t-warn {
+  color: var(--amber);
+}
+.t-crit {
+  color: var(--red);
+}
+.t-load {
+  color: var(--accent);
+}
+.t-flow {
+  color: var(--cyan);
+}
+.t-muted,
+.t-na {
+  color: var(--muted);
+}
+
+/* ── host bar: identity + is the polling alive ── */
+.ov-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 9px 14px;
+}
+
+.ov-bar .host {
+  margin: 0;
+  font-size: 15px;
+  letter-spacing: 0.6px;
+  color: var(--accent);
+}
+
+.ov-bar .sub {
+  color: var(--fg);
+  font-size: 13px;
+}
+
+.ov-bar .right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.live {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  font-size: 11px;
+  color: var(--green);
+}
+
+.live i {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: pulse 2.4s ease-out infinite;
+}
+
+.live.stale {
+  color: var(--amber);
+}
+.live.err {
+  color: var(--red);
+}
+
+@keyframes pulse {
+  0% {
+    box-shadow: 0 0 0 0 currentColor;
+    opacity: 1;
+  }
+  70% {
+    box-shadow: 0 0 0 6px transparent;
+    opacity: 0.65;
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .live i {
+    animation: none;
+  }
+  .meter i {
+    transition: none;
+  }
+}
+
+/* ── the strip: one bordered rail, hairline-separated tiles ── */
+.strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.tile {
+  padding: 10px 14px 12px;
+  border-right: 1px solid var(--line-soft);
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+  align-content: start;
+}
+
+.tile:last-child {
+  border-right: none;
+}
+
+.tile h4 {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 1.3px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* the tile label wins its own row — a trend in this slot must never run over
+   into the neighbour tile (it did, and it read as one long broken label) */
+.tile h4 .r {
+  margin-left: auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+  font-weight: 500;
+  letter-spacing: 0.2px;
+  text-transform: none;
+}
+
+.tile .foot,
+.hero .foot {
+  display: flex;
+  align-items: baseline;
+  font-size: 11.5px;
+  color: var(--muted);
+  min-width: 0;
+  margin-top: auto; /* every tile's small print sits on the same line */
+}
+
+/* the text part of a foot: the trend mark keeps its width, the text ellipsizes */
+.foot .f,
+.foot b {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.foot b {
+  font-weight: 700;
+}
+
+.big {
+  font-size: clamp(19px, 2.1vw, 27px);
+  line-height: 1.04;
+  font-weight: 650;
+  letter-spacing: -0.6px;
+  white-space: nowrap; /* a wrapped value reads as a broken tile */
+}
+
+.big em {
+  font-style: normal;
+  font-size: 12.5px;
+  font-weight: 500;
+  letter-spacing: 0;
+  color: var(--muted);
+  margin-left: 5px;
+}
+
+.dual {
+  display: grid;
+  gap: 2px;
+  font-size: 15.5px;
+  font-weight: 600;
+  letter-spacing: -0.2px;
+  white-space: nowrap;
+}
+
+.dual .dl em {
+  font-style: normal;
+  color: var(--muted);
+  margin-right: 4px;
+}
+
+.dual .dl:first-child {
+  color: var(--cyan);
+}
+.dual .dl:last-child {
+  color: var(--accent);
+}
+
+.bars {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 7px;
+}
+
+.bars .bar {
+  display: grid;
+  gap: 2px;
+}
+
+.bars .bar em {
+  font-style: normal;
+  font-size: 9.5px;
+  color: var(--dim);
+  letter-spacing: 0.5px;
+}
+
+.blocked {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.blocked b {
+  font-size: 14px;
+}
+
+.blocked.on {
+  color: var(--red);
+}
+
+.trend {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-right: 7px; /* keeps "▲ +4°/min" off the text that follows it */
+  font-size: 11px;
+  flex: 0 0 auto; /* an arrow that wraps away from its number is worse than none */
+  white-space: nowrap;
+}
+
+.trend b {
+  font-weight: 700;
+}
+
+/* ── indicators ── */
+.meter,
+.stack {
+  position: relative;
+  display: block;
+  height: 8px;
+  border-radius: 99px;
+  background: var(--track);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04);
+}
+
+.meter i {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  border-radius: 99px;
+  background: var(--accent);
+  transition: width 0.35s ease, background-color 0.35s ease;
+}
+
+.meter.t-ok i {
+  background: var(--green);
+}
+.meter.t-warn i {
+  background: var(--amber);
+}
+.meter.t-crit i {
+  background: var(--red);
+}
+.meter.t-flow i {
+  background: var(--cyan);
+}
+.meter.t-muted i,
+.meter.t-na i {
+  background: var(--dim);
+}
+.meter.na i {
+  display: none;
+}
+
+/* where warn/crit start on THIS scale — the colour is the information: room,
+   then watch, then danger, sitting under the fill instead of beside it */
+.meter.zones {
+  background: linear-gradient(
+    90deg,
+    #0b1016 0 var(--warn),
+    rgba(246, 195, 68, 0.22) var(--warn) var(--crit),
+    rgba(255, 82, 82, 0.26) var(--crit) 100%
+  );
+}
+
+/* scale marks where a whole zone would be overkill (load: "1.0 per thread") */
+.meter b {
+  position: absolute;
+  top: -1px;
+  bottom: -1px;
+  width: 1px;
+  background: var(--line);
+  opacity: 0.9;
+}
+
+.stack {
+  display: flex;
+  overflow: hidden;
+}
+
+.stack i {
+  height: 100%;
+}
+
+.stack i.used {
+  background: var(--accent);
+}
+.stack i.cache {
+  background: #2f6d63;
+}
+.stack i.free {
+  background: #223142;
+}
+
+.chart {
+  position: relative;
+  width: 100%;
+}
+
+.chart svg {
+  display: block;
+  overflow: visible;
+}
+
+.chart .grid {
+  stroke: var(--line-soft);
+  stroke-width: 1;
+}
+
+/* ── GPU cards ── */
+.gpus {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(560px, 1fr));
+  gap: 12px;
+}
+
+.gpu {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px 14px 14px;
+  display: grid;
+  gap: 12px;
+  align-content: start;
+}
+
+.gpu.crit {
+  border-color: #4a2530;
+}
+
+.gpu > header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.gpu h3 {
+  margin: 0 4px 0 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.gpu > header .pill {
+  margin-left: auto;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font: 11px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--muted);
+  background: var(--bg);
+  border: 1px solid var(--line-soft);
+  border-radius: 5px;
+  padding: 1px 7px;
+  white-space: nowrap;
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 1px 9px;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  white-space: nowrap;
+}
+
+.pill.t-ok {
+  border-color: color-mix(in srgb, var(--green) 45%, var(--line));
+}
+.pill.t-warn {
+  border-color: color-mix(in srgb, var(--amber) 45%, var(--line));
+}
+.pill.t-crit {
+  border-color: color-mix(in srgb, var(--red) 55%, var(--line));
+}
+
+.heroes {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.hero {
+  background: var(--panel-2);
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  padding: 9px 11px 10px;
+  display: grid;
+  gap: 6px;
+  align-content: start;
+}
+
+.hero h5 {
+  margin: 0;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1.3px;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+.hero .big {
+  font-size: clamp(18px, 1.9vw, 24px);
+}
+
+.hero .foot {
+  font-size: 11px;
+}
+
+.gpu .trend {
+  display: grid;
+  gap: 4px;
+}
+
+.trendhead {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.trendhead .k {
+  text-transform: uppercase;
+  letter-spacing: 1.3px;
+  font-weight: 700;
+  color: var(--dim);
+  font-size: 10px;
+}
+
+.trendhead .axis {
+  margin-left: auto;
+  color: var(--dim);
+}
+
+.legend {
+  display: flex;
+  gap: 14px;
+}
+
+.legend .li {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.legend i {
+  width: 9px;
+  height: 3px;
+  border-radius: 2px;
+}
+
+.rows {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 2px 22px;
+}
+
+.mrow {
+  display: grid;
+  grid-template-columns: 76px 52px minmax(50px, 1fr) 86px;
+  align-items: center;
+  gap: 9px;
+  padding: 2.5px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.025);
+}
+
+.mrow .k {
+  font-size: 11.5px;
+  color: var(--muted);
+  letter-spacing: 0.2px;
+}
+
+.mrow .s {
+  display: block;
+}
+
+.mrow .v {
+  text-align: right;
+  font-size: 13.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.mrow .v em {
+  font-style: normal;
+  font-weight: 500;
+  font-size: 11px;
+  color: var(--muted);
+  margin-left: 3px;
+}
+
+/* ── panels below the GPUs ── */
+.lower {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+
+.panelish {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px 14px 14px;
+  min-width: 0;
+}
+
+.panelish > header {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  border-bottom: 1px solid var(--line-soft);
+  padding-bottom: 8px;
+  margin-bottom: 10px;
+}
+
+.panelish .note {
+  margin: 4px 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.panelish > header .note {
+  margin: 0;
+  margin-left: auto;
+}
+
+.panelish.empty {
+  color: var(--muted);
+  padding: 16px;
+}
+
+.disk {
+  display: grid;
+  gap: 5px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.disk:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.disk .line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.disk .line .m {
+  font: 600 13.5px ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.disk .line .id {
+  color: var(--dim);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+.disk .line .spacer {
+  flex: 1;
+}
+
+.disk .line .lvl {
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.disk .line .lvl em {
+  font-style: normal;
+  font-weight: 500;
+  color: var(--muted);
+}
+
+.disk .line .of {
+  font-size: 13px;
+  white-space: nowrap;
+  min-width: 116px;
+  text-align: right;
+}
+
+.disk .line .free {
+  font-size: 12.5px;
+  color: var(--muted);
+  white-space: nowrap;
+  min-width: 84px;
+  text-align: right;
+}
+
+/* second line: the bar, an io trace, and the numbers they belong to */
+.disk .line:nth-child(2) {
+  gap: 12px;
+}
+
+.disk .line:nth-child(2) .meter {
+  flex: 0 0 34%;
+}
+
+.disk .line:nth-child(2) .chart {
+  flex: 1 1 auto;
+}
+
+.disk .io {
+  font-size: 11.5px;
+  color: var(--fg);
+  white-space: nowrap;
+}
+
+.disk .io em {
+  font-style: normal;
+  color: var(--muted);
+}
+
+.disk.bad {
+  background: linear-gradient(90deg, rgba(255, 82, 82, 0.08), transparent 65%);
+  border-radius: 8px;
+  padding-left: 10px;
+}
+
+.disk .badmsg {
+  color: var(--red);
+  font-weight: 600;
+  font-size: 12.5px;
+}
+
+.disk .line.sub .io {
+  color: var(--muted);
+  white-space: normal;
+}
+
+/* the board's other thermometry: one quiet strip, amber only when it matters */
+.board {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 11px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.board .bk {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1.3px;
+  text-transform: uppercase;
+  color: var(--dim);
+  margin-right: 4px;
+}
+
+.board .bchip {
+  font: 11.5px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--muted);
+  border: 1px solid var(--line-soft);
+  border-radius: 5px;
+  padding: 0 7px;
+  white-space: nowrap;
+}
+
+.board .bchip b {
+  font-weight: 700;
+}
+
+.board .bchip.t-warn,
+.board .bchip.t-crit {
+  border-color: currentColor;
+}
+
+/* ── fleet ── */
+.panelish .sub {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.panelish .sub:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.panelish .subhead {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 1.3px;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 7px;
+}
+
+.panelish .subhead .counts {
+  margin-left: auto;
+  font-size: 12.5px;
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--fg);
+}
+
+.panelish .subhead .counts b {
+  font-weight: 700;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.chips .cstate {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  background: var(--bg);
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  padding: 1px 9px 1px 7px;
+}
+
+.chips .cstate i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--dim);
+}
+
+.chips .cstate.s-running i {
+  background: var(--green);
+}
+.chips .cstate.s-exited i,
+.chips .cstate.s-created i {
+  background: var(--dim);
+}
+.chips .cstate.s-restarting i,
+.chips .cstate.s-dead i,
+.chips .cstate.s-paused i {
+  background: var(--red);
+}
+
+.chips .cstate b {
+  color: var(--fg);
+}
+
+.chips.names .chip {
+  text-transform: none;
+}
+
+.order {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.order li {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 3px 6px;
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.order li.active {
+  background: rgba(77, 163, 255, 0.08);
+}
+
+.order .rank {
+  width: 16px;
+  color: var(--dim);
+  font-size: 11.5px;
+  text-align: right;
+}
+
+.order .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--dim);
+}
+
+.order .dot.t-ok {
+  background: var(--green);
+}
+.order .dot.t-crit {
+  background: var(--red);
+}
+.order .dot.t-warn {
+  background: var(--amber);
+}
+
+.order .nm {
+  font-weight: 600;
+}
+
+.order .pill {
+  margin-left: auto;
+}
+
+/* ── narrow screens: the strip and rows re-flow, nothing is clipped ── */
+@media (max-width: 900px) {
+  .gpus {
+    grid-template-columns: 1fr;
+  }
+  .heroes {
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  }
+  .lower {
+    grid-template-columns: 1fr;
+  }
+  .mrow {
+    grid-template-columns: 68px minmax(40px, 1fr) 78px;
+  }
+  .mrow .s {
+    display: none;
+  }
+  .disk .line {
+    flex-wrap: wrap;
+  }
+  .disk .line:nth-child(2) .meter {
+    flex-basis: 100%;
+  }
 }

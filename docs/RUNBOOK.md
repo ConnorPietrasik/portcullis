@@ -171,7 +171,7 @@ TOKEN=$(sudo grep '^PANEL_TOKEN=' /opt/panel/.env | cut -d= -f2)
 AUTH=(-H "X-Panel-Token: $TOKEN" -H "Remote-User: connor" -H 'Remote-Groups: admins')
 curl -s http://172.17.0.1:8010/api/health                # {"ok":true,...} — open liveness endpoint
 curl -s http://172.17.0.1:8010/api/metrics               # 401 (expected — auth enforced)
-curl -s "${AUTH[@]}" http://172.17.0.1:8010/api/metrics  # GPUs/CPU/RAM/disks JSON
+curl -s "${AUTH[@]}" http://172.17.0.1:8010/api/metrics  # gpus/cpu/ram/swap/disks/net/sensors JSON
 
 # From inside the edge network — this is exactly what the panel's containers do, so a timeout here means the UFW 8010 rule is wrong:
 docker run --rm --network edge curlimages/curl -s -m 5 http://172.17.0.1:8010/api/metrics   # 401 JSON (reachable, auth enforced)
@@ -183,14 +183,16 @@ set TOKEN (sudo grep '^PANEL_TOKEN=' /opt/panel/.env | cut -d= -f2)
 set -l AUTH -H "X-Panel-Token: $TOKEN" -H "Remote-User: connor" -H "Remote-Groups: admins"
 curl -s http://172.17.0.1:8010/api/health                # {"ok":true,...} — open liveness endpoint
 curl -s http://172.17.0.1:8010/api/metrics               # 401 (expected — auth enforced)
-curl -s $AUTH http://172.17.0.1:8010/api/metrics         # GPUs/CPU/RAM/disks JSON
+curl -s $AUTH http://172.17.0.1:8010/api/metrics         # gpus/cpu/ram/swap/disks/net/sensors JSON
 ```
 
-Disk dials: one per mount in `PANEL_DISK_MOUNTS` (`.env` — this server: `/`, `/home`, `/models`). A mount that isn't there
-(partition failed to mount, path missing, pseudo-fs) shows as a red ERROR card on the dashboard, never as another filesystem's
-numbers or a silent gap — check `journalctl -u panel-api` for the matching line.
+Storage: one row per mount in `PANEL_DISK_MOUNTS` (`.env` — this server: `/`, `/home`, `/models`), each with its device, filesystem,
+capacity, throughput and the drive's own temperature. A mount that isn't there (partition failed to mount, path missing, pseudo-fs)
+shows as a red row on the Overview, never as another filesystem's numbers or a silent gap — check `journalctl -u panel-api` for the
+matching line.
 
-Then from a browser logged into Authelia: `https://panel.pietrasik.top` → Overview dials live, Actions lists the registry.
+Then from a browser logged into Authelia: `https://panel.pietrasik.top` → Overview goes live (its traces fill in over the first
+minute — they are differences between polls, so the first sample of every rate is empty), Actions lists the registry.
 
 ## Phase 5 — trust, but verify (from an external network)
 
