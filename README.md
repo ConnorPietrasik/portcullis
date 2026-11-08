@@ -9,10 +9,15 @@ default-deny.*
 Traefik ─┬─ pietrasik.top            → portfolio container (public)
          ├─ panel.pietrasik.top/     → panel-web container (Authelia: admins)
          ├─ panel.pietrasik.top/api  → host API :8010 (Authelia + X-Panel-Token)
+         ├─ llm.pietrasik.top/v1     → LLM fallback router (panel-api: first instance UP in the
+         │                             panel-configured order — Settings view; /v1 only)
+         ├─ <name>.pietrasik.top     → llm-<name> container (OpenAI-style, bearer LLM_API_KEY)
          ├─ auth.pietrasik.top       → Authelia portal
          └─ *.pietrasik.top          → future apps (per-group rules, private by default)
 
 host API (user 'panel', systemd) ─┬─ /sys + /proc       → AMD temps/util/VRAM, RAM, load (read-only)
+                                  ├─ llm router         → llm.pietrasik.top: first-up instance in the
+                                  │                         panel-configured order (Settings)
                                   └─ sudo -n panel-do   → compiled whitelist dispatcher — the ONLY
                                      privileged path: container list/start/stop/restart,
                                      systemd restarts, docker prune

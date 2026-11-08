@@ -21,6 +21,8 @@ panel-do/panel-do
 __pycache__/
 *.pyc
 .venv/
+# panel-api dev-mode LLM settings (PANEL_DEV=1 writes it in the CWD)
+llm-settings.json
 
 # runtime artifacts that may appear if the repo lives on the server
 *.sqlite3

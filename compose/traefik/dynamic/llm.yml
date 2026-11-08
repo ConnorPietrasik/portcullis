@@ -7,6 +7,13 @@
 # The API key is the gate; llm-rate blunts key-guessing and scan traffic. A
 # host 502s until its instance is up — harmless. Rule: service llm-<name> ↔
 # Host(`<name>.pietrasik.top`) ↔ http://llm-<name>:8000 (RUNBOOK → LLM fleet).
+#
+# llm.pietrasik.top is the FALLBACK ROUTER (RUNBOOK → LLM fleet → fallback
+# router): one base_url for clients that just want the best model currently
+# serving. It points at panel-api (host bind, see panel.yml — its own router
+# so it can omit auth-chain); panel-api walks the admin-configured priority
+# order (panel Settings) and routes to the first instance that's up. Serves
+# /v1 ONLY — the admin /api/* stays behind panel.pietrasik.top's auth chain.
 
 http:
   routers:
@@ -21,6 +28,15 @@ http:
       middlewares: [sec-headers@file, llm-rate@file]
       service: llm-flashnext
 
+    # ordered fallback — first instance up in the panel-configured order wins.
+    # Scoped to /v1 on purpose: panel-api also serves /api/* (the admin API),
+    # and that must stay reachable ONLY via panel.pietrasik.top's Authelia +
+    # panel-secret chain — on this host a client could supply both headers itself.
+    llm-proxy:
+      rule: "Host(`llm.pietrasik.top`) && PathPrefix(`/v1`)"
+      middlewares: [sec-headers@file, llm-rate@file]
+      service: llm-proxy
+
   services:
     llm-27b:
       loadBalancer:
@@ -31,6 +47,13 @@ http:
       loadBalancer:
         servers:
           - url: "http://llm-flashnext:8000"
+
+    # panel-api host service — same bind as panel.yml's panel-api, own service
+    # name so it can carry the instance middlewares without auth-chain.
+    llm-proxy:
+      loadBalancer:
+        servers:
+          - url: "http://172.17.0.1:8010"
 
   middlewares:
     llm-rate:

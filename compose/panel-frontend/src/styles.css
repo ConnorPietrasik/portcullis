@@ -265,6 +265,26 @@ tr:last-child td {
   font: inherit;
 }
 
+.settings .card + .card {
+  margin-top: 14px;
+}
+
+.llm-card select {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 7px 10px;
+  font: inherit;
+}
+
+.llm-add {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+}
+
 pre.out {
   background: var(--bg);
   border: 1px solid var(--line);

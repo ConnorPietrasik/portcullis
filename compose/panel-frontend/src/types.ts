@@ -52,6 +52,20 @@ export interface ActionInfo {
   confirm: boolean
 }
 
+export interface LLMFleetEntry {
+  name: string
+  display: string
+  state: string
+}
+
+export interface LLMSettings {
+  order: string[]
+  status: Record<string, 'up' | 'down' | 'unknown'>
+  active: string | null
+  fleet: LLMFleetEntry[]
+  probe_interval_s: number
+}
+
 export interface ActionResult {
   ok: boolean
   exit_code: number

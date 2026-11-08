@@ -23,7 +23,7 @@
 # the deployed files is one of these, so a leaked key is caught even if it
 # is a secret added to .env later). Keep in sync with what the services
 # actually read: panel-api/main.py and ddns/ddns.py.
-panel_api_env_keys=(PANEL_TOKEN PANEL_DEV PANEL_DISK_MOUNTS)
+panel_api_env_keys=(PANEL_TOKEN PANEL_DEV PANEL_DISK_MOUNTS LLM_API_KEY)
 panel_ddns_env_keys=(NAMESILO_API_KEY DDNS_HOSTS)
 
 # Keys whose line must not carry an `export ` prefix (refused, not merely

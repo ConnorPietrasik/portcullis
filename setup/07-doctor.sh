@@ -287,6 +287,22 @@ section "https endpoints"
 https_check "https://auth.pietrasik.top"   200 "auth portal"
 https_check "https://pietrasik.top"        200 "portfolio (public)"
 https_check "https://panel.pietrasik.top"  30x "panel (unauth → Authelia redirect)"
+# LLM fallback router: 200 (some instance up) or 503 (all down) is both
+# HEALTHY — the router is answering. 401 = key mismatch, 404/502 = broken
+# route or panel-api. Only meaningful with a configured fleet.
+if [[ -n "${LLM_API_KEY:-}" ]]; then
+  llm_code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 \
+    -H "Authorization: Bearer $LLM_API_KEY" \
+    https://llm.pietrasik.top/v1/models 2>/dev/null || true)"
+  if [[ "$llm_code" == 200 || "$llm_code" == 503 ]]; then
+    ok "llm.pietrasik.top/v1/models → $llm_code (router answers; 503 = all instances down)"
+  else
+    bad "llm.pietrasik.top/v1/models → ${llm_code:-000} (want 200 or 503)"
+    hint "401 = LLM_API_KEY mismatch; 404/502 = llm-proxy router (traefik/dynamic/llm.yml) or panel-api down (make logs)"
+  fi
+else
+  skip "llm.pietrasik.top (no LLM_API_KEY in .env — fleet not configured)"
+fi
 
 # ── panel-api ────────────────────────────────────────────────────────────────
 section "panel-api (host service)"
@@ -338,6 +354,12 @@ if [[ "$code" == 401 ]]; then
   ok "GET /api/metrics unauthenticated → 401 (auth enforced)"
 else
   bad "GET /api/metrics unauthenticated → ${code:-000} (expected 401)"
+fi
+code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://172.17.0.1:8010/v1/models 2>/dev/null)"
+if [[ "$code" == 401 ]]; then
+  ok "GET /v1/models unauthenticated → 401 (LLM router key enforced)"
+else
+  bad "GET /v1/models unauthenticated → ${code:-000} (expected 401)"
 fi
 # The REAL data path: edge container → host API. The host curls above pass
 # even when traefik's route 502s (wrong bind IP or missing UFW rule).
@@ -401,6 +423,16 @@ if [[ -x /usr/local/libexec/panel-do ]]; then
     ok "--list emits valid registry JSON (sudoers path works)"
   else
     bad "panel-do --list failed"; hint "make panel-do; check /etc/sudoers.d/panel"
+  fi
+  # The LLM fallback router resolves instance names via edge-ips. A stale
+  # binary (pre-edge-ips) makes llm.pietrasik.top report every instance
+  # "not on the edge network" — a 503 the route check above still calls
+  # healthy — so the action's presence must be checked explicitly.
+  if sudo -u panel sudo -n /usr/local/libexec/panel-do --list 2>/dev/null | grep -q '"name":"edge-ips"'; then
+    ok "edge-ips action present (LLM router name→IP map)"
+  else
+    bad "panel-do registry missing edge-ips — llm.pietrasik.top will report every instance down"
+    hint "binary is stale — make panel-do (rebuilds + reinstalls it)"
   fi
 else
   skip "not installed"; hint "make panel-do (RUNBOOK Phase 3)"

@@ -411,6 +411,30 @@ on it.
 **Models:** `/models/llm/*.rad` (self-contained; ro-mounted at `/models`). If `/models` is btrfs with compression, keep `.rad` files
 uncompressed (`chattr +C`) — direct-I/O n-gram reads degrade otherwise.
 
+**Fallback router (`llm.pietrasik.top`):** one base URL for clients that just want the best model
+currently serving — agents, defaults, anything that shouldn't pin an instance. Set the priority
+order in the panel's Settings view: a request goes to the FIRST instance in the list that's up
+(strictly single-active — the order is priority, traffic is never split). The order holds the
+compose SERVICE name (`llm-27b` — not the `panel-llm-27b` container name compose prefixes);
+panel-api resolves name → container (the compose service label) → edge IP (`edge-ips`).
+Clients use
+`base_url=https://llm.pietrasik.top/v1` + the same `LLM_API_KEY` as every instance; `/v1/models`
+reflects the active instance only. Served by panel-api itself (a router in `traefik/dynamic/llm.yml`
+→ the `172.17.0.1:8010` host bind — its own router, so it can omit `auth-chain` like the instance
+names; the gate is the bearer key). The router is scoped to `/v1`: everything else on the llm
+host 404s, so the admin `/api/*` stays behind `panel.pietrasik.top`'s Authelia + `panel-secret`
+chain — on the llm host a client could supply those headers itself. Health is each instance's
+own `/health`: probed every 30 s, and a failed proxied request (connection error or 5xx) parks
+that instance for 30 s, so failover lands
+within a couple of probe cycles even between probes. All instances down → 503 with a per-instance
+reason; an empty order → 503. The order lives in `/opt/panel-api/settings.json` (panel-owned 0600,
+in the update snapshot — `make rollback` restores it). The `edge-ips` panel-do action supplies the
+name→IP map (read-only, no args) — first deploy needs `make panel-do` (it ships the new binary)
+BEFORE `make update`: with a stale binary the action is unknown, so the router reports every
+instance “not on the edge network” (a 503 the route check still calls healthy). `make doctor`
+checks the route (200 or 503 = healthy), that unauthenticated `/v1/*` gets 401, and that the
+registry carries `edge-ips` (catches the stale binary).
+
 **Later — dynamic GPU allocation:** the pin is just env at start time, so the end state is a panel-do action (ledger from running
 instances' env, conflict check, write the new set, recreate) + a six-slot free/held UI; the file's pins become last-allocation
 defaults.

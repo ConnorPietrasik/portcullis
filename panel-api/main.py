@@ -7,12 +7,14 @@ privileged — container control included — goes through `sudo -n panel-do`
 bypass it.
 
 Runs as user `panel`, binds 172.17.0.1:8010 (docker0 gateway — reachable from
-the edge network, not the internet). PANEL_DEV=1 disables auth for local
-development ONLY (loopback); the systemd unit never sets it.
+the edge network, not the internet). PANEL_DEV=1 disables the PANEL auth
+checks for local development ONLY (loopback) — not the /v1/* LLM key gate
+(see the LLM section); the systemd unit never sets it.
 """
 
 from __future__ import annotations
 
+import asyncio
 import glob
 import json
 import os
@@ -20,10 +22,13 @@ import re
 import secrets
 import subprocess
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+import httpx
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 PANEL_TOKEN = os.environ.get("PANEL_TOKEN", "")
@@ -31,6 +36,14 @@ PANEL_DO = "/usr/local/libexec/panel-do"
 DEV_MODE = os.environ.get("PANEL_DEV") == "1"
 # Filesystems the Overview shows dials for (comma-separated; .env: PANEL_DISK_MOUNTS).
 DISK_MOUNTS = [m.strip() for m in os.environ.get("PANEL_DISK_MOUNTS", "/").split(",") if m.strip()]
+
+# LLM fallback router (llm.pietrasik.top → this service): the fleet's shared
+# API key is the gate, and the priority order lives in a small JSON file.
+# See the LLM section at the bottom of this file.
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
+LLM_SETTINGS_PATH = Path(os.environ.get("LLM_SETTINGS_PATH") or "/opt/panel-api/settings.json")
+if DEV_MODE:  # local development: keep the file in the checkout, not /opt
+    LLM_SETTINGS_PATH = Path("llm-settings.json")
 
 MANAGE_LABEL = "panel.manage"
 CONTAINER_VERBS = frozenset({"start", "stop", "restart"})
@@ -44,7 +57,29 @@ CONTAINERS_CACHE_TTL = 3.0  # UI polls ~2s; sudo+docker spawn per miss is fine a
 if DEV_MODE:
     print("!!! PANEL_DEV=1 — AUTH CHECKS DISABLED (local development only) !!!", flush=True)
 
-app = FastAPI(title="panel-api", docs_url=None, redoc_url=None, openapi_url=None)
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Owns the LLM router's shared httpx client + background health probe."""
+    global _llm_http
+    # read=300 s: normal streams emit bytes far more often than every 5 min,
+    # but a wedged instance that accepts TCP and then goes silent (ROCm init
+    # hang) must not park the client's request forever — the deadline fails
+    # it, and the passive cooldown + /health probe steer the next request
+    # down the list. connect capped at 5 s.
+    _llm_http = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=5.0, read=300.0, pool=5.0))
+    probe = asyncio.create_task(_llm_probe_loop())
+    try:
+        yield
+    finally:
+        probe.cancel()
+        try:
+            await probe  # let the in-flight cycle finish cancelling before closing its client
+        except asyncio.CancelledError:
+            pass
+        await _llm_http.aclose()
+
+
+app = FastAPI(title="panel-api", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 
 
 # ───────────────────────────── auth ─────────────────────────────
@@ -281,6 +316,9 @@ def _containers_fetch() -> list[dict[str, Any]]:
 
 
 def containers_cached() -> list[dict[str, Any]]:
+    """Full `docker ps -a` objects (panel-do list-containers JSON), 3 s TTL.
+    Raw on purpose: /api/containers filters on the Labels field and the LLM
+    router's fleet view needs it too — the UI shape is _container_view()."""
     now = time.monotonic()
     if _containers_cache["data"] is not None and now - _containers_cache["at"] < CONTAINERS_CACHE_TTL:
         return _containers_cache["data"]
@@ -418,3 +456,368 @@ def run_action(name: str, body: ActionBody, _admin: Optional[str] = Depends(requ
         "stdout": proc.stdout[-8000:],
         "stderr": proc.stderr[-8000:],
     }
+
+
+# ─────────────────────────── LLM fallback router ─────────────────────────────
+# llm.pietrasik.top → this service (router in traefik/dynamic/llm.yml). Routes
+# OpenAI-style /v1/* to the FIRST instance that's up in the admin-configured
+# priority order (panel Settings → "llm.pietrasik.top"). Strictly single-active
+# — the point is "the best model I'm serving right now", never load-split.
+#
+# Auth is the same gate as the per-instance subdomains: Authorization: Bearer
+# with LLM_API_KEY. No Authelia here — API clients speak bearer tokens, and
+# forward-auth is cookie-based (see the llm.yml header). /v1/models needs no
+# special handling: it simply proxies to the active instance. The gate is
+# NOT bypassed by PANEL_DEV=1 (unlike the panel endpoints): local dev of
+# the router needs LLM_API_KEY set to any non-empty value.
+#
+# Security: the order holds compose SERVICE names (llm-<name> — what the
+# traefik rules and `make rollback` use), validated against the live llm-*
+# containers and resolved to edge-network IPs server-side — the config
+# (and its admin) can never name an arbitrary host address, so there is no
+# SSRF surface beyond the fleet the admin already fully controls.
+
+LLM_PROBE_INTERVAL_S = 30.0  # background /health refresh per instance
+LLM_PROBE_TIMEOUT_S = 3.0  # /health budget (connect+read)
+LLM_STALE_AFTER_S = 90.0  # a cached "up" older than this forces an on-demand re-probe
+LLM_COOLDOWN_S = 30.0  # passive: a failed proxied request parks the instance this long
+LLM_MAX_ORDER = 8
+LLM_MAX_BODY = 10 * 1024 * 1024
+LLM_NAME_RE = re.compile(r"^llm-[a-z0-9][a-z0-9-]{0,62}$")
+
+# Stripped in both directions: RFC 7230 §6.1 hop-by-hop + content-length
+# (recomputed by starlette) + accept-encoding (forced identity, so upstream
+# bytes pass through untransmuted).
+HOP_BY_HOP = frozenset(
+    {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "host",
+        "content-length",
+        "accept-encoding",
+    }
+)
+
+_llm_http: Optional[httpx.AsyncClient] = None  # created in lifespan
+_llm_health: dict[str, dict[str, Any]] = {}  # name → {"up": bool, "at": float, "err": str}
+_llm_down_until: dict[str, float] = {}  # name → monotonic cooldown end (passive failures)
+_edge_ips_cache: dict[str, Any] = {"data": None, "at": 0.0}
+EDGE_IPS_TTL = 5.0  # IPs only change when a container is (re)created
+
+
+def _llm_load() -> list[str]:
+    """The priority order from disk (small file; re-read per use, no lock)."""
+    try:
+        data = json.loads(LLM_SETTINGS_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    order = data.get("order")
+    return [n for n in order if isinstance(n, str)] if isinstance(order, list) else []
+
+
+def _llm_save(order: list[str]) -> None:
+    LLM_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = LLM_SETTINGS_PATH.with_name(LLM_SETTINGS_PATH.name + ".tmp")
+    tmp.write_text(json.dumps({"order": order}, indent=2) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, LLM_SETTINGS_PATH)
+
+
+def _edge_ips() -> dict[str, str]:
+    """Container name → edge-network IPv4 (panel-do edge-ips, 5 s cache).
+    Empty on failure (e.g. the edge network was deleted) — instances then
+    simply report down, never a wrong IP."""
+    now = time.monotonic()
+    if _edge_ips_cache["data"] is not None and now - _edge_ips_cache["at"] < EDGE_IPS_TTL:
+        return _edge_ips_cache["data"]
+    out: dict[str, str] = {}
+    try:
+        proc = _sudo_panel_do("edge-ips", [], 20.0)
+        if proc.returncode == 0:
+            data = json.loads(proc.stdout or "{}")
+            # docker renders an EMPTY .Containers map as `null` on some
+            # versions — an empty fleet, not a parse error.
+            if isinstance(data, dict):
+                for ep in data.values():
+                    name = (ep.get("Name") or "").lstrip("/")
+                    ip = (ep.get("IPv4Address") or "").partition("/")[0]
+                    if name and ip:
+                        out[name] = ip
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        pass
+    _edge_ips_cache["data"] = out
+    _edge_ips_cache["at"] = now
+    return out
+
+
+def _llm_mark(name: str, up: bool, err: str = "") -> None:
+    _llm_health[name] = {"up": up, "at": time.monotonic(), "err": err}
+
+
+def _llm_fresh_down(name: str) -> bool:
+    """Knows it's down, recently — skip it (avoids 5 s connect hangs on a
+    wedged instance). Once stale, the proxy tries it anyway (connection-
+    refused fails in ms), so the probe loop dying can't wedge failover."""
+    h = _llm_health.get(name)
+    now = time.monotonic()
+    return bool(h and not h["up"] and now - h["at"] < LLM_PROBE_INTERVAL_S)
+
+
+async def _llm_probe(client: httpx.AsyncClient, name: str, ip: str) -> None:
+    try:
+        r = await client.get(f"http://{ip}:8000/health", timeout=LLM_PROBE_TIMEOUT_S)
+        _llm_mark(name, r.status_code == 200, "" if r.status_code == 200 else f"/health → {r.status_code}")
+    except httpx.HTTPError as e:
+        _llm_mark(name, False, type(e).__name__)
+
+
+async def _llm_probe_loop() -> None:
+    while True:
+        await asyncio.sleep(LLM_PROBE_INTERVAL_S)
+        if _llm_http is None:
+            continue
+        try:
+            order = await asyncio.to_thread(_llm_load)
+            ips = await asyncio.to_thread(_edge_ips)
+            fleet = await asyncio.to_thread(_llm_fleet)
+        except Exception:  # noqa: BLE001 — a probe-cycle hiccup is not fatal
+            continue
+        ip_by_name = _llm_ip_by_name(fleet, ips)
+
+        async def one(name: str) -> None:
+            ip = ip_by_name.get(name, "")
+            if ip:
+                await _llm_probe(_llm_http, name, ip)
+            else:
+                _llm_mark(name, False, "container not on the edge network")
+
+        await asyncio.gather(*(one(n) for n in order), return_exceptions=True)
+        # forget names removed from the order (keeps the status map clean)
+        for name in [n for n in _llm_health if n not in order]:
+            del _llm_health[name]
+            _llm_down_until.pop(name, None)
+
+
+def _llm_fleet() -> list[dict[str, str]]:
+    """All llm-* containers (running or stopped) as {name, container, display, state}.
+
+    `name` is the identifier the order holds: the compose SERVICE name
+    (llm-27b — the same name the traefik rules, the RUNBOOK and `make
+    rollback WHAT=…` use) when the container carries the compose service
+    label, else the bare container name (a hand-`docker run`-ed llm-*).
+    NOT the docker container name — compose prefixes it (panel-llm-27b),
+    so keying on it would find nothing on the deployed stack.
+    `container` is that docker name: the key _edge_ips() maps to an IP.
+    """
+    out: list[dict[str, str]] = []
+    for x in containers_cached():
+        raw_names = x.get("Names") or ""
+        container = str(raw_names[0] if isinstance(raw_names, list) else raw_names or "").lstrip("/")
+        svc = _cli_label_get(x.get("Labels") or "", "com.docker.compose.service")
+        name = svc if svc and LLM_NAME_RE.match(svc) else container
+        if not name.startswith("llm-"):
+            continue
+        state = x.get("State", "unknown")
+        # a recreated service leaves its old container in `ps -a` — two rows
+        # may claim one name; keep the running one
+        for i, f in enumerate(out):
+            if f["name"] == name:
+                if not (f["state"] == "running" and state != "running"):
+                    out.pop(i)
+                break
+        # Same display fallback as _container_view: a bare `panel.manage=true`
+        # label is a marker, not a name.
+        display = _cli_label_get(x.get("Labels") or "", MANAGE_LABEL)
+        out.append(
+            {
+                "name": name,
+                "container": container,
+                "display": display if display and display != "true" else name,
+                "state": state,
+            }
+        )
+    return sorted(out, key=lambda f: f["name"])
+
+
+def _llm_fleet_view() -> list[dict[str, str]]:
+    """All llm-* containers (running or stopped): the UI's add-list."""
+    return [{"name": f["name"], "display": f["display"], "state": f["state"]} for f in _llm_fleet()]
+
+
+def _llm_ip_by_name(fleet: list[dict[str, str]], ips: dict[str, str]) -> dict[str, str]:
+    """Order name → edge-network IP ("" = no container row or no IP)."""
+    return {f["name"]: ips.get(f["container"], "") for f in fleet}
+
+
+def _llm_status_view(order: list[str]) -> tuple[dict[str, str], Optional[str]]:
+    """(status per name, active name) — active = what the next request hits now."""
+    status: dict[str, str] = {}
+    active: Optional[str] = None
+    for name in order:
+        h = _llm_health.get(name)
+        if h is not None and time.monotonic() - h["at"] < LLM_STALE_AFTER_S:
+            status[name] = "up" if h["up"] else "down"
+        else:
+            status[name] = "unknown"
+        # Mirror the proxy's first CANDIDATE — anything not freshly parked —
+        # not just fresh-up: within a probe cycle the proxy also tries
+        # unknown/stale names, so "active" should say what the next request
+        # hits first (steady state: identical to the first fresh-up).
+        if active is None and not _llm_fresh_down(name):
+            active = name
+    return status, active
+
+
+async def _llm_stream(upstream: httpx.Response) -> StreamingResponse:
+    # location is stripped too: a 3xx (which the LLM servers practically
+    # never return) would carry an internal http://<edge-ip>:8000 Location —
+    # never forward an internal address to the client.
+    headers = {
+        k: v
+        for k, v in upstream.headers.items()
+        if k.lower() not in HOP_BY_HOP and k.lower() != "location"
+    }
+
+    async def body():
+        try:
+            async for chunk in upstream.aiter_raw():
+                yield chunk
+        finally:
+            await upstream.aclose()  # client disconnect → finally → close upstream
+
+    return StreamingResponse(body(), status_code=upstream.status_code, headers=headers)
+
+
+@app.get("/")
+def root() -> dict[str, str]:
+    # Direct bind only: the llm.pietrasik.top router is scoped to /v1 and
+    # panel.pietrasik.top serves / from panel-web. Handy for a sanity curl.
+    return {
+        "service": "panel-api",
+        "llm": "https://llm.pietrasik.top/v1",
+        "panel": "https://panel.pietrasik.top/api (Authelia admins)",
+    }
+
+
+@app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"])
+async def llm_proxy(path: str, request: Request):
+    # Same gate as the per-instance subdomains — the key, not Authelia.
+    scheme, _, token = (request.headers.get("authorization") or "").partition(" ")
+    if not (
+        LLM_API_KEY
+        and scheme.lower() == "bearer"
+        # .encode() like require_admin: compare_digest(str, str) raises
+        # TypeError on non-ASCII — a 500 where a 401 belongs.
+        and secrets.compare_digest(token.strip().encode(), LLM_API_KEY.encode())
+    ):
+        return JSONResponse(
+            {"error": {"message": "Invalid API key.", "type": "invalid_request_error", "code": "invalid_api_key"}},
+            status_code=401,
+        )
+    # Stream-cap: stop reading at LLM_MAX_BODY instead of buffering the whole
+    # upload first (a full buffer makes the cap decorative).
+    body = bytearray()
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > LLM_MAX_BODY:
+            return JSONResponse(
+                {"error": {"message": "Request body too large.", "type": "invalid_request_error", "code": "body_too_large"}},
+                status_code=413,
+            )
+    body = bytes(body)
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP}
+    headers["accept-encoding"] = "identity"
+
+    order = await asyncio.to_thread(_llm_load)
+    ips = await asyncio.to_thread(_edge_ips)
+    try:
+        fleet = await asyncio.to_thread(_llm_fleet)
+    except HTTPException:
+        fleet = []  # panel-do down: degrade to 503-with-reasons, not a 500
+    ip_by_name = _llm_ip_by_name(fleet, ips)
+    names_in_fleet = {f["name"] for f in fleet}
+    reasons = []
+    for name in order:
+        if _llm_fresh_down(name):
+            reasons.append(f"{name}: down ({_llm_health[name]['err']})")
+            continue
+        if name not in names_in_fleet:
+            reasons.append(f"{name}: container not found (stale order entry?)")
+            continue
+        ip = ip_by_name.get(name, "")
+        if not ip:
+            reasons.append(f"{name}: not on the edge network")
+            continue
+        try:
+            upstream = await _llm_http.send(
+                _llm_http.build_request(
+                    request.method, f"http://{ip}:8000/v1/{path}", headers=headers, content=body
+                ),
+                stream=True,
+            )
+        except httpx.HTTPError as e:
+            _llm_mark(name, False, type(e).__name__)
+            _llm_down_until[name] = time.monotonic() + LLM_COOLDOWN_S
+            reasons.append(f"{name}: {type(e).__name__}")
+            continue
+        if upstream.status_code >= 500:
+            # The instance answered but can't serve (model loading, OOM, …):
+            # a 5xx means it didn't process the request, so park it and fall
+            # through to the next rather than bouncing the client.
+            await upstream.aclose()
+            _llm_mark(name, False, f"HTTP {upstream.status_code}")
+            _llm_down_until[name] = time.monotonic() + LLM_COOLDOWN_S
+            reasons.append(f"{name}: HTTP {upstream.status_code}")
+            continue
+        return await _llm_stream(upstream)
+    msg = (
+        f"No LLM instance is up — {'; '.join(reasons)}"
+        if reasons
+        else "No LLM instance configured (set the order in the panel Settings)"
+    )
+    return JSONResponse(
+        {"error": {"message": msg, "type": "server_error", "code": "no_instance_up"}},
+        status_code=503,
+    )
+
+
+class LLMSettingsBody(BaseModel):
+    order: list[str] = []
+
+
+@app.get("/api/settings/llm")
+def llm_settings_get(_admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
+    order = _llm_load()
+    status, active = _llm_status_view(order)
+    return {
+        "order": order,
+        "status": status,
+        "active": active,
+        "fleet": _llm_fleet_view(),
+        "probe_interval_s": LLM_PROBE_INTERVAL_S,
+    }
+
+
+@app.put("/api/settings/llm")
+def llm_settings_put(body: LLMSettingsBody, _admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
+    known = {f["name"] for f in _llm_fleet_view()}
+    order: list[str] = []
+    for name in body.order:
+        if not LLM_NAME_RE.match(name):
+            raise HTTPException(400, f"bad instance name {name!r} (want llm-<name>)")
+        if name not in known:
+            raise HTTPException(400, f"unknown instance {name!r} (not a llm-* container)")
+        if name not in order:
+            order.append(name)
+    if len(order) > LLM_MAX_ORDER:
+        raise HTTPException(400, f"at most {LLM_MAX_ORDER} instances in the order")
+    _llm_save(order)
+    _audit(_admin, "llm-settings-put", order, 0)
+    status, active = _llm_status_view(order)
+    return {"order": order, "status": status, "active": active}

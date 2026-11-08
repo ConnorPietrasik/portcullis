@@ -248,6 +248,22 @@ func listContainers(ctx context.Context, args []string, logf func(string, ...any
 	return nil
 }
 
+// edgeNetworkIPs lists the edge network's endpoints (containerID → {Name,
+// IPv4Address, …} JSON on stdout). The LLM fallback router (panel-api) uses
+// it to map a configured instance NAME to its bridge IP — `docker ps` only
+// exposes network names, not per-network IPs. Read-only, no args.
+func edgeNetworkIPs(ctx context.Context, args []string, logf func(string, ...any)) error {
+	out, err := runCmd(ctx, "/usr/bin/docker", "network", "inspect", "edge", "--format", "{{json .Containers}}")
+	if err != nil {
+		return fmt.Errorf("docker network inspect edge: %v: %s", err, out)
+	}
+	// JSON object on stdout; panel-api parses it (and degrades to "no fleet"
+	// when the edge network itself is absent — that's a FAIL here, so the
+	// router reports every instance down instead of guessing).
+	fmt.Print(out)
+	return nil
+}
+
 func containerAction(verb string) RunFunc {
 	return func(ctx context.Context, args []string, logf func(string, ...any)) error {
 		out, err := runCmd(ctx, "/usr/bin/docker", verb, "--", args[0])
@@ -280,6 +296,13 @@ var registry = map[string]Action{
 		Timeout: 15 * time.Second,
 		Confirm: false,
 		Run:     listContainers,
+	},
+	"edge-ips": {
+		Summary: "edge-network endpoints: containerID → {Name, IPv4Address} (JSON on stdout)",
+		Args:    nil,
+		Timeout: 15 * time.Second,
+		Confirm: false,
+		Run:     edgeNetworkIPs,
 	},
 	"start-container": {
 		Summary: "Start a stopped container (12-hex ID)",
