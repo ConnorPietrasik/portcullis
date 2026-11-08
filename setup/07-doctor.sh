@@ -348,12 +348,13 @@ if [[ -d /opt/panel && -n "$panel_web_id" ]]; then
   # nginx:stable-alpine, whose wget has no --timeout (GNU-only). Passing it
   # makes the probe abort at argument parsing (usage on stderr, no request
   # ever made, stdout empty) — a permanent false FAIL with the network
-  # perfectly healthy. Busybox wget also has no connect timeout (-T only
-  # caps reads), so a genuinely DROPped port would hang the doctor forever:
-  # cap the whole probe with the timeout applet. 2>&1 so a real failure
-  # (refused/no route) surfaces in the hint instead of masquerading as an
-  # empty response.
-  edge_health="$(sudo docker exec -T "$panel_web_id" \
+  # perfectly healthy. Busybox wget also has no connect timeout (wget's -T
+  # only caps reads), so a genuinely DROPped port would hang the doctor
+  # forever: cap the whole probe with the timeout applet. 2>&1 so a real
+  # failure (refused/no route) surfaces in the hint instead of masquerading
+  # as an empty response. No -T on exec: redundant without -t, and removed
+  # in Docker 29.
+  edge_health="$(sudo docker exec "$panel_web_id" \
     timeout 5 wget -q -O - http://172.17.0.1:8010/api/health 2>&1 || true)"
   if grep -q '"ok":true' <<<"$edge_health"; then
     ok "edge container → 172.17.0.1:8010 reachable (real API path)"
