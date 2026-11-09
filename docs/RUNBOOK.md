@@ -387,10 +387,15 @@ them that way: `cards 0+2+5`).
 count in the set. Everything else in `x-llm-base` is identical for all instances.
 
 **`restart: "no"` on purpose:** after a reboot nothing LLM comes back by itself — you start the set you want from the panel.
-`make update` still starts new/changed instances and leaves deliberately-stopped ones down (and out of the health gate).
+`make update` recreates running instances whose block or image changed and leaves deliberately-stopped ones down (and out of the health gate).
+It never *starts* a fleet instance from a missing container: a pruned stopped container (raw `docker container prune`)
+is indistinguishable from a new one, and auto-starting the whole fleet at once is invalid when instances share cards —
+new instances are deployed + pulled, then left down: start one with `cd /opt/panel && docker compose up -d <svc>`,
+after which the panel's Services view manages it as usual.
 
-**Add an instance:** clone a block (name, model, cards, flags) + the router pair, then `make update` (first load ~1 min on this
-hardware, shown in Services). The flags in the committed blocks are this host's own tuning — the blocks are the truth, do not
+**Add an instance:** clone a block (name, model, cards, flags) + the router pair, then `make update` (deploys + pulls it,
+leaves it down) and `cd /opt/panel && sudo docker compose up -d llm-<name>` (first load ~1 min on this hardware,
+shown in Services). The flags in the committed blocks are this host's own tuning — the blocks are the truth, do not
 reconcile them against upstream. To trial a NEW model first: `git clone --depth 1` upstream, run its `deploy/compose/<model>.yaml`
 ad hoc (one at a time), delete the clone — its flags belong to the trial, not to a fleet block.
 
@@ -491,5 +496,6 @@ either is missing; on CachyOS both are distro defaults, so this is usually a no-
 | Services view empty | containers lack the `panel.manage` label |
 | container action → 500 | panel-do too old for the container actions → `make panel-do`; details in `sudo journalctl -u panel-api -n 50` |
 | `up -d` → "network edge declared as external, but could not be found" | the `edge` network was deleted — it's created only by `make deploy` / `make stack`, never by compose (`external: true`). Cause: the edge containers were stopped (or removed) and unused networks pruned — `docker system prune` does both in one run (that's what the panel's *old* `prune-docker` action ran). The current `prune-docker` never touches networks. Fix: `sudo docker network create edge`, then `sudo docker compose --project-directory /opt/panel up -d` (or re-run `make deploy`); `make doctor` checks for this |
+| update gate: `llm-* (exited)`, and the update started the WHOLE fleet | a stopped fleet container was pruned (raw `docker container prune` / `docker system prune`), so the update read the missing container as a new service and started every instance at once — invalid when they share cards. The auto-rollback leaves the fleet containers in place, so a re-run of `make update` classifies them as deliberately stopped again (deploys the new configs, pulls the images, starts nothing fleet). With the current guard, a pruned (or brand-new) `restart: "no"` service is never auto-started — the update names it and leaves it down. Don't raw-prune containers on this box — use the panel's `prune-docker` action (images + build cache only) |
 | domain resolves to an old IP | panel-ddns failing → `journalctl -u panel-ddns`; then `sudo systemctl start panel-ddns` (missing/stale records are fixed in place) |
 | panel-api won't bind | docker failed to start (`panel-api` does `Wants=docker.service`, so a docker *failure* surfaces here too): `systemctl status docker`, `ip addr show docker0` missing |

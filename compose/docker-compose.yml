@@ -169,7 +169,7 @@ services:
       --tp 4 --max-num-seqs 16 --max-model-len 250000
       --gpu-headroom-mib 96 --prefix-cache-mib 65536 --checkpoint-policy tip-only
       --num-speculative-tokens 3 --max-num-batched-tokens 2048
-    labels: ["panel.manage=Qwen 27B FP8 · cards 0-3"] # Services view name
+    labels: ["panel.manage=Qwen 27B IQ6R-S-V4 · cards 0-3"] # Services view name
   llm-flashnext:
     <<: *llm-base
     environment:

@@ -122,11 +122,30 @@ stack_compose build --pull
 # down — an update must not resurrect them. --remove-orphans drops containers
 # for services REMOVED from compose (stopped-but-defined services keep
 # theirs).
+# The "no container before" test tells a NEW service from a deliberately
+# stopped one — but a pruned stopped container (raw `docker container prune`)
+# destroys that evidence and reads as NEW. On-demand services (restart: "no"
+# — the LLM fleet) therefore never auto-start from a missing container: the
+# restart policy is the durable signal, and starting the whole fleet at once
+# is invalid, not just rude, when instances share cards (ROCR_VISIBLE_DEVICES).
+# They still get their image pulled (step 4) and their configs synced (step 3);
+# a genuinely NEW instance is deployed the same way and started once with
+# `docker compose up -d <svc>` (the panel's Services view then manages it).
 defined_services="$(stack_services)"
+on_demand="$(stack_compose config --format json | python3 -c 'import json,sys
+svcs = json.load(sys.stdin).get("services") or {}
+[print(s) for s, v in svcs.items() if isinstance(v, dict) and v.get("restart") == "no"]')" \
+  || die "cannot read the deployed compose config (missing env vars? re-run: make deploy)"
 targets=""
 for s in $defined_services; do
-  if grep -qx -- "$s" <<<"$snap_services" || ! grep -qx -- "$s" <<<"$pre_containers"; then
-    targets+="$s "
+  if grep -qx -- "$s" <<<"$snap_services"; then
+    targets+="$s " # was running — must be running after the update
+  elif grep -qx -- "$s" <<<"$pre_containers"; then
+    : # stopped with a container present — deliberately stopped, leave it down
+  elif grep -qx -- "$s" <<<"$on_demand"; then
+    info "  $s: no container and restart: \"no\" — left down (a stopped container was pruned, or it is brand-new). Once the update passes, start it with: cd /opt/panel && docker compose up -d $s (then the panel's Services view manages it)"
+  else
+    targets+="$s " # no container before and not on-demand — new service added by this update
   fi
 done
 if [[ -n "$targets" ]]; then
