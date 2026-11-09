@@ -162,13 +162,13 @@ services:
       RADIANCE_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env} # read by --api-key-env, so the key
       # never sits in argv (ps / docker inspect)
       RADIANCE_LOG: "warn" # per-request INFO lines (tok/s, cache, ttft) are chatty — radiance docs §6.5
+    # bf16 KV (no --kv-cache-dtype: fp8 diverges on long contexts). VRAM holds ~612k tokens;
+    # the host tier keeps evicted context for re-prefill: 40 GiB = 655k tokens, so 6 x 200k
+    # realistic sessions (1.2M) stay resident-or-retained. Box has 251 GiB RAM.
     command: >
       --model /models/qwen3.8-27b-iq6r-s-v4.rad
       --host 0.0.0.0 --port 8000 --api-key-env RADIANCE_API_KEY
       --tp 2 --max-num-seqs 6 --max-model-len 250000
-      # bf16 KV (no --kv-cache-dtype: fp8 diverges on long contexts). VRAM holds ~612k tokens;
-      # the host tier keeps evicted context for re-prefill: 40 GiB = 655k tokens, so 6 x 200k
-      # realistic sessions (1.2M) stay resident-or-retained. Box has 251 GiB RAM.
       --gpu-headroom-mib 96 --prefix-cache-mib 40960 --checkpoint-policy tip-only
       --num-speculative-tokens 3 --max-num-batched-tokens 2048
     labels: ["panel.manage=Qwen 27B IQ6R-S-V4 · cards 0-1"] # Services view name
