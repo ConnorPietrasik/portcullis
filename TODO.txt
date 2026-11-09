@@ -1,4 +1,3 @@
-Some way to easily configure GPUs per container and what not. Also have the config stick on reboots
 Add LLM stats to the panel; from Radiance (or maybe a link to that?)
 Make an actual portfolio site
 Some sort of chat server that allows the chosen model to do web searches / tool calls to image gen / maybe write scripts to verify stuff. Admin-only and behind authelia, obviously. Should take text / images.

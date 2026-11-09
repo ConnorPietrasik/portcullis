@@ -373,7 +373,8 @@ re-pins itself automatically as part of `make update` (see Updates).
 
 ## LLM fleet (Radiance instances)
 
-[Radiance](https://codeberg.org/StillDeadcode/radiance) instances on 6 shared R9700s; start/stop from the panel's Services view.
+[Radiance](https://codeberg.org/StillDeadcode/radiance) instances on 6 shared R9700s; start/stop and GPU assignment from the panel
+(Services view for the containers, **GPUs view** for the cards — see **GPU pool** below).
 Machine APIs, not browser apps: no Authelia — the gate is the server's own API key (`Authorization: Bearer`) behind the wildcard cert
 + `llm-rate`; clients use `base_url=https://<name>.pietrasik.top/v1` + key, exactly like OpenAI.
 
@@ -381,25 +382,37 @@ Machine APIs, not browser apps: no Authelia — the gate is the server's own API
 `x-llm-base`) ↔ `Host(`<name>.pietrasik.top`)` → `http://llm-<name>:8000` in `traefik/dynamic/llm.yml`. One subdomain per instance so
 agents pin the right server; the wildcard CNAME + cert make that zero DNS work. Port is always 8000 (own IP per container). The
 display name is the `panel.manage` label — **no commas** in it (`docker ps` encodes labels comma-joined and the Services view parses
-them that way: `cards 0+2+5`).
+them that way).
 
-**Cards:** `ROCR_VISIBLE_DEVICES: "i,j,k"` (indices are fixed 0–5; per-card VRAM shows in the panel's GPU stats) + `--tp` = card
-count in the set. Everything else in `x-llm-base` is identical for all instances.
+**Cards:** assigned at run time from the panel's **GPUs view** (a pool with auto-grab — see **GPU pool** below).
+The block's `ROCR_VISIBLE_DEVICES` is the FALLBACK default a hand-run compose
+would use, and the `llm.cards` label (== `--tp`) is how many cards the instance needs. Everything else in
+`x-llm-base` is identical for all instances.
 
-**`restart: "no"` on purpose:** after a reboot nothing LLM comes back by itself — you start the set you want from the panel.
+**`restart: "no"` on purpose:** after a reboot nothing LLM comes back by itself, EXCEPT the set you mark
+**boot** in the GPUs view (the boot-autostart list — applied by `llm-autostart.service`, see **GPU pool** below).
 `make update` recreates running instances whose block or image changed and leaves deliberately-stopped ones down (and out of the health gate).
 It never *starts* a fleet instance from a missing container: a pruned stopped container (raw `docker container prune`)
 is indistinguishable from a new one, and auto-starting the whole fleet at once is invalid when instances share cards —
 new instances are deployed + pulled, then left down. Bring one up from the panel: the Services view lists defined
-but container-less services under **defined, no container** with a *create + start* button (panel-do
-`start-service` = `docker compose up -d <svc>`, same validation/audit as the other actions); the command line is
-`cd /opt/panel && sudo docker compose up -d <svc>`. After that the panel manages it as usual.
+but container-less services under **defined, no container** with a *create + start* button — for llm-*
+instances that is the GPU-aware path (saved card set when free, else the lowest free set; see **GPU pool**
+below), for everything else it is panel-do `start-service` (same validation/audit as the other actions).
+The command-line equivalent is `cd /opt/panel && sudo docker compose -f docker-compose.yml -f
+/opt/panel-api/llm-gpu-override.yml up -d <svc>` — keep the GPU override in the render for llm-*
+instances, or the revive pins the base-file fallback cards and shows up as drift in the GPU view.
+After that the panel manages it as usual.
 
-**Add an instance:** clone a block (name, model, cards, flags) + the router pair, then `make update` (deploys + pulls it,
-leaves it down) and start it — panel Services view → *defined, no container* → *create + start*
-(first load ~1 min on this hardware, shown in Services). The flags in the committed blocks are this host's own tuning — the blocks are the truth, do not
-reconcile them against upstream. To trial a NEW model first: `git clone --depth 1` upstream, run its `deploy/compose/<model>.yaml`
-ad hoc (one at a time), delete the clone — its flags belong to the trial, not to a fleet block.
+**Add an instance** (including a second copy of a model — `llm-27b-1` next to `llm-27b`): copy the block
+(name, model, `llm.cards`, flags) + the router pair — four name references must all match (service key,
+router key, `Host(...)`, service `url`); `make doctor` flags any that don't — give the twins distinct
+display labels (append the instance name) so the Services view tells them apart. Then `git commit`,
+`make update` (deploys + pulls it, leaves it down) and start it — panel GPUs view → *start* (or the Services
+view → *defined, no container* → *create + start*, which for llm-* services goes through the same GPU-aware
+path). First load ~1 min on this hardware, shown in the panel. The flags in the committed blocks are this
+host's own tuning — the blocks are the truth, do not reconcile them against upstream. To trial a NEW model
+first: `git clone --depth 1` upstream, run its `deploy/compose/<model>.yaml` ad hoc (one at a time), delete
+the clone — its flags belong to the trial, not to a fleet block.
 
 **Key:** one shared `LLM_API_KEY` for all instances (a key authorizes LLM use, not one instance). Rotate = edit `.env` +
 `make update` (radiance reads it at startup).
@@ -444,9 +457,52 @@ instance “not on the edge network” (a 503 the route check still calls health
 checks the route (200 or 503 = healthy), that unauthenticated `/v1/*` gets 401, and that the
 registry carries `edge-ips` (catches the stale binary).
 
-**Later — dynamic GPU allocation:** the pin is just env at start time, so the end state is a panel-do action (ledger from running
-instances' env, conflict check, write the new set, recreate) + a six-slot free/held UI; the file's pins become last-allocation
-defaults.
+**GPU pool** — per-instance card sets, auto-grab, boot autostart.
+
+The panel's **GPUs** tab is the control surface: a tile per card (free / held by whom, temp, VRAM,
+utilisation) and one row per fleet instance with its **assigned** set (the ledger's intent), its
+**holding** set (the live truth — drift between the two means a failed apply or a hand-run compose),
+start/stop, an **auto** button (grab the lowest free cards, sized by the instance's `--tp` / `llm.cards`),
+a **pick…** row for exact card sets, and a **boot** checkbox.
+
+- **State:** the LEDGER `/opt/panel-api/llm-gpu.json` (panel-owned 0600) holds `allocations`
+  (instance → card set) + `autostart` (ordered list). The OVERRIDE `/opt/panel-api/llm-gpu-override.yml`
+  (0644) is its compose projection — `ROCR_VISIBLE_DEVICES` per instance — and is included in EVERY
+  compose render (`COMPOSE_STACK` in setup/common.sh, panel-do `llm-apply`/`llm-stop`/`start-service`): a `make update`
+  recreate (radiance floats on `latest`) therefore keeps the assignment instead of reverting to the
+  base-file default. Both files are re-rendered by panel-api from the ledger (never hand-edit), and
+  both ride the update snapshot — `make rollback` restores them.
+- **Live holds** are read from the running containers' env (panel-do `llm-live`), never from the
+  ledger: a stopped instance holds nothing, and `assigned`/`holding` are shown separately.
+- **Assigning cards (re)creates the container** — GPU env only exists at create time — so "set cards"
+  and "run on them" are one operation (brief downtime + model reload on a running instance). Conflicts
+  (a card held by another RUNNING instance, wrong count for `--tp`, out-of-range index) are refused
+  with the reason; the instance's own current cards are allowed (a move or a no-op recreate).
+- **Count drift is warned, not silently run:** a saved set whose count no longer matches the instance's
+  `llm.cards` / `--tp` (e.g. after a flag edit without a re-assign) shows in the panel's warnings — a
+  GPU-aware start self-heals by re-grabbing the right number of free cards, but a hand-run `up -d`
+  would pin the old count and the engine would fail to load. Reassign (auto) or fix the flag.
+- **Starts are GPU-aware everywhere**: the GPUs view's *start*, and the Services view's *start* /
+  *create + start* for llm-* services, all go through `POST /api/llm/gpus/start` — the saved set when
+  it is free, else the lowest free set (recorded in the ledger). A raw `docker start` is deliberately
+  off the panel's path: it would reuse the create-time env and could resurrect cards another instance
+  now owns. Stop is plain (the container is kept; cards free on exit; the assignment is remembered).
+- **Boot autostart:** `llm-autostart.service` (oneshot, User=panel, after docker; installed + enabled
+  by `make api`, no-op when the list is empty) runs `panel-api/llm_autostart.py`, which walks the
+  autostart list IN ORDER: an instance already up is left alone; a saved set that is free is honored;
+  otherwise the lowest free set is grabbed and recorded (the ledger converges on what actually
+  starts). So the boot set is conflict-free by construction — whatever fits comes up; a set that
+  doesn't fit is skipped with the reason in `journalctl -u llm-autostart`, and shows down in the
+  panel. Overlapping saved sets are warned about in the panel (autostart warnings) but never block
+  saving — boot resolves them.
+- **Privilege path** (all panel-do, audited in journald like every other action): `llm-fleet`
+  (instances + cards needed, read-only), `llm-live` (live containers + holds, read-only — it extracts
+  ONLY the ROCR entry from the inspect env; the API key is never logged or forwarded), `llm-apply
+  <svc>` (`compose up -d` with the override), `llm-stop <svc>` (`compose stop`). `make doctor` checks
+  the registry carries `llm-apply` (stale-binary tripwire) and that the unit is enabled.
+- **Multiple instances of one model:** a second `llm-27b` is just another instance (see **Add an instance** above) —
+  e.g. `llm-27b` on 0,1 and `llm-27b-1` on 2,3, each with its own subdomain, each assignable
+  independently here.
 
 ## Add a privileged action
 
@@ -496,6 +552,7 @@ either is missing; on CachyOS both are distro defaults, so this is usually a no-
 | `/api/*` → 502 only in the browser (host curls fine) | missing UFW 8010 rule for the edge subnet (RUNBOOK → UFW), or the traefik service URL in `traefik/dynamic/panel.yml` drifted from `172.17.0.1:8010` |
 | `/api/actions` → 500 | panel-do not installed or sudoers missing → `make panel-do` |
 | Services view empty | containers lack the `panel.manage` label |
+| GPUs view errors (`panel-do llm-* failed`) | panel-do too old for the GPU pool actions → `make panel-do`; `make doctor` checks for `llm-apply` in the registry |
 | container action → 500 | panel-do too old for the container actions → `make panel-do`; details in `sudo journalctl -u panel-api -n 50` |
 | `up -d` → "network edge declared as external, but could not be found" | the `edge` network was deleted — it's created only by `make deploy` / `make stack`, never by compose (`external: true`). Cause: the edge containers were stopped (or removed) and unused networks pruned — `docker system prune` does both in one run (that's what the panel's *old* `prune-docker` action ran). The current `prune-docker` never touches networks. Fix: `sudo docker network create edge`, then `sudo docker compose --project-directory /opt/panel up -d` (or re-run `make deploy`); `make doctor` checks for this |
 | update gate: `llm-* (exited)`, and the update started the WHOLE fleet | a stopped fleet container was pruned (raw `docker container prune` / `docker system prune`), so the update read the missing container as a new service and started every instance at once — invalid when they share cards. The auto-rollback leaves the fleet containers in place, so a re-run of `make update` classifies them as deliberately stopped again (deploys the new configs, pulls the images, starts nothing fleet). With the current guard, a pruned (or brand-new) `restart: "no"` service is never auto-started — the update names it and leaves it down. Bring it back from the panel: Services view → *defined, no container* → *create + start*. Don't raw-prune containers on this box — use the panel's `prune-docker` action (images + build cache only) |

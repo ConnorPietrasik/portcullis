@@ -57,6 +57,6 @@ rollback:
 ## local sanity checks (no server needed): shell syntax + python syntax
 verify:
 	@set -e; for f in setup/*.sh tools/*.sh; do bash -n "$$f"; done
-	@python3 -m py_compile panel-api/main.py ddns/ddns.py
+	@python3 -m py_compile panel-api/main.py panel-api/llm_gpus.py panel-api/llm_autostart.py ddns/ddns.py
 	@rm -rf panel-api/__pycache__ ddns/__pycache__  # py_compile always writes bytecode — don't litter
 	@echo "verify: ok"

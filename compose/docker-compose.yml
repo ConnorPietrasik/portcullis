@@ -144,21 +144,27 @@ services:
 
   # ── LLM fleet (Radiance) — start/stop instances from the panel ──────────────
   # An instance = one block here + one router pair in traefik/dynamic/llm.yml:
-  # llm-<name> ↔ <name>.pietrasik.top. Cards: ROCR_VISIBLE_DEVICES "i,j,k"
-  # (fixed 0-5) + --tp = card count. Port always 8000 (own IP per container).
-  # The display name (panel.manage) shows the card set — no commas in it
-  # (docker ps encodes labels comma-joined). restart "no" so a reboot never
-  # resurrects the set you chose. Model files: /models/llm/*.rad (ro-mounted
-  # at /models). New instance: clone a block + the router pair — a block's
-  # flags are this host's own tuning; the committed blocks are the truth, not
-  # upstream's. Trialing a model first: temp-clone radiance upstream, run its
-  # deploy/compose/<model>.yaml ad hoc, delete the clone (RUNBOOK → LLM fleet).
+  # llm-<name> ↔ <name>.pietrasik.top. Port always 8000 (own IP per container).
+  #
+  # CARDS: the GPU view (panel tab "GPUs") assigns card sets per instance at
+  # run time — it pins ROCR_VISIBLE_DEVICES through /opt/panel-api/llm-gpu-
+  # override.yml (every compose render includes it), so the pins below are
+  # FALLBACK DEFAULTS for a hand-run compose, not the running truth. llm.cards
+  # is how many cards the instance NEEDS (keep == --tp) — the pool's auto-
+  # grab sizes off it. The display name (panel.manage) has no card set in it
+  # (the set moves — and no commas: docker ps encodes labels comma-joined).
+  # restart "no" so a reboot never resurrects the set you chose; the boot
+  # autostart list (GPU view) is what comes back. Model files:
+  # /models/llm/*.rad (ro-mounted at /models). New instance (including a
+  # second copy of a model, e.g. llm-27b-1): copy the block + the router pair
+  # (RUNBOOK → LLM fleet; make doctor checks all four name references match),
+  # make update, then assign cards in the GPU view.
   llm-27b:
     <<: *llm-base
     environment:
-      ROCR_VISIBLE_DEVICES: "0,1" # 2 cards: the IQR-V4 vocabulary-weighted lm_head (output.k<B>) only
-      # shards at tp<=2 — class row counts are multiples of 512, not 1024 (radiance: "rows a multiple of
-      # 256 a rank")
+      ROCR_VISIBLE_DEVICES: "0,1" # fallback default (the GPU view's override wins): 2 cards — the
+      # IQR-V4 vocabulary-weighted lm_head (output.k<B>) only shards at tp<=2 — class row counts
+      # are multiples of 512, not 1024 (radiance: "rows a multiple of 256 a rank")
       RADIANCE_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env} # read by --api-key-env, so the key
       # never sits in argv (ps / docker inspect)
       RADIANCE_LOG: "warn" # per-request INFO lines (tok/s, cache, ttft) are chatty — radiance docs §6.5
@@ -171,11 +177,14 @@ services:
       --tp 2 --max-num-seqs 6 --max-model-len 250000
       --gpu-headroom-mib 96 --prefix-cache-mib 40960 --checkpoint-policy tip-only
       --num-speculative-tokens 3 --max-num-batched-tokens 2048
-    labels: ["panel.manage=Qwen 27B IQ5R-S-V4 · cards 0-1"] # Services view name
+    labels:
+      - panel.manage=Qwen 27B IQ5R-S-V4 # Services view name (no card set — it moves)
+      - llm.cards=2 # the pool's auto-grab size (== --tp)
   llm-flashnext:
     <<: *llm-base
     environment:
-      ROCR_VISIBLE_DEVICES: "0,1,2,3" # same four cards as llm-27b — not at the same time
+      ROCR_VISIBLE_DEVICES: "0,1,2,3" # fallback default (override wins): same four cards as
+      # llm-27b's — not at the same time
       RADIANCE_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env}
       RADIANCE_LOG: "warn"
     command: >
@@ -185,7 +194,9 @@ services:
       --placement expert_tiered --host-pool-mib 24576 --gpu-headroom-mib 96
       --prefix-cache-mib 65536 --checkpoint-policy tip-only
       --num-speculative-tokens 3 --max-num-batched-tokens 2048
-    labels: ["panel.manage=Qwen Flash-Next · cards 0-3"] # Services view name
+    labels:
+      - panel.manage=Qwen Flash-Next # Services view name (no card set — it moves)
+      - llm.cards=4 # the pool's auto-grab size (== --tp)
 
 volumes:
   acme: {}

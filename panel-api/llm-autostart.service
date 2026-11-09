@@ -1,0 +1,21 @@
+[Unit]
+Description=LLM fleet boot autostart (panel-configured instances, panel-configured GPU sets)
+# After docker (the fleet's containers + the edge network live there) and
+# network-online (a first-run image pull can touch the registry). Harmless
+# no-op when the ledger is missing or the autostart list is empty — the
+# script exits 0 without touching anything.
+After=network-online.target docker.service
+Wants=docker.service network-online.target
+
+[Service]
+Type=oneshot
+User=panel
+Group=panel
+WorkingDirectory=/opt/panel-api
+# No EnvironmentFile on purpose: the script needs no secrets — paths are
+# fixed, `sudo -n panel-do` is the privilege path, and the ledger it reads
+# is panel-owned 0600. stdout/stderr → journald (journalctl -u llm-autostart).
+ExecStart=/opt/panel-api/venv/bin/python /opt/panel-api/llm_autostart.py
+
+[Install]
+WantedBy=multi-user.target

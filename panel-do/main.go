@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -191,6 +192,204 @@ var unitNameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._@-]*\.service$`)
 var containerIDRe = regexp.MustCompile(`^[0-9a-f]{12}$`)
 var serviceNameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
 
+// llmServiceRe — an LLM fleet instance's compose service name (llm-27b,
+// llm-27b-1, …). Mirrors panel-api's LLM_NAME_RE, so the two sides can
+// never disagree about what a fleet instance is called.
+var llmServiceRe = regexp.MustCompile(`^llm-[a-z0-9][a-z0-9-]{0,62}$`)
+
+// llmFleet lists the deployed stack's LLM fleet instances (services named
+// llm-*) and the number of cards each one needs — the GPU pool's static
+// half. cards comes from the llm.cards label (explicit, keep == --tp),
+// falling back to the --tp flag in the instance's command (tensor
+// parallelism = card count), then 1. JSON array on stdout; read-only, no args.
+func llmFleet(ctx context.Context, args []string, logf func(string, ...any)) error {
+	out, err := runCmd(ctx, "/usr/bin/docker", "compose", "--project-directory", "/opt/panel",
+		"-f", "/opt/panel/docker-compose.yml", "config", "--format", "json")
+	if err != nil {
+		return fmt.Errorf("compose config: %v: %s", err, out)
+	}
+	var cfg struct {
+		Services map[string]struct {
+			// command is emitted as a string OR a token list depending on the
+			// compose version — accept both (same drift-tolerance as labels
+			// in composeLabel). Raw here; tokenized in tensorParallel.
+			Command json.RawMessage `json:"command"`
+			Labels  json.RawMessage `json:"labels"`
+		} `json:"services"`
+	}
+	if err := json.Unmarshal([]byte(out), &cfg); err != nil {
+		return fmt.Errorf("compose config: bad JSON: %v", err)
+	}
+	type inst struct {
+		Name    string `json:"name"`
+		Display string `json:"display"`
+		Cards   int    `json:"cards"`
+	}
+	res := []inst{}
+	for name, s := range cfg.Services {
+		if !llmServiceRe.MatchString(name) {
+			continue
+		}
+		display := composeLabel(s.Labels, "panel.manage")
+		if display == "" || display == "true" {
+			display = name
+		}
+		cards := 0
+		if v := composeLabel(s.Labels, "llm.cards"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				cards = n
+			}
+		}
+		if cards == 0 {
+			cards = tensorParallel(commandTokens(s.Command))
+		}
+		res = append(res, inst{name, display, cards})
+	}
+	sort.Slice(res, func(i, j int) bool { return res[i].Name < res[j].Name })
+	enc, err := json.Marshal(res)
+	if err != nil {
+		return fmt.Errorf("llm-fleet: marshal: %v", err)
+	}
+	fmt.Println(string(enc))
+	return nil
+}
+
+// commandTokens turns a compose `command` (string or token-list, per version)
+// into a token slice; nil when absent.
+func commandTokens(raw json.RawMessage) []string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var tokens []string
+	if err := json.Unmarshal(raw, &tokens); err == nil {
+		return tokens
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return strings.Fields(s)
+	}
+	return nil
+}
+
+// tensorParallel reads the --tp value out of a compose command (a token list); 1
+// when the flag is absent (a single card).
+func tensorParallel(cmd []string) int {
+	for i := 0; i+1 < len(cmd); i++ {
+		if cmd[i] == "--tp" {
+			if n, err := strconv.Atoi(cmd[i+1]); err == nil && n > 0 {
+				return n
+			}
+			return 1
+		}
+	}
+	return 1
+}
+
+// llmLive reports the LIVE GPU holds of the fleet: for every llm-* container
+// (any state) the compose service, docker state, and the cards its
+// ROCR_VISIBLE_DEVICES pins it to (null when unset). The pool's held column
+// and every conflict check derive from this + the container state — a
+// stopped instance holds nothing. Read-only, no args.
+// NOTE: docker inspect's Config.Env also carries RADIANCE_API_KEY — never
+// log or forward the env list; extract ONLY the ROCR entry.
+func llmLive(ctx context.Context, args []string, logf func(string, ...any)) error {
+	// KEY-ONLY label filter: the engine matches label VALUES by exact string
+	// equality (regex is for name/id/status only — moby's MatchKVList), so a
+	// pattern like ^llm- matches nothing and the pool sees an empty world
+	// (conflict detection silently off). Key-only matches every compose
+	// container; the llmServiceRe check after inspect keeps just the fleet.
+	out, err := runCmd(ctx, "/usr/bin/docker", "ps", "-a",
+		"--filter", "label=com.docker.compose.service", "--format", "{{.ID}}")
+	if err != nil {
+		return fmt.Errorf("docker ps: %v: %s", err, out)
+	}
+	ids := strings.Fields(strings.TrimSpace(out))
+	if len(ids) == 0 {
+		fmt.Println("[]")
+		return nil
+	}
+	// ids come from docker itself (12-hex), not the caller — safe tokens.
+	inspect := append([]string{"inspect"}, ids...)
+	out, err = runCmd(ctx, "/usr/bin/docker", inspect...)
+	if err != nil {
+		return fmt.Errorf("docker inspect: %v: %s", err, out)
+	}
+	var data []struct {
+		Name  string `json:"Name"`
+		State struct {
+			Status string `json:"Status"`
+		} `json:"State"`
+		Config struct {
+			Env    []string          `json:"Env"`
+			Labels map[string]string `json:"Labels"`
+		} `json:"Config"`
+	}
+	if err := json.Unmarshal([]byte(out), &data); err != nil {
+		return fmt.Errorf("docker inspect: bad JSON: %v", err)
+	}
+	type inst struct {
+		Service   string `json:"service"`
+		Container string `json:"container"`
+		State     string `json:"state"`
+		Gpus      []int  `json:"gpus"`
+	}
+	res := []inst{}
+	for _, c := range data {
+		svc := c.Config.Labels["com.docker.compose.service"]
+		if !llmServiceRe.MatchString(svc) {
+			continue
+		}
+		var gpus []int
+		for _, kv := range c.Config.Env {
+			if k, v, ok := strings.Cut(kv, "="); ok && k == "ROCR_VISIBLE_DEVICES" {
+				for _, part := range strings.Split(v, ",") {
+					if n, err := strconv.Atoi(strings.TrimSpace(part)); err == nil {
+						gpus = append(gpus, n)
+					}
+				}
+			}
+		}
+		res = append(res, inst{svc, strings.TrimPrefix(c.Name, "/"), c.State.Status, gpus})
+	}
+	sort.Slice(res, func(i, j int) bool { return res[i].Container < res[j].Container })
+	enc, err := json.Marshal(res)
+	if err != nil {
+		return fmt.Errorf("llm-live: marshal: %v", err)
+	}
+	fmt.Println(string(enc))
+	return nil
+}
+
+// llmApply (re)creates + starts one fleet instance on the CURRENT GPU
+// override: panel-api has already written /opt/panel-api/llm-gpu-override.yml
+// (the ledger's set for this service) — this action only converges the
+// container onto it. `up -d` creates a missing container, recreates one
+// whose env drifted (the GPU change), and is a no-op when already converged.
+func llmApply(ctx context.Context, args []string, logf func(string, ...any)) error {
+	out, err := runCmd(ctx, "/usr/bin/docker", "compose", "--project-directory", "/opt/panel",
+		"-f", "/opt/panel/docker-compose.yml", "-f", "/opt/panel-api/llm-gpu-override.yml",
+		"up", "-d", "--", args[0])
+	if err != nil {
+		return fmt.Errorf("up -d %s: %v: %s", args[0], err, out)
+	}
+	logf("fleet %s: up -d with gpu override ok", args[0])
+	return nil
+}
+
+// llmStop stops one fleet instance's container (compose stop: the container
+// is KEPT — the panel starts it again — and its cards are released the
+// moment it exits).
+func llmStop(ctx context.Context, args []string, logf func(string, ...any)) error {
+	out, err := runCmd(ctx, "/usr/bin/docker", "compose", "--project-directory", "/opt/panel",
+		"-f", "/opt/panel/docker-compose.yml", "-f", "/opt/panel-api/llm-gpu-override.yml",
+		"stop", "--", args[0])
+	if err != nil {
+		return fmt.Errorf("stop %s: %v: %s", args[0], err, out)
+	}
+	logf("fleet %s: stopped", args[0])
+	return nil
+}
+
 func restartService(ctx context.Context, args []string, logf func(string, ...any)) error {
 	if out, err := runCmd(ctx, "/usr/bin/systemctl", "restart", "--", args[0]); err != nil {
 		return fmt.Errorf("restart %s: %v: %s", args[0], err, out)
@@ -281,9 +480,17 @@ func containerAction(verb string) RunFunc {
 // (pruned, or never created) and starts it, recreating it when its recorded
 // config has drifted from the compose file. The service name is the only arg,
 // pre-validated as an opaque token; the project paths are hardcoded.
+//
+// The render includes the GPU pool override, like EVERY other invocation that
+// can create/recreate a fleet container (llm-apply, llm-stop, COMPOSE_STACK in
+// setup/common.sh): without it, reviving an llm-* instance would pin the
+// base-file fallback cards instead of its assigned set. The file always exists
+// (make deploy/api seed it, panel-api re-renders it) — a no-op for non-llm-*
+// services, whose names never appear in it.
 func startService(ctx context.Context, args []string, logf func(string, ...any)) error {
 	out, err := runCmd(ctx, "/usr/bin/docker", "compose", "--project-directory", "/opt/panel",
-		"-f", "/opt/panel/docker-compose.yml", "up", "-d", "--", args[0])
+		"-f", "/opt/panel/docker-compose.yml", "-f", "/opt/panel-api/llm-gpu-override.yml",
+		"up", "-d", "--", args[0])
 	if err != nil {
 		return fmt.Errorf("up -d %s: %v: %s", args[0], err, out)
 	}
@@ -423,5 +630,33 @@ var registry = map[string]Action{
 		Timeout: 90 * time.Second,
 		Confirm: true,
 		Run:     containerAction("restart"),
+	},
+	"llm-fleet": {
+		Summary: "LLM fleet instances + cards needed (JSON on stdout)",
+		Args:    nil,
+		Timeout: 20 * time.Second,
+		Confirm: false,
+		Run:     llmFleet,
+	},
+	"llm-live": {
+		Summary: "Live fleet containers: state + ROCR_VISIBLE_DEVICES holds (JSON on stdout)",
+		Args:    nil,
+		Timeout: 20 * time.Second,
+		Confirm: false,
+		Run:     llmLive,
+	},
+	"llm-apply": {
+		Summary: "(Re)create + start an llm-* instance on the override's GPU set",
+		Args:    []*regexp.Regexp{llmServiceRe},
+		Timeout: 5 * time.Minute, // detached start is seconds; 5m covers a missing-image pull
+		Confirm: true,
+		Run:     llmApply,
+	},
+	"llm-stop": {
+		Summary: "Stop an llm-* instance (container kept, cards released)",
+		Args:    []*regexp.Regexp{llmServiceRe},
+		Timeout: 90 * time.Second,
+		Confirm: true,
+		Run:     llmStop,
 	},
 }

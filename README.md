@@ -20,9 +20,12 @@ host API (user 'panel', systemd) ─┬─ /sys + /proc       → AMD temp/util/
                                   │                        temps, board thermometry, net, load (all read-only)
                                   ├─ llm router         → llm.pietrasik.top: first-up instance in the
                                   │                         panel-configured order (Settings)
+                                  ├─ llm GPU pool       → per-instance card sets + auto-grab from the free
+                                  │                         pool + boot autostart (panel GPUs view; ledger in
+                                  │                         /opt/panel-api, projected to a compose override)
                                   └─ sudo -n panel-do   → compiled whitelist dispatcher — the ONLY
                                      privileged path: container list/start/stop/restart,
-                                     systemd restarts, docker prune
+                                     LLM fleet apply/stop + live holds, systemd restarts, docker prune
 
 panel-ddns (systemd timer, user 'panel') ─→ NameSilo API — the apex A record
    follows the public IP; *.pietrasik.top is a CNAME → apex, so it follows for
@@ -94,6 +97,9 @@ Never set `PANEL_DEV=1` in production — the systemd unit doesn't, and nothing 
 - **New app**: compose service on `edge` + router in `compose/traefik/dynamic/` + optional Authelia rule, then `make update` → [RUNBOOK](docs/RUNBOOK.md#add-an-app)
 - **New privileged action**: edit `panel-do/main.go` ACTIONS section → `make panel-do` → [RUNBOOK](docs/RUNBOOK.md#add-a-privileged-action)
   (container control is registry actions too — Services and Actions views both render from `panel-do --list`)
+- **LLM cards**: panel → **GPUs** tab — per-instance card assignment (auto-grab N free from the pool, or
+  pick exact cards), start/stop, and the boot-autostart list. Assignments survive stops, `make update`
+  recreates and reboots (ledger in `/opt/panel-api` — [RUNBOOK → LLM fleet](docs/RUNBOOK.md#llm-fleet-radiance-instances))
 - **Rotate secrets**: edit `.env`, `make update` (it re-derives the panel-api + panel-ddns env files — panel-api is restarted, panel-ddns
   picks the new value up on its next tick)
 - **Logs / status**: `make logs`, `make status`

@@ -21,8 +21,11 @@ panel-do/panel-do
 __pycache__/
 *.pyc
 .venv/
-# panel-api dev-mode LLM settings (PANEL_DEV=1 writes it in the CWD)
+# panel-api dev-mode LLM settings + GPU pool state (PANEL_DEV=1 writes them in the CWD)
 llm-settings.json
+llm-gpu.json
+llm-gpu-override.yml
+.llm-gpu.lock
 
 # runtime artifacts that may appear if the repo lives on the server
 *.sqlite3

@@ -137,6 +137,37 @@ export interface LLMSettings {
   probe_interval_s: number
 }
 
+// ── GPU pool (panel tab "GPUs"; see panel-api/llm_gpus.py) ──────────────
+
+export interface GpuPoolCard {
+  index: number
+  /** the instance holding this card right now (live container env), or null */
+  holder: string | null
+}
+
+export interface LlmGpuInstance {
+  name: string
+  display: string
+  /** cards this instance needs (llm.cards label, else --tp) */
+  cards_needed: number
+  /** the ledger's assignment (intent) — null when never assigned */
+  assigned: number[] | null
+  /** cards its up-container actually pins (live) — drift vs assigned = a failed apply or hand-run compose */
+  holding: number[] | null
+  state: string
+  running: boolean
+  autostart: boolean
+}
+
+export interface GpuPool {
+  /** the pool size (host card count from /sys) */
+  cards: number
+  pool: GpuPoolCard[]
+  instances: LlmGpuInstance[]
+  autostart: string[]
+  warnings: string[]
+}
+
 export interface ActionResult {
   ok: boolean
   exit_code: number

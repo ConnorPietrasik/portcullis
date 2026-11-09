@@ -66,6 +66,11 @@ expect_exit 65 restart-container '../../etc'      # path injection
 expect_exit 65 start-service '../../etc/passwd'   # path injection
 expect_exit 65 start-service -foo                 # flag injection
 expect_exit 65 start-service                      # arity
+expect_exit 65 llm-apply                          # arity
+expect_exit 65 llm-apply notaninstance            # not an llm-* service name
+expect_exit 65 llm-apply '../../etc/passwd'       # path injection
+expect_exit 65 llm-apply -foo                     # flag injection
+expect_exit 65 llm-stop notaninstance             # not an llm-* service name
 
 if sudo -u panel sudo -n /usr/local/libexec/panel-do list-services | python3 -c 'import json,sys
 d = json.load(sys.stdin)
@@ -73,6 +78,39 @@ assert isinstance(d, list) and all(isinstance(s.get("name"), str) for s in d)'; 
   info "  ok: list-services emits a valid service JSON array"
 else
   die "  FAIL: list-services did not emit a valid service JSON array"
+fi
+
+# GPU pool actions (panel's GPU view): the read-only ones must emit valid
+# JSON even with an empty fleet; the mutating ones are NOT exercised here
+# (llm-apply would (re)create a container) — their arg validation above is
+# the negative coverage.
+if sudo -u panel sudo -n /usr/local/libexec/panel-do llm-fleet | python3 -c 'import json,sys
+d = json.load(sys.stdin)
+assert isinstance(d, list) and all(set(x) >= {"name", "display", "cards"} for x in d)'; then
+  info "  ok: llm-fleet emits a valid fleet JSON array"
+else
+  die "  FAIL: llm-fleet did not emit a valid fleet JSON array"
+fi
+if sudo -u panel sudo -n /usr/local/libexec/panel-do llm-live | python3 -c 'import json,sys
+d = json.load(sys.stdin)
+assert isinstance(d, list) and all(set(x) >= {"service", "state", "gpus"} for x in d)'; then
+  info "  ok: llm-live emits a valid live-state JSON array"
+else
+  die "  FAIL: llm-live did not emit a valid live-state JSON array"
+fi
+# Positive cross-check: llm-live must name EXACTLY the llm-* containers the
+# host has. The shape check above passes for [] — and a broken label filter
+# (the engine matches label VALUES exactly, no regex) yields [] while the
+# pool's conflict detection sits silently disabled. Both sides empty on a
+# fresh host = still passes.
+want_live="$(sudo docker ps -a --format '{{.Names}} {{.Label "com.docker.compose.service"}}' \
+  | awk '$2 ~ /^llm-[a-z0-9][a-z0-9-]*$/ {print $1}' | sort)"
+got_live="$(sudo -u panel sudo -n /usr/local/libexec/panel-do llm-live \
+  | python3 -c 'import json,sys; print("\n".join(sorted(x["container"] for x in json.load(sys.stdin))))')"
+if [[ "$want_live" == "$got_live" ]]; then
+  info "  ok: llm-live sees the same llm-* containers as the host"
+else
+  die "  FAIL: llm-live disagrees with the host — host has: [$(echo $want_live | tr '\n' ' ')] llm-live: [$(echo $got_live | tr '\n' ' ')]"
 fi
 
 info "panel-do installed. /api/actions in the panel now works."

@@ -17,7 +17,7 @@
 
 http:
   routers:
-    # one pair per instance — clone for each (llm-27b2 → 27b2.pietrasik.top, …)
+    # one pair per instance — copy for each (llm-27b2 → 27b2.pietrasik.top, …)
     llm-27b:
       rule: "Host(`27b.pietrasik.top`)"
       middlewares: [sec-headers@file, llm-rate@file]

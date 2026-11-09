@@ -21,7 +21,14 @@ export default function Services({ intervalMs }: { intervalMs: number }) {
   async function act(c: ContainerInfo, action: string) {
     if (action !== 'start' && !window.confirm(`${action} ${c.name}?`)) return
     try {
-      await api(`/containers/${c.id}/${action}`, { method: 'POST' })
+      if (action === 'start' && c.service?.startsWith('llm-')) {
+        // GPU-aware start: the saved card set when free, else the lowest
+        // free set — a raw `docker start` would reuse the create-time env
+        // and could resurrect cards another instance now owns (GPU view).
+        await api('/llm/gpus/start', { method: 'POST', body: JSON.stringify({ service: c.service }) })
+      } else {
+        await api(`/containers/${c.id}/${action}`, { method: 'POST' })
+      }
       await refresh()
     } catch (e) {
       window.alert(String(e))
@@ -34,12 +41,18 @@ export default function Services({ intervalMs }: { intervalMs: number }) {
       // The generic action endpoint answers 200 + {ok:false, stderr} on a
       // panel-do failure (unlike the container endpoint, which raises 502)
       // — surface that instead of silently refreshing.
-      const res = await api<ActionResult>('/action/start-service', {
-        method: 'POST',
-        body: JSON.stringify({ args: [s.name] }),
-      })
-      if (!res.ok)
-        throw new Error(`start-service failed (exit ${res.exit_code}): ${res.stderr || res.stdout}`)
+      if (s.name.startsWith('llm-')) {
+        // GPU-aware create+start: picks the instance's saved cards (or the
+        // lowest free set) and writes the assignment — see the GPU view.
+        await api('/llm/gpus/start', { method: 'POST', body: JSON.stringify({ service: s.name }) })
+      } else {
+        const res = await api<ActionResult>('/action/start-service', {
+          method: 'POST',
+          body: JSON.stringify({ args: [s.name] }),
+        })
+        if (!res.ok)
+          throw new Error(`start-service failed (exit ${res.exit_code}): ${res.stderr || res.stdout}`)
+      }
       await refresh()
       await svcs.refresh()
     } catch (e) {

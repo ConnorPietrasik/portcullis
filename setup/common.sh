@@ -315,7 +315,15 @@ update_snapshot_dir() { # <ts> → that snapshot's dir
 
 # Compose command for the deployed stack (project dir /opt/panel). Global so
 # apply_snapshot() can append its override -f.
-COMPOSE_STACK=(sudo docker compose --project-directory /opt/panel -f /opt/panel/docker-compose.yml)
+# The GPU pool override (panel-api's ledger projected as ROCR_VISIBLE_DEVICES
+# per llm-* instance) is included in EVERY render
+# on purpose: radiance floats on `latest`, so a routine `make update` can
+# recreate running instances, and without the override that recreate would
+# silently revert each instance to the card set committed in the base file.
+# The file always exists — make deploy (02) creates it before the first
+# `up -d`, make api (03) re-derives ownership, and panel-api re-renders it
+# from the ledger on every change.
+COMPOSE_STACK=(sudo docker compose --project-directory /opt/panel -f /opt/panel/docker-compose.yml -f /opt/panel-api/llm-gpu-override.yml)
 stack_compose() { "${COMPOSE_STACK[@]}" "$@"; }
 
 stack_services() { # every service defined in the deployed compose, one per line
@@ -692,15 +700,18 @@ wait_panel_api_healthy() { # <timeout-seconds>
   done
 }
 
-# Update the deployed panel-api in place: new main.py + requirements.txt +
-# unit, pip --upgrade within the declared ranges, restart, verify serving.
+# Update the deployed panel-api in place: new main.py + llm_gpus.py +
+# llm_autostart.py + requirements.txt + both units, pip --upgrade within the
+# declared ranges, restart, verify serving. The GPU pool state files (ledger
+# + override) are NOT touched — they are runtime data owned by panel-api and
+# ride the snapshot's whole /opt/panel-api copy for rollback.
 # Deliberately does NOT re-run 03-panel-api.sh: its UFW gate is first-install
 # protection; on an already-deployed server a firewall regression surfaces in
 # the doctor gate → auto-rollback.
 update_panel_api() {
   PANEL_API_REASON=""
   local f
-  for f in main.py requirements.txt; do
+  for f in main.py llm_gpus.py llm_autostart.py requirements.txt; do
     sudo cp -a "$REPO_ROOT/panel-api/$f" /opt/panel-api/ \
       || { PANEL_API_REASON="cannot install $f into /opt/panel-api"; return 1; }
   done
@@ -708,8 +719,15 @@ update_panel_api() {
     || { PANEL_API_REASON="chown /opt/panel-api failed"; return 1; }
   sudo cp -a "$REPO_ROOT/panel-api/panel-api.service" /etc/systemd/system/panel-api.service \
     || { PANEL_API_REASON="cannot install panel-api.service"; return 1; }
+  # Fleet boot autostart: (re)install + keep enabled so an update to this
+  # repo's unit definition is applied (make api already enabled it; enabling
+  # again is idempotent). A no-op at boot when the autostart list is empty.
+  sudo cp -a "$REPO_ROOT/panel-api/llm-autostart.service" /etc/systemd/system/llm-autostart.service \
+    || { PANEL_API_REASON="cannot install llm-autostart.service"; return 1; }
   sudo systemctl daemon-reload \
     || { PANEL_API_REASON="systemctl daemon-reload failed"; return 1; }
+  sudo systemctl enable llm-autostart \
+    || { PANEL_API_REASON="enable llm-autostart failed"; return 1; }
   # --upgrade floats within requirements.txt's ranges (>=x,<MAJOR) and
   # converges if the installed set violates them.
   sudo -u panel /opt/panel-api/venv/bin/pip install --quiet --upgrade -r /opt/panel-api/requirements.txt \

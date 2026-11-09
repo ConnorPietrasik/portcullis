@@ -143,7 +143,15 @@ for s in $defined_services; do
   elif grep -qx -- "$s" <<<"$pre_containers"; then
     : # stopped with a container present — deliberately stopped, leave it down
   elif grep -qx -- "$s" <<<"$on_demand"; then
-    info "  $s: no container and restart: \"no\" — left down (a stopped container was pruned, or it is brand-new). Once the update passes, start it from the panel's Services view (\"defined, no container\") or: cd /opt/panel && docker compose up -d $s"
+    if [[ "$s" == llm-* ]]; then
+      # llm-* instances must NOT be revived by hand: a raw `up -d` (even with
+      # the override) skips the GPU-aware path — no ledger record, no conflict
+      # check — and an unassigned instance would land on the base-file fallback
+      # cards. The panel's GPUs view is the only sanctioned start.
+      info "  $s: no container and restart: \"no\" — left down (a stopped container was pruned, or it is brand-new). Once the update passes, start it from the panel's GPUs view (start picks its cards — see GPU pool)"
+    else
+      info "  $s: no container and restart: \"no\" — left down (a stopped container was pruned, or it is brand-new). Once the update passes, start it from the panel's Services view (\"defined, no container\") or: cd /opt/panel && docker compose up -d $s"
+    fi
   else
     targets+="$s " # no container before and not on-demand — new service added by this update
   fi

@@ -20,11 +20,22 @@ export function usePoll<T>(fn: () => Promise<T>, intervalMs: number) {
     }
   }, [])
 
+  /**
+   * Adopt a value fetched outside the poll cycle (e.g. a mutation's response
+   * carrying the fresh server state) — same effect as a successful refresh,
+   * so the view updates immediately instead of waiting for the next tick.
+   */
+  const adopt = useCallback((d: T) => {
+    setData(d)
+    setError(null)
+    setLast(Date.now())
+  }, [])
+
   useEffect(() => {
     void refresh()
     const t = window.setInterval(() => void refresh(), Math.max(250, intervalMs))
     return () => window.clearInterval(t)
   }, [intervalMs, refresh])
 
-  return { data, error, last, refresh }
+  return { data, error, last, refresh, adopt }
 }

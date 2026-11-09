@@ -26,18 +26,34 @@ fi
 # Copy the repo's compose tree + secrets to $TARGET (shared with make update).
 stack_sync_configs "$TARGET"
 
+# LLM GPU pool override: the ledger's projection as a compose -f file
+# (ROCR_VISIBLE_DEVICES per llm-* instance). panel-api re-renders it on every
+# assignment; COMPOSE_STACK (make deploy / update / rollback / panel-do)
+# always includes it — the `up -d` below renders through it too — so create
+# it BEFORE the first `up -d`: a missing file would break every compose
+# render, and a render WITHOUT it would recreate fleet instances on the
+# base-file fallback cards instead of their assigned sets. `make api` (03)
+# re-derives ownership (panel).
+sudo mkdir -p /opt/panel-api
+if [[ ! -f /opt/panel-api/llm-gpu-override.yml ]]; then
+  printf 'services: {}\n' | sudo tee /opt/panel-api/llm-gpu-override.yml >/dev/null
+fi
+sudo chmod 644 /opt/panel-api/llm-gpu-override.yml
+
 info "Building + starting stack (first run pulls images and compiles the frontend)"
 # Deliberately NO `pull` here: the edge images float on the major line, so a
 # pull is an *upgrade* of the public edge — that happens in `make update`
 # (snapshot + gate + auto-rollback), not in a routine config deploy. (If a
 # manual tag edit references an image not yet local, `up -d` pulls just that
 # one.) --remove-orphans drops containers for services deleted from compose.
-sudo docker compose --project-directory "$TARGET" -f "$TARGET/docker-compose.yml" up -d --build --remove-orphans
+# stack_compose (not a raw `docker compose`): includes the GPU override, so
+# a Day-2 re-run recreates fleet instances on their ASSIGNED card sets.
+stack_compose up -d --build --remove-orphans
 
 # Restart services whose start-time-only config content changed (snapshot
 # taken by stack_sync_configs). No change → no restart.
 stack_restart_if_configs_changed "$TARGET"
-sudo docker compose --project-directory "$TARGET" -f "$TARGET/docker-compose.yml" ps
+stack_compose ps
 
 # Tighten the TOTP store on first boot: authelia creates db.sqlite3 0644,
 # AFTER stack_sync_configs' chmod window (the file doesn't exist yet at sync

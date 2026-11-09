@@ -101,15 +101,71 @@ else
   skip "repo compose render (.env or compose/ missing — fresh clone: make secrets)"
 fi
 if [[ -f /opt/panel/docker-compose.yml ]]; then
-  if render_out="$(sudo docker compose --project-directory /opt/panel \
-      -f /opt/panel/docker-compose.yml config -q 2>&1)"; then
-    ok "deployed compose renders with /opt/panel/.env"
+  # the deployed render includes the GPU pool override — that is exactly what
+  # COMPOSE_STACK (make update / rollback / panel-do) renders, so a stale or
+  # broken override surfaces HERE, not mid-update.
+  if [[ ! -f /opt/panel-api/llm-gpu-override.yml ]]; then
+    bad "llm-gpu-override.yml missing — every compose render on this host is broken"
+    hint "sudo mkdir -p /opt/panel-api && printf 'services: {}\\n' | sudo tee /opt/panel-api/llm-gpu-override.yml && sudo chmod 644 /opt/panel-api/llm-gpu-override.yml — or re-run: make api (re-creates it)"
+  elif render_out="$(sudo docker compose --project-directory /opt/panel \
+      -f /opt/panel/docker-compose.yml -f /opt/panel-api/llm-gpu-override.yml config -q 2>&1)"; then
+    ok "deployed compose (+ GPU override) renders with /opt/panel/.env"
   else
     bad "deployed compose does NOT render with /opt/panel/.env (half-synced state?)"
     hint "$(head -1 <<<"$render_out") → re-run: make deploy (re-syncs the repo .env; ungated — make update refuses while this check is red) — or make rollback if the last snapshot was known-good"
   fi
 else
   skip "deployed compose render (no /opt/panel — make deploy, RUNBOOK Phase 2)"
+fi
+
+# ── fleet routes ───────────────────────────────────────────────────────────────
+# A fleet instance is reachable only through its router pair in
+# traefik/dynamic/llm.yml: router <name> (rule Host(<sub>.pietrasik.top)) +
+# service <name> (url http://<name>:8000). Those four name references come
+# from a hand-copied block, and one wrong one leaves the container up but the
+# subdomain dead — silently. Both trees are checked: the repo's (make update
+# refuses to run while this is red — doctor is its precondition) and the
+# deployed one (what actually routes). llm-proxy is the ordered-fallback
+# router — no compose service, exempt.
+fleet_routes() { # <compose.yml> <llm.yml> <label>
+  local comp="$1" routes="$2" label="$3" svc sub orph
+  local -a svcs
+  mapfile -t svcs < <(grep -oE '^  llm-[a-z0-9][a-z0-9-]*:' "$comp" | sed 's/^  //; s/:$//' | sort -u)
+  for svc in "${svcs[@]}"; do
+    sub="${svc#llm-}"
+    if ! grep -q "^    ${svc}:" "$routes"; then
+      bad "$label: $svc (compose) has no router entry in llm.yml"
+      hint "the container would run but ${sub}.pietrasik.top would 404 — add the router + service pair (one block each)"
+    elif ! grep -qF "Host(\`${sub}.pietrasik.top\`)" "$routes"; then
+      bad "$label: $svc — Host(\`${sub}.pietrasik.top\`) not found in llm.yml"
+      hint "the subdomain would not reach this instance — fix the router's rule"
+    elif ! grep -qF "http://${svc}:8000" "$routes"; then
+      bad "$label: $svc — no service url http://${svc}:8000 in llm.yml"
+      hint "the subdomain would 503 — add the service block (loadBalancer → servers → url)"
+    else
+      ok "$label: $svc ↔ ${sub}.pietrasik.top (router + Host + url)"
+    fi
+  done
+  while IFS= read -r orph; do
+    if ! grep -q "^  ${orph}:" "$comp"; then
+      bad "$label: $orph router in llm.yml but no compose service"
+      hint "stale route (instance deleted?) — remove the router + service pair"
+    fi
+  done < <(awk '/^  routers:/{f=1;next} f && /^  [a-z]/{f=0} f && /^    llm-[a-z0-9][a-z0-9-]*:/{print}' "$routes" \
+    | sed 's/^    //; s/:$//' | grep -v '^llm-proxy$' | sort -u)
+  [[ ${#svcs[@]} -eq 0 ]] && warn "$label: no llm-* services in compose (fleet not configured?)"
+  return 0
+}
+section "fleet routes"
+if [[ -f "$REPO_ROOT/compose/docker-compose.yml" && -f "$REPO_ROOT/compose/traefik/dynamic/llm.yml" ]]; then
+  fleet_routes "$REPO_ROOT/compose/docker-compose.yml" "$REPO_ROOT/compose/traefik/dynamic/llm.yml" "repo"
+else
+  skip "repo fleet routes (compose/ tree missing — fresh clone: make secrets/deploy)"
+fi
+if [[ -f /opt/panel/docker-compose.yml && -f /opt/panel/traefik/dynamic/llm.yml ]]; then
+  fleet_routes /opt/panel/docker-compose.yml /opt/panel/traefik/dynamic/llm.yml "deployed"
+else
+  skip "deployed fleet routes (no /opt/panel — make deploy, RUNBOOK Phase 2)"
 fi
 
 # ── edge stack ───────────────────────────────────────────────────────────────
@@ -347,6 +403,27 @@ if grep -q '"ok":true' <<<"$health"; then
 else
   bad "GET /api/health failed"; hint "systemctl status panel-api"
 fi
+# GPU pool state (the ledger is intent — panel-owned 0600; the override is
+# its compose projection — 0644, read by docker compose as root). Both are
+# seeded by make deploy / make api and re-seeded by panel-api at startup.
+if [[ -f /opt/panel-api/llm-gpu.json ]]; then
+  m="$(stat -c %a /opt/panel-api/llm-gpu.json 2>/dev/null || true)"
+  if [[ "$m" == 600 ]]; then ok "llm-gpu.json (GPU ledger) mode 600"; else
+    warn "llm-gpu.json mode ${m:-unreadable} (want 600)"; hint "sudo chown panel:panel && sudo chmod 600 /opt/panel-api/llm-gpu.json"
+  fi
+else
+  warn "llm-gpu.json missing — panel-api seeds it at startup"; hint "systemctl restart panel-api (or make api)"
+fi
+if [[ -f /opt/panel-api/llm-gpu-override.yml ]]; then
+  ok "llm-gpu-override.yml present (GPU pool compose projection)"
+else
+  bad "llm-gpu-override.yml missing — compose renders (make update) will fail"; hint "make api (re-creates it)"
+fi
+if systemctl is-enabled --quiet llm-autostart 2>/dev/null; then
+  ok "llm-autostart.service enabled (fleet boot autostart)"
+else
+  warn "llm-autostart.service not enabled — the fleet won't auto-start on boot"; hint "make api (installs + enables it)"
+fi
 code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://172.17.0.1:8010/api/metrics 2>/dev/null)"
 if [[ "$code" == 401 ]]; then
   ok "GET /api/metrics unauthenticated → 401 (auth enforced)"
@@ -430,6 +507,15 @@ if [[ -x /usr/local/libexec/panel-do ]]; then
     ok "edge-ips action present (LLM router name→IP map)"
   else
     bad "panel-do registry missing edge-ips — llm.pietrasik.top will report every instance down"
+    hint "binary is stale — make panel-do (rebuilds + reinstalls it)"
+  fi
+  # The GPU view (panel tab "GPUs") rides on llm-fleet/llm-live/llm-apply/
+  # llm-stop; a stale binary makes the view error instead of erroring
+  # silently, so presence is a hard check like the others above.
+  if sudo -u panel sudo -n /usr/local/libexec/panel-do --list 2>/dev/null | grep -q '"name":"llm-apply"'; then
+    ok "llm-apply action present (GPU pool: (re)create an instance on its card set)"
+  else
+    bad "panel-do registry missing llm-apply — the GPU view cannot assign cards"
     hint "binary is stale — make panel-do (rebuilds + reinstalls it)"
   fi
   # The Services view's "defined, no container" → create+start button rides on

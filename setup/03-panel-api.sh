@@ -52,8 +52,26 @@ ensure_panel_user
 
 info "Installing panel-api to /opt/panel-api"
 sudo mkdir -p /opt/panel-api
-sudo cp -a "$REPO_ROOT/panel-api/main.py" "$REPO_ROOT/panel-api/requirements.txt" /opt/panel-api/
+# llm_gpus.py: the GPU pool's ledger/override/allocation logic (shared with
+# the boot oneshot). llm_autostart.py: the boot autostart (below).
+sudo cp -a "$REPO_ROOT/panel-api/main.py" "$REPO_ROOT/panel-api/llm_gpus.py" \
+  "$REPO_ROOT/panel-api/llm_autostart.py" "$REPO_ROOT/panel-api/requirements.txt" /opt/panel-api/
 sudo chown -R panel:panel /opt/panel-api
+
+# LLM GPU pool state: seed the ledger (panel-owned 0600) once; the override
+# is its compose projection (0644 — docker compose reads it as root). 02
+# already created the override for the first deploy; this keeps a host that
+# predates this feature consistent, and panel-api re-seeds both at startup
+# if a hand removed them. Never hand-edit either file.
+if [[ ! -f /opt/panel-api/llm-gpu.json ]]; then
+  printf '{\n  "allocations": {},\n  "autostart": []\n}\n' | sudo tee /opt/panel-api/llm-gpu.json >/dev/null
+fi
+if [[ ! -f /opt/panel-api/llm-gpu-override.yml ]]; then
+  printf 'services: {}\n' | sudo tee /opt/panel-api/llm-gpu-override.yml >/dev/null
+fi
+sudo chown panel:panel /opt/panel-api/llm-gpu.json /opt/panel-api/llm-gpu-override.yml
+sudo chmod 600 /opt/panel-api/llm-gpu.json
+sudo chmod 644 /opt/panel-api/llm-gpu-override.yml
 
 if [[ ! -x /opt/panel-api/venv/bin/python ]]; then
   info "Creating venv"
@@ -71,11 +89,18 @@ info "Installing systemd unit"
 # changed since the last deploy.
 sync_panel_api_env /opt/panel
 sudo cp -a "$REPO_ROOT/panel-api/panel-api.service" /etc/systemd/system/panel-api.service
+# Fleet boot autostart: a oneshot that starts the panel-configured set on
+# boot (its GPU assignments from the ledger — overlap-safe, see
+# RUNBOOK → LLM fleet → GPU pool). Always installed + enabled; a no-op (exit 0) when
+# the autostart list is empty. panel-do must be installed first — the
+# quickstart runs it (04) before this (03).
+sudo cp -a "$REPO_ROOT/panel-api/llm-autostart.service" /etc/systemd/system/llm-autostart.service
 sudo systemctl daemon-reload
 # enable + explicit restart (not `enable --now`): on a re-run after editing
 # main.py the unit is already active, so `start` would be a no-op and keep
 # serving the old code. `restart` always picks up the new file.
 sudo systemctl enable panel-api
+sudo systemctl enable llm-autostart
 sudo systemctl restart panel-api
 
 sleep 1
