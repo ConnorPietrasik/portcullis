@@ -164,12 +164,11 @@ services:
       # never sits in argv (ps / docker inspect)
       RADIANCE_LOG: "warn" # per-request INFO lines (tok/s, cache, ttft) are chatty — radiance docs §6.5
     command: >
-      --model /models/qwen3.8-27b-fp8.rad
+      --model /models/qwen3.8-27b-iq6r-s-v4.rad
       --host 0.0.0.0 --port 8000 --api-key-env RADIANCE_API_KEY
       --tp 4 --max-num-seqs 16 --max-model-len 250000
       --gpu-headroom-mib 96 --prefix-cache-mib 65536 --checkpoint-policy tip-only
       --num-speculative-tokens 3 --max-num-batched-tokens 2048
-      --checkpoint-slots auto
     labels: ["panel.manage=Qwen 27B FP8 · cards 0-3"] # Services view name
   llm-flashnext:
     <<: *llm-base
