@@ -99,9 +99,19 @@ export interface Metrics {
 export interface ContainerInfo {
   id: string
   name: string
+  /** compose service name (container label) — joins /api/stack-services */
+  service?: string
   image: string
   state: string
   status: string
+}
+
+/** A service defined in the deployed compose, with no container required. */
+export interface StackService {
+  name: string
+  image: string
+  display: string
+  restart: string
 }
 
 export interface ActionInfo {

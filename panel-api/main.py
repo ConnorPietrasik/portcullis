@@ -590,6 +590,9 @@ def _container_view(x: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": cid,
         "name": display if display and display != "true" else (name or cid),
+        # compose service name (container label) — the UI joins this against
+        # /api/stack-services to find defined services whose container is gone.
+        "service": _cli_label_get(x.get("Labels") or "", "com.docker.compose.service"),
         "image": x.get("Image", ""),
         "state": x.get("State", "unknown"),
         "status": x.get("Status", ""),
@@ -659,6 +662,48 @@ def containers(_admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]
         if _cli_label_get(x.get("Labels") or "", MANAGE_LABEL) is not None
     ]
     return {"containers": managed}
+
+
+_STACK_SERVICES_TTL = 15.0  # the defined set only changes via make update / deploy
+_stack_services_cache: dict[str, Any] = {"data": None, "at": 0.0}
+
+
+def _stack_services_fetch() -> list[dict[str, Any]]:
+    try:
+        proc = _sudo_panel_do("list-services", [], 20.0)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise HTTPException(500, f"panel-do list-services: {e}") from e
+    if proc.returncode != 0:
+        raise HTTPException(500, f"list-services failed: {proc.stderr.strip()[-300:]}")
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError as e:
+        raise HTTPException(502, f"list-services: bad JSON: {e}") from e
+    if not isinstance(data, list):
+        raise HTTPException(502, "list-services: expected a JSON array")
+    return data
+
+
+def stack_services_cached() -> list[dict[str, Any]]:
+    """Deployed compose services carrying panel.manage (panel-do list-services
+    JSON), 15 s TTL. The Services view diffs this against the container list:
+    defined-but-container-less services get a create+start button (the
+    panel-do start-service action)."""
+    now = time.monotonic()
+    if (
+        _stack_services_cache["data"] is not None
+        and now - _stack_services_cache["at"] < _STACK_SERVICES_TTL
+    ):
+        return _stack_services_cache["data"]
+    data = _stack_services_fetch()
+    _stack_services_cache["data"] = data
+    _stack_services_cache["at"] = now
+    return data
+
+
+@app.get("/api/stack-services")
+def stack_services(_admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
+    return {"services": stack_services_cached()}
 
 
 @app.post("/api/containers/{cid}/{action}")

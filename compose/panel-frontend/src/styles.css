@@ -188,6 +188,17 @@ table {
   overflow: hidden;
 }
 
+/* Services view: label above the "defined, no container" table (same voice
+   as th — the only other text between two tables on that page). */
+.svc-missing {
+  margin: 22px 0 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
 th,
 td {
   text-align: left;

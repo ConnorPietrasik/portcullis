@@ -189,6 +189,7 @@ func main() {
 
 var unitNameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._@-]*\.service$`)
 var containerIDRe = regexp.MustCompile(`^[0-9a-f]{12}$`)
+var serviceNameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
 
 func restartService(ctx context.Context, args []string, logf func(string, ...any)) error {
 	if out, err := runCmd(ctx, "/usr/bin/systemctl", "restart", "--", args[0]); err != nil {
@@ -275,6 +276,90 @@ func containerAction(verb string) RunFunc {
 	}
 }
 
+// startService brings a deployed-stack service up with `docker compose up -d
+// <svc>` against /opt/panel: creates the container if it does not exist
+// (pruned, or never created) and starts it, recreating it when its recorded
+// config has drifted from the compose file. The service name is the only arg,
+// pre-validated as an opaque token; the project paths are hardcoded.
+func startService(ctx context.Context, args []string, logf func(string, ...any)) error {
+	out, err := runCmd(ctx, "/usr/bin/docker", "compose", "--project-directory", "/opt/panel",
+		"-f", "/opt/panel/docker-compose.yml", "up", "-d", "--", args[0])
+	if err != nil {
+		return fmt.Errorf("up -d %s: %v: %s", args[0], err, out)
+	}
+	logf("service %s: up -d ok", args[0])
+	return nil
+}
+
+// listServices emits the deployed stack's services carrying the panel.manage
+// label — the Services view's contract — as a JSON array of {name, image,
+// display, restart}. Read-only, no args; the frontend diffs this against the
+// container list to offer create+start for services whose container is gone.
+func listServices(ctx context.Context, args []string, logf func(string, ...any)) error {
+	out, err := runCmd(ctx, "/usr/bin/docker", "compose", "--project-directory", "/opt/panel",
+		"-f", "/opt/panel/docker-compose.yml", "config", "--format", "json")
+	if err != nil {
+		return fmt.Errorf("compose config: %v: %s", err, out)
+	}
+	var cfg struct {
+		Services map[string]struct {
+			Image   string          `json:"image"`
+			Restart string          `json:"restart"`
+			Labels  json.RawMessage `json:"labels"`
+		} `json:"services"`
+	}
+	if err := json.Unmarshal([]byte(out), &cfg); err != nil {
+		return fmt.Errorf("compose config: bad JSON: %v", err)
+	}
+	type svc struct {
+		Name    string `json:"name"`
+		Image   string `json:"image"`
+		Display string `json:"display"`
+		Restart string `json:"restart"`
+	}
+	svcs := []svc{}
+	for name, s := range cfg.Services {
+		display := composeLabel(s.Labels, "panel.manage")
+		if display == "" {
+			continue // not in the Services view
+		}
+		if display == "true" {
+			display = name
+		}
+		svcs = append(svcs, svc{name, s.Image, display, s.Restart})
+	}
+	sort.Slice(svcs, func(i, j int) bool { return svcs[i].Name < svcs[j].Name })
+	enc, err := json.Marshal(svcs)
+	if err != nil {
+		return fmt.Errorf("list-services: marshal: %v", err)
+	}
+	fmt.Println(string(enc))
+	return nil
+}
+
+// composeLabel reads one label from `compose config` JSON output. CLI versions
+// have shipped the labels field as either an object or a list of "k=v"
+// strings; accept both, return "" when absent or unparseable (callers treat
+// that as "not managed" — the safe direction).
+func composeLabel(raw json.RawMessage, key string) string {
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err == nil {
+		if s, ok := obj[key].(string); ok {
+			return s
+		}
+		return ""
+	}
+	var list []string
+	if err := json.Unmarshal(raw, &list); err == nil {
+		for _, kv := range list {
+			if k, v, ok := strings.Cut(kv, "="); ok && k == key {
+				return v
+			}
+		}
+	}
+	return ""
+}
+
 var registry = map[string]Action{
 	"restart-service": {
 		Summary: "Restart a systemd service",
@@ -296,6 +381,20 @@ var registry = map[string]Action{
 		Timeout: 15 * time.Second,
 		Confirm: false,
 		Run:     listContainers,
+	},
+	"list-services": {
+		Summary: "Deployed compose services with the panel.manage label (JSON on stdout)",
+		Args:    nil,
+		Timeout: 15 * time.Second,
+		Confirm: false,
+		Run:     listServices,
+	},
+	"start-service": {
+		Summary: "Create + start a deployed compose service (revives a pruned one)",
+		Args:    []*regexp.Regexp{serviceNameRe},
+		Timeout: 5 * time.Minute, // detached start is seconds; 5m only covers a missing-image pull
+		Confirm: true,
+		Run:     startService,
 	},
 	"edge-ips": {
 		Summary: "edge-network endpoints: containerID → {Name, IPv4Address} (JSON on stdout)",

@@ -434,6 +434,15 @@ if [[ -x /usr/local/libexec/panel-do ]]; then
     bad "panel-do registry missing edge-ips — llm.pietrasik.top will report every instance down"
     hint "binary is stale — make panel-do (rebuilds + reinstalls it)"
   fi
+  # The Services view's "defined, no container" → create+start button rides on
+  # start-service/list-services; a stale binary makes that section silently
+  # vanish (and /api/stack-services 500), so check presence explicitly too.
+  if sudo -u panel sudo -n /usr/local/libexec/panel-do --list 2>/dev/null | grep -q '"name":"start-service"'; then
+    ok "start-service action present (Services view create+start)"
+  else
+    bad "panel-do registry missing start-service — the panel can't bring up container-less services"
+    hint "binary is stale — make panel-do (rebuilds + reinstalls it)"
+  fi
 else
   skip "not installed"; hint "make panel-do (RUNBOOK Phase 3)"
 fi

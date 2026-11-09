@@ -63,6 +63,17 @@ expect_exit 65 restart-service -foo               # flag injection
 expect_exit 65 restart-service                    # arity
 expect_exit 65 start-container zzz                # not a 12-hex container ID
 expect_exit 65 restart-container '../../etc'      # path injection
+expect_exit 65 start-service '../../etc/passwd'   # path injection
+expect_exit 65 start-service -foo                 # flag injection
+expect_exit 65 start-service                      # arity
+
+if sudo -u panel sudo -n /usr/local/libexec/panel-do list-services | python3 -c 'import json,sys
+d = json.load(sys.stdin)
+assert isinstance(d, list) and all(isinstance(s.get("name"), str) for s in d)'; then
+  info "  ok: list-services emits a valid service JSON array"
+else
+  die "  FAIL: list-services did not emit a valid service JSON array"
+fi
 
 info "panel-do installed. /api/actions in the panel now works."
 echo "  registry: sudo -u panel sudo -n /usr/local/libexec/panel-do --list | python3 -m json.tool"

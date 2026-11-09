@@ -143,7 +143,7 @@ for s in $defined_services; do
   elif grep -qx -- "$s" <<<"$pre_containers"; then
     : # stopped with a container present — deliberately stopped, leave it down
   elif grep -qx -- "$s" <<<"$on_demand"; then
-    info "  $s: no container and restart: \"no\" — left down (a stopped container was pruned, or it is brand-new). Once the update passes, start it with: cd /opt/panel && docker compose up -d $s (then the panel's Services view manages it)"
+    info "  $s: no container and restart: \"no\" — left down (a stopped container was pruned, or it is brand-new). Once the update passes, start it from the panel's Services view (\"defined, no container\") or: cd /opt/panel && docker compose up -d $s"
   else
     targets+="$s " # no container before and not on-demand — new service added by this update
   fi
