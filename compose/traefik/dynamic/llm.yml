@@ -23,6 +23,16 @@ http:
       middlewares: [sec-headers@file, llm-rate@file]
       service: llm-27b
 
+    llm-27b-1:
+      rule: "Host(`27b-1.pietrasik.top`)"
+      middlewares: [sec-headers@file, llm-rate@file]
+      service: llm-27b-1
+
+    llm-27b-2:
+      rule: "Host(`27b-2.pietrasik.top`)"
+      middlewares: [sec-headers@file, llm-rate@file]
+      service: llm-27b-2
+
     llm-flashnext:
       rule: "Host(`flashnext.pietrasik.top`)"
       middlewares: [sec-headers@file, llm-rate@file]
@@ -42,6 +52,16 @@ http:
       loadBalancer:
         servers:
           - url: "http://llm-27b:8000"
+
+    llm-27b-1:
+      loadBalancer:
+        servers:
+          - url: "http://llm-27b-1:8000"
+
+    llm-27b-2:
+      loadBalancer:
+        servers:
+          - url: "http://llm-27b-2:8000"
 
     llm-flashnext:
       loadBalancer:
