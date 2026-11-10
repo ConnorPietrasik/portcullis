@@ -8,12 +8,22 @@
 # host 502s until its instance is up — harmless. Rule: service llm-<name> ↔
 # Host(`<name>.pietrasik.top`) ↔ http://llm-<name>:8000 (RUNBOOK → LLM fleet).
 #
+# Naming: llm-<name> is an INSTANCE — router, traefik service, compose
+# service and container all share the name, 1:1. make doctor's orphan check
+# ASSUMES that prefix (a llm-* router with no compose service is stale), so
+# SHARED (non-instance) routers never carry it: they are fleet-* and route
+# to the panel-api service (defined in panel.yml — same file provider, so
+# one service, not redefined here):
+#   fleet-fallback  llm.pietrasik.top /v1     — ordered fallback
+#   fleet-open      <instance hosts> /open    — dashboards' key bootstrap
+# Never name a shared router or service llm-*.
+#
 # llm.pietrasik.top is the FALLBACK ROUTER (RUNBOOK → LLM fleet → fallback
 # router): one base_url for clients that just want the best model currently
-# serving. It points at panel-api (host bind, see panel.yml — its own router
-# so it can omit auth-chain); panel-api walks the admin-configured priority
-# order (panel Settings) and routes to the first instance that's up. Serves
-# /v1 ONLY — the admin /api/* stays behind panel.pietrasik.top's auth chain.
+# serving. It points at panel-api; panel-api walks the admin-configured
+# priority order (panel Settings) and routes to the first instance that's
+# up. Serves /v1 ONLY — the admin /api/* stays behind
+# panel.pietrasik.top's auth chain.
 
 http:
   routers:
@@ -38,14 +48,36 @@ http:
       middlewares: [sec-headers@file, llm-rate@file]
       service: llm-flashnext
 
+    # Key bootstrap for the radiance dashboards (panel Services view → the
+    # "dashboard ↗" link per instance). The dashboard HTML is public on every
+    # instance host; its data calls need the bearer key, which the page only
+    # reads from its OWN origin's localStorage. /open is a one-line page served
+    # by panel-api (which holds LLM_API_KEY) that writes it there and bounces
+    # to / — opens a working dashboard with zero typing. The ONLY
+    # Authelia-gated path on these hosts: /v1 etc. stay bearer-gated for API
+    # clients. Admins-only — the Authelia wildcard admits any user to the
+    # path, so panel-api re-checks Remote-User/Remote-Groups. No secret gate
+    # by design (a browser can't hold the panel token): a direct 172.17.0.1
+    # bind hit 401s only while it leaves Remote-* unset — an edge container
+    # that CAN spoof them already sits on the fleet's own network (accepted,
+    # see require_forward_auth_admin in panel-api). New instance = add its
+    # host to the Host() list — make doctor verifies that list against the
+    # compose services (make update refuses while it's red). Named fleet-*
+    # (not llm-*) on purpose — the name IS the instance marker (see header),
+    # so this router needs no exemption in doctor's orphan check.
+    fleet-open:
+      rule: "Host(`27b.pietrasik.top`, `27b-1.pietrasik.top`, `27b-2.pietrasik.top`, `flashnext.pietrasik.top`) && PathPrefix(`/open`)"
+      middlewares: [auth-chain@file, llm-rate@file]
+      service: panel-api
+
     # ordered fallback — first instance up in the panel-configured order wins.
     # Scoped to /v1 on purpose: panel-api also serves /api/* (the admin API),
     # and that must stay reachable ONLY via panel.pietrasik.top's Authelia +
     # panel-secret chain — on this host a client could supply both headers itself.
-    llm-proxy:
+    fleet-fallback:
       rule: "Host(`llm.pietrasik.top`) && PathPrefix(`/v1`)"
       middlewares: [sec-headers@file, llm-rate@file]
-      service: llm-proxy
+      service: panel-api
 
   services:
     llm-27b:
@@ -68,12 +100,8 @@ http:
         servers:
           - url: "http://llm-flashnext:8000"
 
-    # panel-api host service — same bind as panel.yml's panel-api, own service
-    # name so it can carry the instance middlewares without auth-chain.
-    llm-proxy:
-      loadBalancer:
-        servers:
-          - url: "http://172.17.0.1:8010"
+    # (fleet-fallback and fleet-open route to the panel-api service in
+    # panel.yml — same file provider; not redefined here.)
 
   middlewares:
     llm-rate:

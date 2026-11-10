@@ -125,8 +125,14 @@ fi
 # from a hand-copied block, and one wrong one leaves the container up but the
 # subdomain dead — silently. Both trees are checked: the repo's (make update
 # refuses to run while this is red — doctor is its precondition) and the
-# deployed one (what actually routes). llm-proxy is the ordered-fallback
-# router — no compose service, exempt.
+# deployed one (what actually routes). The llm-* prefix IS the instance
+# marker: the orphan check below assumes any llm-* router pairs with a
+# compose service, so shared (non-instance) routers carry the fleet-*
+# prefix instead (fleet-fallback, fleet-open — both route to the panel-api
+# service in panel.yml) and need no exemption; a shared router named llm-*
+# reports as stale on purpose (rename it). fleet-open's Host() list is
+# checked separately: it must name every instance host (end of
+# fleet_routes).
 fleet_routes() { # <compose.yml> <llm.yml> <label>
   local comp="$1" routes="$2" label="$3" svc sub orph
   local -a svcs
@@ -152,8 +158,40 @@ fleet_routes() { # <compose.yml> <llm.yml> <label>
       hint "stale route (instance deleted?) — remove the router + service pair"
     fi
   done < <(awk '/^  routers:/{f=1;next} f && /^  [a-z]/{f=0} f && /^    llm-[a-z0-9][a-z0-9-]*:/{print}' "$routes" \
-    | sed 's/^    //; s/:$//' | grep -v '^llm-proxy$' | sort -u)
+    | sed 's/^    //; s/:$//' | sort -u)
   [[ ${#svcs[@]} -eq 0 ]] && warn "$label: no llm-* services in compose (fleet not configured?)"
+  # The fleet-open list — the one copy of instance names that is not a
+  # router/service pair: the shared key-bootstrap router routes to the
+  # panel-api service (no compose service to pair), but its Host() list
+  # must still name EVERY instance. A missing host leaves that instance's
+  # dashboard link dead: /open falls through to the instance's bare-Host
+  # router, and radiance 404s it after the Authelia login. A stale host is
+  # harmless clutter (warn only). Empty fleet → nothing to compare.
+  if (( ${#svcs[@]} )); then
+    local open_hosts inst_hosts missing stale add h
+    open_hosts="$(awk '/^  routers:/{f=1;next} f && /^  [a-z]/{f=0} f && /^    fleet-open:$/{g=1;next} f && g && /^    [a-z]/{g=0;next} f && g{print}' "$routes" \
+      | sed 's/#.*$//' \
+      | { grep -oE 'Host\([^)]*\)' || true; } | { grep -oE '`[^`]+`' || true; } | tr -d '`' | LC_ALL=C sort -u)"
+    inst_hosts="$(for svc in "${svcs[@]}"; do printf '%s\n' "${svc#llm-}.pietrasik.top"; done | LC_ALL=C sort -u)"
+    if [[ -z $open_hosts ]]; then
+      bad "$label: no hosts parseable from the fleet-open rule in llm.yml — every dashboard link 404s"
+      hint "restore the fleet-open router block (key bootstrap → panel-api; see its comment in llm.yml)"
+    else
+      missing="$(LC_ALL=C comm -13 <(printf '%s\n' "$open_hosts") <(printf '%s\n' "$inst_hosts") || true)"
+      stale="$(LC_ALL=C comm -23 <(printf '%s\n' "$open_hosts") <(printf '%s\n' "$inst_hosts") || true)"
+      if [[ -n $missing ]]; then
+        add=""
+        while IFS= read -r h; do
+          [[ -n $h ]] || continue
+          add+="${add:+, }\`${h}\`"
+        done <<<"$missing"
+        bad "$label: fleet-open rule missing $(tr '\n' ' ' <<<"$missing" | sed 's/ *$//') — its dashboard link(s) 404"
+        hint "add ${add} to the Host() list: llm.yml → fleet-open → rule"
+      fi
+      [[ -n $stale ]] && warn "$label: fleet-open rule lists $(tr '\n' ' ' <<<"$stale" | sed 's/ *$//') with no compose service (instance deleted?) — trim the list"
+      [[ -z $missing && -z $stale ]] && ok "$label: fleet-open Host() list ↔ ${#svcs[@]} instance host(s)"
+    fi
+  fi
   return 0
 }
 section "fleet routes"
@@ -352,7 +390,7 @@ if [[ -n "${LLM_API_KEY:-}" ]]; then
     ok "llm.pietrasik.top/v1/models → $llm_code (router answers; 503 = all instances down)"
   else
     bad "llm.pietrasik.top/v1/models → ${llm_code:-000} (want 200 or 503)"
-    hint "401 = LLM_API_KEY mismatch; 404/502 = llm-proxy router (traefik/dynamic/llm.yml) or panel-api down (make logs)"
+    hint "401 = LLM_API_KEY mismatch; 404/502 = fleet-fallback router (traefik/dynamic/llm.yml) or panel-api down (make logs)"
   fi
 else
   skip "llm.pietrasik.top (no LLM_API_KEY in .env — fleet not configured)"

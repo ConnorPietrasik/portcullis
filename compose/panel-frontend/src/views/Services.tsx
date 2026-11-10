@@ -96,6 +96,17 @@ export default function Services({ intervalMs }: { intervalMs: number }) {
                 </td>
                 <td className="muted">{c.status}</td>
                 <td className="btns">
+                  {/* running only — while the instance is down the /open bounce lands on a 502 */}
+                  {c.state === 'running' && c.service?.startsWith('llm-') && (
+                    <a
+                      href={`https://${c.service.slice(4)}.pietrasik.top/open`}
+                      target="_blank"
+                      rel="noreferrer"
+                      title="radiance dashboard — Authelia, then the API key is injected for this origin (panel-api /open)"
+                    >
+                      dashboard ↗
+                    </a>
+                  )}
                   <button onClick={() => act(c, 'start')}>start</button>
                   <button className="warn" onClick={() => act(c, 'restart')}>
                     restart

@@ -1,4 +1,5 @@
-Add LLM stats to the panel; from Radiance (or maybe a link to that?)
+Fix the off-by-one GPU stats for the GPUs tab of the panel
+Services categories for the panel to make it easier to find things / avoid bloat
 Make an actual portfolio site
 Some sort of chat server that allows the chosen model to do web searches / tool calls to image gen / maybe write scripts to verify stuff. Admin-only and behind authelia, obviously. Should take text / images.
 MAYBE - An Android app, so I can do everything from my phone without a browser? Would also fix the NAT hairpin thing since it could probably do explicit network stuff for itself.

@@ -228,6 +228,20 @@ tr:last-child td {
   font-size: 12px;
 }
 
+.btns a {
+  margin-left: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.btns a:hover {
+  border-color: var(--accent);
+}
+
 .action input {
   display: block;
   width: 100%;

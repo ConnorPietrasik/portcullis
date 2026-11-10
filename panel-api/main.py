@@ -29,7 +29,7 @@ from typing import Any, Callable, Optional
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 import llm_gpus
@@ -1043,6 +1043,56 @@ async def _llm_stream(upstream: httpx.Response) -> StreamingResponse:
             await upstream.aclose()  # client disconnect → finally → close upstream
 
     return StreamingResponse(body(), status_code=upstream.status_code, headers=headers)
+
+
+def require_forward_auth_admin(
+    remote_user: Optional[str] = Header(default=None),
+    remote_groups: Optional[str] = Header(default=None),
+) -> Optional[str]:
+    """Like require_admin minus X-Panel-Token: the fleet-open router carries
+    auth-chain only (a browser can't hold the panel token, and /open must
+    not be reachable WITH one off-panel). On the routed path Traefik strips
+    client-supplied Remote-* headers, so their presence proves the request
+    passed forward-auth. The 172.17.0.1 bind itself is reachable from any
+    edge container, and there the headers are NOT stripped: a bare hit
+    401s, but one that spoofs Remote-User/Remote-Groups gets the key. That
+    is the price of a path with no secret gate (a browser can't hold the
+    panel token) — accepted, since such an attacker already sits on the
+    fleet's own network. The Authelia wildcard admits any user to the path,
+    so admins-only is enforced HERE — same boundary as the panel."""
+    if DEV_MODE:
+        return None
+    if not remote_user:
+        raise HTTPException(401, "missing Remote-User (direct bind hit?)")
+    if "admins" not in set(GROUP_SPLIT_RE.split(remote_groups or "")):
+        raise HTTPException(403, "admins only")
+    return remote_user
+
+
+@app.get("/open", include_in_schema=False)
+def llm_dashboard_open(_admin: Optional[str] = Depends(require_forward_auth_admin)):
+    """Key bootstrap for the radiance dashboards: https://<sub>.pietrasik.top/open
+    (panel Services view → the dashboard link per instance). The dashboard
+    HTML is public on every instance host, but its data calls need the
+    bearer key and the page only reads it from its OWN origin's localStorage
+    — no URL param, and a panel page can't write cross-origin. This one-line
+    page, served on the instance's own origin by this service (which holds
+    LLM_API_KEY), writes it and bounces to /. no-store: the key must never
+    sit in a browser cache (it lands in localStorage — exactly where typing
+    it into the header field would put it)."""
+    if not LLM_API_KEY:
+        raise HTTPException(503, "LLM_API_KEY not configured (fleet not set up)")
+    # .replace: a key containing </script> would close the inline script early
+    # in the browser — \u003c decodes to the same character in the JS string.
+    key_json = json.dumps(LLM_API_KEY).replace("<", "\\u003c")
+    html = (
+        "<!doctype html><meta charset=utf-8><title>opening radiance…</title>"
+        f"<script>try{{localStorage.setItem('radiance.key',{key_json});location.replace('/')}}"
+        "catch(e){document.title='radiance: key not set — open / and use the API key field in the header'}</script>"
+        "<noscript>JavaScript is required. Open <code>/</code> and type the API key into the "
+        "field in the header.</noscript>"
+    )
+    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/")

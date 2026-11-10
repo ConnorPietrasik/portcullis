@@ -405,9 +405,13 @@ After that the panel manages it as usual.
 
 **Add an instance** (including a second copy of a model — `llm-27b-1` next to `llm-27b`): copy the block
 (name, model, `llm.cards`, flags) + the router pair — four name references must all match (service key,
-router key, `Host(...)`, service `url`); `make doctor` flags any that don't — give the twins distinct
-display labels (append the instance name) so the Services view tells them apart. Then `git commit`,
-`make update` (deploys + pulls it, leaves it down) and start it — panel GPUs view → *start* (or the Services
+router key, `Host(...)`, service `url`) + its host in the `fleet-open` rule's `Host()` list so the
+dashboard link works; `make doctor` flags any of the five that don't (`fleet-open` routes to
+panel-api, not an instance, so it sits outside the instance-pairing checks — in llm.yml the
+`llm-*` prefix marks instance routers and `fleet-*` names shared ones — but its `Host()` list
+is verified against the compose services). Give the twins distinct display labels
+(append the instance name) so the Services view tells them apart. Then `git commit`, `make update`
+(deploys + pulls it, leaves it down) and start it — panel GPUs view → *start* (or the Services
 view → *defined, no container* → *create + start*, which for llm-* services goes through the same GPU-aware
 path). First load ~1 min on this hardware, shown in the panel. The flags in the committed blocks are this
 host's own tuning — the blocks are the truth, do not reconcile them against upstream. To trial a NEW model
@@ -416,6 +420,20 @@ the clone — its flags belong to the trial, not to a fleet block.
 
 **Key:** one shared `LLM_API_KEY` for all instances (a key authorizes LLM use, not one instance). Rotate = edit `.env` +
 `make update` (radiance reads it at startup).
+
+**Dashboard:** radiance serves its dashboard at the instance host root — public HTML, data calls
+bearer-gated like `/v1`. The page takes the key from its OWN origin's localStorage only (no URL
+param, and a panel page can't write cross-origin), so panel-api serves a one-line bootstrap at
+`https://<sub>.pietrasik.top/open` (router `fleet-open` in llm.yml — the ONLY Authelia-gated path on
+these hosts; admins-only: panel-api re-checks Remote-User/Remote-Groups). No secret gate by design
+— a browser can't hold the panel token — so a direct 172.17.0.1:8010 bind hit (reachable from any
+edge container) 401s only while it leaves Remote-* unset: one that CAN spoof them gets the key,
+accepted because it already sits on the fleet's own network. The panel's Services view links there
+per instance (*dashboard ↗*, shown only while the container is running — down, the bounce 502s):
+Authelia pass → key written to that origin's localStorage → bounce to `/`, dashboard live.
+The `/v1` routers are untouched — API clients keep the bearer gate. No-JS/first-use fallback:
+type the key into the field the dashboard shows in its header after a 401 (persists in
+localStorage).
 
 **Logs:** every instance sets `RADIANCE_LOG: warn` in its own `environment` (it can't live in `x-llm-base` — YAML `<<:`
 merges top level only, and an instance's `environment` replaces the base's whole map). Per-request INFO lines (token
@@ -441,9 +459,10 @@ compose SERVICE name (`llm-27b` — not the `panel-llm-27b` container name compo
 panel-api resolves name → container (the compose service label) → edge IP (`edge-ips`).
 Clients use
 `base_url=https://llm.pietrasik.top/v1` + the same `LLM_API_KEY` as every instance; `/v1/models`
-reflects the active instance only. Served by panel-api itself (a router in `traefik/dynamic/llm.yml`
-→ the `172.17.0.1:8010` host bind — its own router, so it can omit `auth-chain` like the instance
-names; the gate is the bearer key). The router is scoped to `/v1`: everything else on the llm
+reflects the active instance only. Served by panel-api itself (router `fleet-fallback` in
+`traefik/dynamic/llm.yml` → the `panel-api` service in `panel.yml` → the `172.17.0.1:8010` host
+bind — the router omits `auth-chain` like the instance names; the gate is the bearer key).
+The router is scoped to `/v1`: everything else on the llm
 host 404s, so the admin `/api/*` stays behind `panel.pietrasik.top`'s Authelia + `panel-secret`
 chain — on the llm host a client could supply those headers itself. Health is each instance's
 own `/health`: probed every 30 s, and a failed proxied request (connection error or 5xx) parks
