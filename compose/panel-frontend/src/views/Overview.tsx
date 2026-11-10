@@ -2,7 +2,10 @@
 // The one page that answers "is the box okay?" without scrolling through
 // tables. Reading order is the order you'd ask the questions:
 //   host strip  → is anything on fire right now
-//   GPU cards   → are the cards working, full, hot
+//   GPU cards   → are the cards working, full, hot. Condensed by default —
+//                 one at-a-glance row per card, the whole pool on screen —
+//                 the full card (heroes, 5-min trace, every sensor) expands
+//                 under the header on demand, remembered per card.
 //   storage     → will I run out of room
 //   fleet       → is what should be running running (and which model is serving)
 // Indicators are bars (level) and traces (trend) — see ui.tsx for the colour
@@ -34,9 +37,10 @@ import type { Tone } from '../fmt'
 import { Big, Chart, Chip, Meter, MetricRow, Pill, Stack, Tile, TrendMark, TONE_COLOR } from '../ui'
 
 // Where amber starts and red starts, in one table, as fractions of each
-// sensor's own scale. VRAM is deliberately absent: an LLM server
-// preallocates all of it, so a full VRAM bar is a working box, not a
-// warning — colouring it red every time would train you to ignore red.
+// sensor's own scale. VRAM and power are deliberately absent: an LLM server
+// preallocates all of the VRAM, and the cards are power-limited, so a full
+// bar means the box is at its set point — working as intended, not a
+// warning — and colouring it red every time would train you to ignore red.
 const T = {
   cpuUse: { warn: 0.85, crit: 0.95 },
   cpuTemp: { max: 100, warn: 0.78, crit: 0.92 },
@@ -46,7 +50,6 @@ const T = {
   ram: { warn: 0.8, crit: 0.92 },
   swap: { warn: 0.55, crit: 0.85 },
   disk: { warn: 0.8, crit: 0.9 },
-  power: { warn: 0.85, crit: 0.98 },
   loadPerCore: { warn: 0.85, crit: 1.15 },
 }
 
@@ -79,6 +82,36 @@ function gpuState(util: number | null, junction: number | null): { label: string
   if (util >= 25) return { label: 'WORKING', tone: 'load', title: `GPU busy ${util.toFixed(0)} %` }
   if (util > 3) return { label: 'LIGHT', tone: 'muted', title: `GPU busy ${util.toFixed(0)} %` }
   return { label: 'IDLE', tone: 'muted', title: 'nothing is using this card' }
+}
+
+/**
+ * Condensed by default so the whole pool reads at a glance; this remembers,
+ * per card, whether the user opened the full detail. Keyed by the physical
+ * card — the same identity React keys the <GpuCard> by — so the remembered
+ * state follows the device even if its ROCR index shifts between polls.
+ * localStorage — survives tab switches and reloads, and a card the user
+ * never expanded stays condensed.
+ */
+function useGpuOpen(card: string): [boolean, () => void] {
+  const key = `panel.ov.gpu.${card}`
+  const [open, set] = useState(() => {
+    try {
+      return localStorage.getItem(key) === '1'
+    } catch {
+      return false
+    }
+  })
+  // The write is a side effect of `open`, so it lives in an effect — not in
+  // the setState updater, which React may invoke twice under StrictMode.
+  useEffect(() => {
+    try {
+      localStorage.setItem(key, open ? '1' : '0')
+    } catch {
+      /* storage unavailable — the card simply won't remember */
+    }
+  }, [key, open])
+  const toggle = () => set((o) => !o)
+  return [open, toggle]
 }
 
 export default function Overview({ intervalMs }: { intervalMs: number }) {
@@ -366,6 +399,7 @@ function TileNet({ net, hist, windowN, spanLabel }: { net: NonNullable<Metrics['
 // ─────────────────────────────── GPUs ───────────────────────────────
 
 function GpuCard({ gpu, hist, windowN, intervalS, spanLabel }: { gpu: Gpu; hist: Sample[]; windowN: number; intervalS: number; spanLabel: string }) {
+  const [open, setOpen] = useGpuOpen(gpu.card)
   const w = tail(hist, windowN)
   // Series are read out of the shared history buffer; a card that appeared
   // after the buffer started reads as a run of nulls (a gap), never zeros.
@@ -397,134 +431,195 @@ function GpuCard({ gpu, hist, windowN, intervalS, spanLabel }: { gpu: Gpu; hist:
 
   // "GPU-N" — N is the 0-based ROCR index, the same number the GPU pool's tiles use.
   return (
-    <article className={`gpu${state.tone === 'crit' ? ' crit' : ''}`}>
-      <header>
+    <article className={`gpu${state.tone === 'crit' ? ' crit' : ''}${open ? ' open' : ''}`}>
+      <header
+        role="button"
+        tabIndex={0}
+        aria-expanded={open}
+        title={open ? 'click to condense' : 'click for the full card'}
+        onClick={setOpen}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault()
+            setOpen()
+          }
+        }}
+      >
         <h3>GPU-{gpu.rocr_index}</h3>
         {gpu.pci_id && <Chip title={`driver: ${gpu.driver || '?'}`}>{gpu.pci_id}</Chip>}
         {gpu.pci_slot && <Chip title="PCI slot">{gpu.pci_slot.replace(/^0000:/, '')}</Chip>}
         <Pill tone={state.tone} title={state.title}>
           {state.label}
         </Pill>
+        <span className="gchev" aria-hidden>
+          ▾
+        </span>
       </header>
 
-      <div className="heroes">
-        <div className="hero">
-          <h5>gpu load</h5>
+      <div className="gsum">
+        <div className="gstat">
+          <h5>load</h5>
           <Big value={num(util)} unit="%" tone="load" />
-          <Chart series={[{ values: utilS, tone: 'load', fill: true }]} min={0} max={100} height={34} grid={[50]} />
-          <div className="foot">
-            <TrendMark {...trend(utilS, intervalS, 0, '%')} />
-            <span className="f">
-              avg {num(avg(utilS))}% · max {num(spread(utilS).max)}%
-            </span>
-          </div>
+          <Chart series={[{ values: utilS, tone: 'load', fill: true }]} min={0} max={100} height={20} dot={false} />
         </div>
-
-        <div className="hero">
+        <div
+          className="gstat"
+          title="No warn zone on purpose: an LLM server reserves all the VRAM it is given, so a full bar means a model is loaded — not that you are out of room."
+        >
           <h5>vram</h5>
-          <Big value={mem(gpu.vram_used_mib)} unit={gpu.vram_total_mib ? `/ ${mem(gpu.vram_total_mib, 0)}` : undefined} tone="load" />
+          <span className="gv t-load">
+            {mem(gpu.vram_used_mib)}
+            {gpu.vram_total_mib != null && <em> / {mem(gpu.vram_total_mib, 0)}</em>}
+          </span>
           <Meter pct={vramFrac} tone="load" />
-          <div
-            className="foot"
-            title="No warn zone on purpose: an LLM server reserves all the VRAM it is given, so a full bar means a model is loaded — not that you are out of room."
-          >
-            <span className="f">
-              {num((vramFrac ?? 0) * 100, 0)}% · headroom{' '}
-              {mem(Math.max(0, (gpu.vram_total_mib ?? 0) - (gpu.vram_used_mib ?? 0)))}
-            </span>
-          </div>
         </div>
-
-        <div className="hero">
+        <div
+          className="gstat"
+          title={junction != null ? 'junction — the silicon hot-spot; this is what throttles first' : 'edge — no junction sensor on this card'}
+        >
           <h5>{junction != null ? 'junction' : 'edge'}</h5>
-          <Big value={num(therm, 0)} unit="°C" tone={thermTone} />
-          <Chart series={[{ values: thermS, tone: thermTone, fill: true }]} min={thermAxis.min} max={thermAxis.max} height={34} grid={[thermMax * thermWarn]} />
-          <div className="foot">
-            <span className="f">
-              max {spanLabel} {num(spread(thermS).max, 0)}° · hot above {Math.round(thermMax * thermWarn)}°
-            </span>
+          <span className={`gv t-${thermTone}`}>
+            {num(therm, 0)}
+            <em>°C</em>
+          </span>
+          <Chart series={[{ values: thermS, tone: thermTone, fill: true }]} min={thermAxis.min} max={thermAxis.max} height={20} dot={false} />
+        </div>
+        <div
+          className="gstat"
+          title={gpu.power_cap_w ? `${num(gpu.power_w, 1)} W of a ${gpu.power_cap_w} W limit — a full bar is the card working at its limit, not a warning` : 'no power sensor on this card'}
+        >
+          <h5>power</h5>
+          <span className="gv t-load">
+            {num(gpu.power_w, 1)}
+            <em>
+              W{gpu.power_cap_w != null ? ` / ${gpu.power_cap_w}W` : ''}
+            </em>
+          </span>
+          <Meter pct={powerFrac} tone="load" />
+        </div>
+      </div>
+
+      {open && (
+        <div className="gdetail">
+          <div className="heroes">
+            <div className="hero">
+              <h5>gpu load</h5>
+              <Big value={num(util)} unit="%" tone="load" />
+              <Chart series={[{ values: utilS, tone: 'load', fill: true }]} min={0} max={100} height={34} grid={[50]} />
+              <div className="foot">
+                <TrendMark {...trend(utilS, intervalS, 0, '%')} />
+                <span className="f">
+                  avg {num(avg(utilS))}% · max {num(spread(utilS).max)}%
+                </span>
+              </div>
+            </div>
+
+            <div className="hero">
+              <h5>vram</h5>
+              <Big value={mem(gpu.vram_used_mib)} unit={gpu.vram_total_mib ? `/ ${mem(gpu.vram_total_mib, 0)}` : undefined} tone="load" />
+              <Meter pct={vramFrac} tone="load" />
+              <div
+                className="foot"
+                title="No warn zone on purpose: an LLM server reserves all the VRAM it is given, so a full bar means a model is loaded — not that you are out of room."
+              >
+                <span className="f">
+                  {num((vramFrac ?? 0) * 100, 0)}% · headroom{' '}
+                  {mem(Math.max(0, (gpu.vram_total_mib ?? 0) - (gpu.vram_used_mib ?? 0)))}
+                </span>
+              </div>
+            </div>
+
+            <div className="hero">
+              <h5>{junction != null ? 'junction' : 'edge'}</h5>
+              <Big value={num(therm, 0)} unit="°C" tone={thermTone} />
+              <Chart series={[{ values: thermS, tone: thermTone, fill: true }]} min={thermAxis.min} max={thermAxis.max} height={34} grid={[thermMax * thermWarn]} />
+              <div className="foot">
+                <span className="f">
+                  max {spanLabel} {num(spread(thermS).max, 0)}° · hot above {Math.round(thermMax * thermWarn)}°
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div className="gpu-trend">
+            <div className="trendhead">
+              <span className="k">{spanLabel} trend</span>
+              <span className="legend">
+                <span className="li">
+                  <i style={{ background: TONE_COLOR.load }} /> util {num(lastOf(utilS))}%
+                </span>
+                <span className="li">
+                  <i style={{ background: TONE_COLOR.flow }} /> vram {num(lastOf(vramS))}%
+                </span>
+              </span>
+              <span className="axis">
+                {w.length > 1 ? `${clockOf(w[0].t)} → now` : 'gathering…'}
+              </span>
+            </div>
+            <Chart series={[{ values: utilS, tone: 'load', fill: true }, { values: vramS, tone: 'flow' }]} min={0} max={100} height={64} grid={[25, 50, 75]} />
+          </div>
+
+          <div className="rows">
+            <MetricRow
+              label="edge"
+              value={num(edge, 0)}
+              unit="°C"
+              tone={toneOf(edge == null ? null : edge / T.edge.max, T.edge.warn, T.edge.crit)}
+              pct={edge == null ? null : edge / T.edge.max}
+              bands={[T.edge.warn, T.edge.crit]}
+              spark={edgeS}
+              title="hwmon temp1 — the cooler's own sensor"
+            />
+            <MetricRow
+              label="junction"
+              value={num(junction, 0)}
+              unit="°C"
+              tone={toneOf(junction == null ? null : junction / T.junction.max, T.junction.warn, T.junction.crit)}
+              pct={junction == null ? null : junction / T.junction.max}
+              bands={[T.junction.warn, T.junction.crit]}
+              spark={junctionS}
+              title="hwmon temp2 — the silicon hot-spot; this is what throttles first"
+            />
+            <MetricRow
+              label="mem temp"
+              value={num(gpu.temp_mem_c, 0)}
+              unit="°C"
+              tone={toneOf(gpu.temp_mem_c == null ? null : gpu.temp_mem_c / T.memTemp.max, T.memTemp.warn, T.memTemp.crit)}
+              pct={gpu.temp_mem_c == null ? null : gpu.temp_mem_c / T.memTemp.max}
+              bands={[T.memTemp.warn, T.memTemp.crit]}
+              spark={memS}
+              title="hwmon temp3 — HBM/GDDR temperature"
+            />
+            <MetricRow
+              label="power"
+              value={num(gpu.power_w, 1)}
+              unit="W"
+              tone="load"
+              pct={powerFrac}
+              spark={powerS}
+              title={gpu.power_cap_w ? `${num(gpu.power_w, 1)} W of a ${gpu.power_cap_w} W limit — a full bar is the card working at its limit, not a warning` : 'no power sensor on this card'}
+            />
+            <MetricRow
+              label="fan"
+              value={gpu.fan_rpm == null ? '—' : gpu.fan_rpm === 0 ? 'passive' : num(gpu.fan_rpm)}
+              unit={gpu.fan_rpm ? 'rpm' : undefined}
+              tone="muted"
+              pct={undefined}
+              spark={fanS}
+              title="fan1_input — 0 rpm means the fan is stopped (below the fan curve's floor), not broken"
+            />
+            <MetricRow
+              label="clock"
+              value={num(gpu.clock_mhz)}
+              unit="MHz"
+              tone="muted"
+              pct={undefined}
+              spark={clockS}
+              title={gpu.mem_clock_mhz ? `graphics clock; memory clock ${gpu.mem_clock_mhz} MHz` : 'graphics clock (sclk)'}
+            />
           </div>
         </div>
-      </div>
-
-      <div className="gpu-trend">
-        <div className="trendhead">
-          <span className="k">{spanLabel} trend</span>
-          <span className="legend">
-            <span className="li">
-              <i style={{ background: TONE_COLOR.load }} /> util {num(lastOf(utilS))}%
-            </span>
-            <span className="li">
-              <i style={{ background: TONE_COLOR.flow }} /> vram {num(lastOf(vramS))}%
-            </span>
-          </span>
-          <span className="axis">
-            {w.length > 1 ? `${clockOf(w[0].t)} → now` : 'gathering…'}
-          </span>
-        </div>
-        <Chart series={[{ values: utilS, tone: 'load', fill: true }, { values: vramS, tone: 'flow' }]} min={0} max={100} height={64} grid={[25, 50, 75]} />
-      </div>
-
-      <div className="rows">
-        <MetricRow
-          label="edge"
-          value={num(edge, 0)}
-          unit="°C"
-          tone={toneOf(edge == null ? null : edge / T.edge.max, T.edge.warn, T.edge.crit)}
-          pct={edge == null ? null : edge / T.edge.max}
-          bands={[T.edge.warn, T.edge.crit]}
-          spark={edgeS}
-          title="hwmon temp1 — the cooler's own sensor"
-        />
-        <MetricRow
-          label="junction"
-          value={num(junction, 0)}
-          unit="°C"
-          tone={toneOf(junction == null ? null : junction / T.junction.max, T.junction.warn, T.junction.crit)}
-          pct={junction == null ? null : junction / T.junction.max}
-          bands={[T.junction.warn, T.junction.crit]}
-          spark={junctionS}
-          title="hwmon temp2 — the silicon hot-spot; this is what throttles first"
-        />
-        <MetricRow
-          label="mem temp"
-          value={num(gpu.temp_mem_c, 0)}
-          unit="°C"
-          tone={toneOf(gpu.temp_mem_c == null ? null : gpu.temp_mem_c / T.memTemp.max, T.memTemp.warn, T.memTemp.crit)}
-          pct={gpu.temp_mem_c == null ? null : gpu.temp_mem_c / T.memTemp.max}
-          bands={[T.memTemp.warn, T.memTemp.crit]}
-          spark={memS}
-          title="hwmon temp3 — HBM/GDDR temperature"
-        />
-        <MetricRow
-          label="power"
-          value={num(gpu.power_w, 1)}
-          unit="W"
-          tone={toneOf(powerFrac, T.power.warn, T.power.crit)}
-          pct={powerFrac}
-          bands={[T.power.warn, T.power.crit]}
-          spark={powerS}
-          title={gpu.power_cap_w ? `${num(gpu.power_w, 1)} W of a ${gpu.power_cap_w} W limit` : 'no power sensor on this card'}
-        />
-        <MetricRow
-          label="fan"
-          value={gpu.fan_rpm == null ? '—' : gpu.fan_rpm === 0 ? 'passive' : num(gpu.fan_rpm)}
-          unit={gpu.fan_rpm ? 'rpm' : undefined}
-          tone="muted"
-          pct={undefined}
-          spark={fanS}
-          title="fan1_input — 0 rpm means the fan is stopped (below the fan curve's floor), not broken"
-        />
-        <MetricRow
-          label="clock"
-          value={num(gpu.clock_mhz)}
-          unit="MHz"
-          tone="muted"
-          pct={undefined}
-          spark={clockS}
-          title={gpu.mem_clock_mhz ? `graphics clock; memory clock ${gpu.mem_clock_mhz} MHz` : 'graphics clock (sclk)'}
-        />
-      </div>
+      )}
     </article>
   )
 }

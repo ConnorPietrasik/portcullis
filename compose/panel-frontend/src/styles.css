@@ -729,6 +729,16 @@ pre.out.err {
      top-nav header rule matched this <header> tag too. */
   border-bottom: 1px solid var(--line-soft);
   padding-bottom: 8px;
+  /* the row is the card's expand toggle (role=button on the element) */
+  cursor: pointer;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.gpu > header:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 8px;
 }
 
 .gpu h3 {
@@ -739,6 +749,89 @@ pre.out.err {
 
 .gpu > header .pill {
   margin-left: auto;
+}
+
+/* the expand affordance — points down while condensed, up while open */
+.gpu > header .gchev {
+  color: var(--dim);
+  font-size: 11px;
+  line-height: 1;
+  padding: 2px;
+  transition: transform 130ms ease;
+}
+
+.gpu.open > header .gchev {
+  transform: rotate(180deg);
+}
+
+/* ── the condensed card: one at-a-glance row per GPU ──
+   The default state of every card — load, VRAM, the sensor that throttles,
+   and power, each with a slim indicator — so the whole pool reads top to
+   bottom without scrolling. Clicking the header reveals the full card
+   (.gdetail) beneath this row. */
+.gsum {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr) minmax(0, 0.85fr) minmax(0, 0.85fr);
+  gap: 10px;
+  min-width: 0;
+}
+
+/* a flex column, not a grid: the bar/trace's `margin-top: auto` only pulls
+   it to the cell's bottom line when the free space is in the main axis — a
+   grid with `align-content: start` keeps its auto rows packed at the top, so
+   the meter floated ~12px above the 20px chart's bottom. */
+.gstat {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.gstat h5 {
+  margin: 0;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1.3px;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+/* the load % is the number you read from across the room — bigger than the
+   other cells, but small enough that the row stays one quiet band */
+.gstat .big {
+  font-size: clamp(17px, 1.7vw, 21px);
+}
+
+.gstat .gv {
+  font-size: 14.5px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.gstat .gv em {
+  font-style: normal;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--muted);
+  margin-left: 4px;
+}
+
+/* every cell's bar/trace sits on the same bottom line, whatever its height
+   — `margin-top: auto` inside the flex column above absorbs the cell's spare
+   height, so an 8px meter and a 20px chart share the same baseline */
+.gstat .chart,
+.gstat .meter {
+  margin-top: auto;
+}
+
+/* the expanded body — heroes, the 5-min trace and the per-sensor rows keep
+   their own spacing; the card's grid gap handles the seam */
+.gdetail {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+  min-width: 0;
 }
 
 .chip {
@@ -1224,6 +1317,9 @@ pre.out.err {
 @media (max-width: 900px) {
   .gpus {
     grid-template-columns: 1fr;
+  }
+  .gsum {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .heroes {
     grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
