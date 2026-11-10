@@ -33,7 +33,7 @@ body {
   padding: 0 18px 44px;
 }
 
-header {
+.app > header {
   display: flex;
   align-items: center;
   gap: 24px;
@@ -723,6 +723,12 @@ pre.out.err {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+  /* plain identity row — same treatment as .panelish > header: soft hairline
+     under the row, no background strip, so the card name lines up with the
+     tiles below. The dark strip it used to have was an accident: the global
+     top-nav header rule matched this <header> tag too. */
+  border-bottom: 1px solid var(--line-soft);
+  padding-bottom: 8px;
 }
 
 .gpu h3 {
@@ -744,7 +750,7 @@ pre.out.err {
   background: var(--bg);
   border: 1px solid var(--line-soft);
   border-radius: 5px;
-  padding: 1px 7px;
+  padding: 2px 9px;
   white-space: nowrap;
 }
 

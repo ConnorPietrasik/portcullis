@@ -395,11 +395,11 @@ function GpuCard({ gpu, hist, windowN, intervalS, spanLabel }: { gpu: Gpu; hist:
   const thermTone = toneOf(therm == null ? null : therm / thermMax, thermWarn, thermCrit)
   const thermAxis = axis(thermS, { floorAt: 20, ceilAt: thermMax })
 
+  // "GPU-N" — N is the 0-based ROCR index, the same number the GPU pool's tiles use.
   return (
     <article className={`gpu${state.tone === 'crit' ? ' crit' : ''}`}>
       <header>
-        <h3>{gpu.name}</h3>
-        {gpu.name !== gpu.card && <Chip title="drm card">{gpu.card}</Chip>}
+        <h3>GPU-{gpu.rocr_index}</h3>
         {gpu.pci_id && <Chip title={`driver: ${gpu.driver || '?'}`}>{gpu.pci_id}</Chip>}
         {gpu.pci_slot && <Chip title="PCI slot">{gpu.pci_slot.replace(/^0000:/, '')}</Chip>}
         <Pill tone={state.tone} title={state.title}>

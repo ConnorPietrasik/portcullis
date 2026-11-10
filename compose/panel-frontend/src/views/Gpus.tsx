@@ -69,8 +69,7 @@ export default function Gpus({ intervalMs }: { intervalMs: number }) {
   // skipped; the same files the ROCm runtime reads) — the sysfs card NAME is
   // not the ROCR index (on this host a non-GPU drm device takes card0, so
   // the GPUs are card1..card6, and joining on the name was off by one: tile
-  // 0 had no readings, tiles 1+ showed the previous card's). The name parse
-  // below is only a fallback for an API older than rocr_index.
+  // 0 had no readings, tiles 1+ showed the previous card's).
   const metrics = usePoll(() => api<Metrics>('/metrics'), intervalMs)
 
   const [busy, setBusy] = useState<string | null>(null)
@@ -80,12 +79,7 @@ export default function Gpus({ intervalMs }: { intervalMs: number }) {
   const data = pool.data
   const gpusByIndex = new Map<number, Gpu>()
   for (const g of metrics.data?.gpus ?? []) {
-    if (typeof g.rocr_index === 'number') {
-      gpusByIndex.set(g.rocr_index, g)
-    } else {
-      const m = /^card(\d+)$/.exec(g.card)
-      if (m) gpusByIndex.set(Number(m[1]), g)
-    }
+    gpusByIndex.set(g.rocr_index, g)
   }
 
   // Every mutation endpoint responds with the fresh pool view

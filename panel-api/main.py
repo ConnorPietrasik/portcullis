@@ -258,8 +258,8 @@ def amd_gpus() -> list[dict[str, Any]]:
         if not hwmons and _rd(f"{dev}/gpu_busy_percent") is None:
             continue
         hw = hwmons[0] if hwmons else None
-        # No product_name on many kernels — the PCI id + slot at least make the
-        # two identical cards distinguishable in the UI (name falls back to cardN).
+        # No product_name on many kernels — the PCI id + slot are what make the
+        # two identical cards distinguishable in the UI.
         uevent = _rd(f"{dev}/uevent", default="") or ""
         ue = dict(
             line.split("=", 1) for line in uevent.splitlines() if "=" in line
@@ -268,7 +268,6 @@ def amd_gpus() -> list[dict[str, Any]]:
             {
                 "card": os.path.basename(card),
                 "rocr_index": None,  # assigned in the KFD-order pass below
-                "name": _rd(f"{dev}/product_name") or _rd(f"{dev}/label") or os.path.basename(card),
                 "driver": ue.get("DRIVER", ""),
                 "pci_id": ue.get("PCI_ID", ""),
                 "pci_slot": ue.get("PCI_SLOT_NAME", ""),
