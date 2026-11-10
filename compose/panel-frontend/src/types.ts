@@ -3,6 +3,12 @@
 
 export interface Gpu {
   card: string
+  /** ROCR device index — the card's position in the KFD topology order
+   *  (node id, host CPU node skipped), what ROCR_VISIBLE_DEVICES and the
+   *  GPU pool's tile indices count in. The sysfs card name is NOT this
+   *  (a non-GPU drm device can take card0). Absent on an API older than
+   *  the rocr_index field. */
+  rocr_index?: number | null
   name: string
   driver: string
   pci_id: string

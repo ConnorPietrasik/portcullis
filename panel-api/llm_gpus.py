@@ -4,8 +4,12 @@ Operator view: docs/RUNBOOK.md → "LLM fleet" → "GPU pool".
 
 - Each fleet instance (compose service ``llm-*``) needs a fixed number of
   cards (its ``llm.cards`` label, else ``--tp`` in its command). The pool is
-  the host's whole card set (panel-api counts it from /sys; ROCR index i ==
-  drm card i on this host).
+  the host's whole card set (panel-api counts it from /sys). Pool indices
+  are ROCR indices — what ROCR_VISIBLE_DEVICES counts in — NOT sysfs drm
+  card numbers: on this host a non-GPU drm device takes card0, so the six
+  GPUs are card1..card6 (panel-api's metrics carry each card's rocr_index —
+  its ROCR device number from the KFD topology — for exactly this join; see
+  ``amd_gpus`` in main.py).
 - The LEDGER (``llm-gpu.json`` next to this file in production:
   /opt/panel-api/) is the durable state: each instance's current card set
   (``allocations``) + the boot-autostart list (``autostart``). panel-api and

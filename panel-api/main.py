@@ -164,8 +164,91 @@ def _rate(key: str, value: float) -> Optional[float]:
     return (value - prev[0]) / dt if dt > 0 else None
 
 
+DRM_CLASS_DIR = "/sys/class/drm"
+KFD_NODES_DIR = "/sys/class/kfd/kfd/topology/nodes"
+
+
+def _bdf_of(path: str) -> Optional[str]:
+    """A drm sysfs path → its PCI BDF (the component above 'drm/'), None for
+    a virtual device or an unresolvable path."""
+    parts = os.path.realpath(path).split("/")
+    i = parts.index("drm") if "drm" in parts else -1
+    return parts[i - 1] if i >= 1 and ":" in parts[i - 1] else None
+
+
+def _rocr_indexes(cards: list[str]) -> Optional[dict[str, int]]:
+    """card name → ROCR device index, from the KFD topology sysfs — or None
+    to make the caller fall back to card-number order.
+
+    ROCm enumerates devices in KFD registration order, and the kernel exposes
+    exactly that order as /sys/class/kfd/kfd/topology/nodes/<id> — in id
+    order, with the HOST CPU occupying a node too (vendor_id 0, always
+    first), so ROCR device i is the (i+1)-th GPU node. The ROCm runtime reads
+    these same files (its own topology code), so this is the order itself,
+    not a proxy — no ROCm install, no /dev/kfd. A node maps to its card via
+    unique_id (decimal here, hex in the card's device dir) or
+    drm_render_minor (renderD<N> → BDF). None when the topology is absent
+    (older kernel), unreadable (the service user lacks kfd access), or a
+    node/card can't be placed — a half mapping is worse than the fallback.
+    """
+    nodes = sorted(
+        (p for p in glob.glob(f"{KFD_NODES_DIR}/*") if os.path.basename(p).isdigit()),
+        key=lambda p: int(os.path.basename(p)),
+    )
+    if not nodes:
+        return None
+    card_by_uid: dict[int, str] = {}
+    card_by_bdf: dict[str, str] = {}
+    for card in glob.glob(f"{DRM_CLASS_DIR}/card[0-9]*"):
+        name = os.path.basename(card)
+        if not re.match(r"^card[0-9]+$", name):
+            continue  # cardN-DP-1 & friends share the card's BDF/device
+        try:
+            card_by_uid[int(_rd(f"{card}/device/unique_id", default=""), 16)] = name
+        except ValueError:
+            pass
+        bdf = _bdf_of(card)
+        if bdf:
+            card_by_bdf[bdf] = name
+    mapping: dict[str, int] = {}
+    i = -1
+    for node in nodes:
+        props: dict[str, int] = {}
+        for line in _rd(f"{node}/properties", default="").splitlines():
+            key, _, val = line.partition(" ")
+            try:
+                props[key] = int(val)
+            except ValueError:
+                pass
+        if not props.get("vendor_id"):
+            continue  # the CPU node (vendor 0) — or unreadable properties
+        i += 1
+        card = card_by_uid.get(props["unique_id"]) if props.get("unique_id") else None
+        if card is None and props.get("drm_render_minor"):
+            bdf = _bdf_of(f"{DRM_CLASS_DIR}/renderD{props['drm_render_minor']}")
+            card = card_by_bdf.get(bdf) if bdf else None
+        if card is None:
+            return None  # a GPU node we can't place: don't trust the mapping
+        mapping[card] = i
+    return mapping if set(mapping) == set(cards) else None
+
+
 def amd_gpus() -> list[dict[str, Any]]:
-    """AMD GPU stats from sysfs — no ROCm / amd-smi needed."""
+    """AMD GPU stats from sysfs — no ROCm / amd-smi needed.
+
+    Each entry carries `rocr_index`: the card's ROCR device number — what
+    ROCR_VISIBLE_DEVICES (and the GPU pool's tile indices) count in. The
+    kernel exposes the enumeration in the KFD topology sysfs (node id order,
+    host CPU node skipped) — the same files the ROCm runtime reads, so
+    _rocr_indexes() returns the exact order, not a proxy. The sysfs card NAME
+    is NOT that index: a non-GPU drm device can take a card slot (on this
+    host card0, so the six R9700s are card1..card6 — joining the pool on the
+    name was off by one: tile 0 had no readings and every tile showed the
+    PREVIOUS card's). When the topology is unavailable or can't be fully
+    mapped, the index falls back to card-number order (probe order — the same
+    sequence KFD registers in). The list itself stays in card-number order
+    (the Overview renders it as-is); the pool view joins on rocr_index.
+    """
     out: list[dict[str, Any]] = []
     for card in sorted(glob.glob("/sys/class/drm/card[0-9]*"), key=_natural_key):
         dev = f"{card}/device"
@@ -184,6 +267,7 @@ def amd_gpus() -> list[dict[str, Any]]:
         out.append(
             {
                 "card": os.path.basename(card),
+                "rocr_index": None,  # assigned in the KFD-order pass below
                 "name": _rd(f"{dev}/product_name") or _rd(f"{dev}/label") or os.path.basename(card),
                 "driver": ue.get("DRIVER", ""),
                 "pci_id": ue.get("PCI_ID", ""),
@@ -204,6 +288,13 @@ def amd_gpus() -> list[dict[str, Any]]:
                 "mem_clock_mhz": _hwrd(hw, "freq2_input", lambda v: int(v) // 10**6),
             }
         )
+    # rocr_index: the KFD topology order (exact) when it is readable and
+    # maps every card, else card-number order (probe order). See _rocr_indexes.
+    rocr = _rocr_indexes([e["card"] for e in out])
+    if rocr is None:
+        rocr = {e["card"]: i for i, e in enumerate(out)}
+    for e in out:
+        e["rocr_index"] = rocr[e["card"]]
     return out
 
 
