@@ -144,11 +144,6 @@ export function axis(
   return hi - lo < 1 ? { min: lo, max: lo + 1 } : { min: lo, max: hi }
 }
 
-export function avg(values: (number | null)[]): number | null {
-  const pts = values.filter((v): v is number => v != null)
-  return pts.length ? pts.reduce((a, b) => a + b, 0) / pts.length : null
-}
-
 export const lastOf = (values: (number | null)[]): number | null => {
   for (let i = values.length - 1; i >= 0; i--) if (values[i] != null) return values[i]
   return null

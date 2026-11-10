@@ -1,3 +1,4 @@
+Add an AGENTS.md
 Services categories for the panel to make it easier to find things / avoid bloat
 Make an actual portfolio site
 Some sort of chat server that allows the chosen model to do web searches / tool calls to image gen / maybe write scripts to verify stuff. Admin-only and behind authelia, obviously. Should take text / images.

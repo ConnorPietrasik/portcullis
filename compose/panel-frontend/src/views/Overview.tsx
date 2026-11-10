@@ -3,9 +3,10 @@
 // tables. Reading order is the order you'd ask the questions:
 //   host strip  → is anything on fire right now
 //   GPU cards   → are the cards working, full, hot. Condensed by default —
-//                 one at-a-glance row per card, the whole pool on screen —
-//                 the full card (heroes, 5-min trace, every sensor) expands
-//                 under the header on demand, remembered per card.
+//                 one at-a-glance row per card (load with clocks and fan,
+//                 VRAM, junction with mem temp, power), the whole pool on
+//                 screen — every sensor's 5-min trace expands under the
+//                 header on demand, remembered per card.
 //   storage     → will I run out of room
 //   fleet       → is what should be running running (and which model is serving)
 // Indicators are bars (level) and traces (trend) — see ui.tsx for the colour
@@ -19,7 +20,6 @@ import { useHistory, seriesOf, tail } from '../history'
 import type { Sample } from '../history'
 import type { ContainerInfo, Disk, Gpu, LLMSettings, Metrics, Sensor } from '../types'
 import {
-  avg,
   axis,
   bitsPerSec,
   bytesPerSec,
@@ -34,7 +34,7 @@ import {
   uptime,
 } from '../fmt'
 import type { Tone } from '../fmt'
-import { Big, Chart, Chip, Meter, MetricRow, Pill, Stack, Tile, TrendMark, TONE_COLOR } from '../ui'
+import { Big, Chart, Chip, Meter, Pill, Stack, Tile, TrendMark } from '../ui'
 
 // Where amber starts and red starts, in one table, as fractions of each
 // sensor's own scale. VRAM and power are deliberately absent: an LLM server
@@ -52,6 +52,13 @@ const T = {
   disk: { warn: 0.8, crit: 0.9 },
   loadPerCore: { warn: 0.85, crit: 1.15 },
 }
+
+// Physical ceilings for the fan and clock traces. axis() scales to the data
+// up to the ceiling, so these only stop the scale clipping a real reading:
+// the ASRock R9700 blower tops out at ~3725 rpm sustained (the ASUS board's
+// hits 3967) and NAVI 48 boost is 2920 MHz.
+const FAN_CEIL_RPM = 4000
+const CLOCK_CEIL_MHZ = 3000
 
 const shortCpu = (m: string) =>
   m
@@ -408,7 +415,9 @@ function GpuCard({ gpu, hist, windowN, intervalS, spanLabel }: { gpu: Gpu; hist:
   const util = gpu.util_pct ?? null
   const junction = gpu.temp_junction_c ?? null
   const edge = gpu.temp_edge_c ?? null
+  const memC = gpu.temp_mem_c
   const state = gpuState(util, junction)
+  const fanText = gpu.fan_rpm == null ? '—' : `${num(gpu.fan_rpm)} rpm`
 
   const utilS = col((g) => g.util)
   const vramS = col((g) => g.vramPct)
@@ -428,6 +437,18 @@ function GpuCard({ gpu, hist, windowN, intervalS, spanLabel }: { gpu: Gpu; hist:
   const thermCrit = junction != null ? T.junction.crit : T.edge.crit
   const thermTone = toneOf(therm == null ? null : therm / thermMax, thermWarn, thermCrit)
   const thermAxis = axis(thermS, { floorAt: 20, ceilAt: thermMax })
+
+  // Scales for the expanded trace grid: each sensor gets its own autoscale
+  // so a 2 °C drift is visible, clamped under the max its colour rules are
+  // quoted against. Power is the exception — fixed 0 → cap — so the trace's
+  // height *is* the level against the limit; near the cap that hides small
+  // wiggles, and that's fine, the range row carries the numbers.
+  const junctionAxis = axis(junctionS, { floorAt: 20, ceilAt: T.junction.max })
+  const memAxis = axis(memS, { floorAt: 20, ceilAt: T.memTemp.max })
+  const edgeAxis = axis(edgeS, { floorAt: 20, ceilAt: T.edge.max })
+  const fanAxis = axis(fanS, { floorAt: 0, ceilAt: FAN_CEIL_RPM })
+  const clockAxis = axis(clockS, { floorAt: 0, ceilAt: CLOCK_CEIL_MHZ })
+  const powerMax = gpu.power_cap_w ?? Math.max(10, (spread(powerS).max ?? 10) * 1.2)
 
   // "GPU-N" — N is the 0-based ROCR index, the same number the GPU pool's tiles use.
   return (
@@ -460,6 +481,16 @@ function GpuCard({ gpu, hist, windowN, intervalS, spanLabel }: { gpu: Gpu; hist:
         <div className="gstat">
           <h5>load</h5>
           <Big value={num(util)} unit="%" tone="load" />
+          <span
+            className="gsub"
+            title={
+              gpu.mem_clock_mhz
+                ? `graphics clock (memory runs at ${gpu.mem_clock_mhz} MHz) · fan`
+                : 'graphics clock (sclk) · fan'
+            }
+          >
+            {num(gpu.clock_mhz)} MHz · {fanText}
+          </span>
           <Chart series={[{ values: utilS, tone: 'load', fill: true }]} min={0} max={100} height={20} dot={false} />
         </div>
         <div
@@ -482,6 +513,9 @@ function GpuCard({ gpu, hist, windowN, intervalS, spanLabel }: { gpu: Gpu; hist:
             {num(therm, 0)}
             <em>°C</em>
           </span>
+          <span className="gsub" title="HBM/GDDR memory temperature — the third sensor; hot VRAM throttles the memory clock">
+            mem {num(memC, 0)}°
+          </span>
           <Chart series={[{ values: thermS, tone: thermTone, fill: true }]} min={thermAxis.min} max={thermAxis.max} height={20} dot={false} />
         </div>
         <div
@@ -501,126 +535,164 @@ function GpuCard({ gpu, hist, windowN, intervalS, spanLabel }: { gpu: Gpu; hist:
 
       {open && (
         <div className="gdetail">
-          <div className="heroes">
-            <div className="hero">
-              <h5>gpu load</h5>
-              <Big value={num(util)} unit="%" tone="load" />
-              <Chart series={[{ values: utilS, tone: 'load', fill: true }]} min={0} max={100} height={34} grid={[50]} />
-              <div className="foot">
-                <TrendMark {...trend(utilS, intervalS, 0, '%')} />
-                <span className="f">
-                  avg {num(avg(utilS))}% · max {num(spread(utilS).max)}%
-                </span>
-              </div>
-            </div>
-
-            <div className="hero">
-              <h5>vram</h5>
-              <Big value={mem(gpu.vram_used_mib)} unit={gpu.vram_total_mib ? `/ ${mem(gpu.vram_total_mib, 0)}` : undefined} tone="load" />
-              <Meter pct={vramFrac} tone="load" />
-              <div
-                className="foot"
-                title="No warn zone on purpose: an LLM server reserves all the VRAM it is given, so a full bar means a model is loaded — not that you are out of room."
-              >
-                <span className="f">
-                  {num((vramFrac ?? 0) * 100, 0)}% · headroom{' '}
-                  {mem(Math.max(0, (gpu.vram_total_mib ?? 0) - (gpu.vram_used_mib ?? 0)))}
-                </span>
-              </div>
-            </div>
-
-            <div className="hero">
-              <h5>{junction != null ? 'junction' : 'edge'}</h5>
-              <Big value={num(therm, 0)} unit="°C" tone={thermTone} />
-              <Chart series={[{ values: thermS, tone: thermTone, fill: true }]} min={thermAxis.min} max={thermAxis.max} height={34} grid={[thermMax * thermWarn]} />
-              <div className="foot">
-                <span className="f">
-                  max {spanLabel} {num(spread(thermS).max, 0)}° · hot above {Math.round(thermMax * thermWarn)}°
-                </span>
-              </div>
-            </div>
+          <div className="trendhead">
+            <span className="k">{spanLabel} trace</span>
+            <span className="axis">
+              {w.length > 1 ? `${clockOf(w[0].t)} → now` : 'gathering…'}
+            </span>
           </div>
 
-          <div className="gpu-trend">
-            <div className="trendhead">
-              <span className="k">{spanLabel} trend</span>
-              <span className="legend">
-                <span className="li">
-                  <i style={{ background: TONE_COLOR.load }} /> util {num(lastOf(utilS))}%
-                </span>
-                <span className="li">
-                  <i style={{ background: TONE_COLOR.flow }} /> vram {num(lastOf(vramS))}%
-                </span>
-              </span>
-              <span className="axis">
-                {w.length > 1 ? `${clockOf(w[0].t)} → now` : 'gathering…'}
-              </span>
-            </div>
-            <Chart series={[{ values: utilS, tone: 'load', fill: true }, { values: vramS, tone: 'flow' }]} min={0} max={100} height={64} grid={[25, 50, 75]} />
-          </div>
-
-          <div className="rows">
-            <MetricRow
-              label="edge"
-              value={num(edge, 0)}
-              unit="°C"
-              tone={toneOf(edge == null ? null : edge / T.edge.max, T.edge.warn, T.edge.crit)}
-              pct={edge == null ? null : edge / T.edge.max}
-              bands={[T.edge.warn, T.edge.crit]}
-              spark={edgeS}
-              title="hwmon temp1 — the cooler's own sensor"
+          {/* the condensed row says what is true now — so this section is the
+              history: every sensor on its own scale, with the window's range
+              and rate under each trace. Nothing up top is repeated here. */}
+          <div className="gtrace">
+            <GpuTrace
+              label="util"
+              values={utilS}
+              intervalS={intervalS}
+              min={0}
+              max={100}
+              grid={[50]}
+              tone="load"
+              unit="%"
+              trendUnit="%"
+              title="GPU busy — the work the card is doing"
             />
-            <MetricRow
+            <GpuTrace
+              label="vram"
+              values={vramS}
+              intervalS={intervalS}
+              min={0}
+              max={100}
+              grid={[50]}
+              tone="flow"
+              unit="%"
+              trendUnit="%"
+              title="VRAM as a % of total — flat at 100 % is a loaded model, not a leak"
+            />
+            <GpuTrace
               label="junction"
-              value={num(junction, 0)}
-              unit="°C"
+              values={junctionS}
+              intervalS={intervalS}
+              min={junctionAxis.min}
+              max={junctionAxis.max}
+              grid={[T.junction.max * T.junction.warn]}
               tone={toneOf(junction == null ? null : junction / T.junction.max, T.junction.warn, T.junction.crit)}
-              pct={junction == null ? null : junction / T.junction.max}
-              bands={[T.junction.warn, T.junction.crit]}
-              spark={junctionS}
+              unit="°C"
+              trendUnit="°"
               title="hwmon temp2 — the silicon hot-spot; this is what throttles first"
             />
-            <MetricRow
-              label="mem temp"
-              value={num(gpu.temp_mem_c, 0)}
+            <GpuTrace
+              label="edge"
+              values={edgeS}
+              intervalS={intervalS}
+              min={edgeAxis.min}
+              max={edgeAxis.max}
+              grid={[T.edge.max * T.edge.warn]}
+              tone={toneOf(edge == null ? null : edge / T.edge.max, T.edge.warn, T.edge.crit)}
               unit="°C"
-              tone={toneOf(gpu.temp_mem_c == null ? null : gpu.temp_mem_c / T.memTemp.max, T.memTemp.warn, T.memTemp.crit)}
-              pct={gpu.temp_mem_c == null ? null : gpu.temp_mem_c / T.memTemp.max}
-              bands={[T.memTemp.warn, T.memTemp.crit]}
-              spark={memS}
-              title="hwmon temp3 — HBM/GDDR temperature"
+              trendUnit="°"
+              title="hwmon temp1 — the cooler's own sensor"
             />
-            <MetricRow
+            <GpuTrace
+              label="mem temp"
+              values={memS}
+              intervalS={intervalS}
+              min={memAxis.min}
+              max={memAxis.max}
+              grid={[T.memTemp.max * T.memTemp.warn]}
+              tone={toneOf(memC == null ? null : memC / T.memTemp.max, T.memTemp.warn, T.memTemp.crit)}
+              unit="°C"
+              trendUnit="°"
+              title="hwmon temp3 — HBM/GDDR temperature; hot VRAM throttles the memory clock"
+            />
+            <GpuTrace
               label="power"
-              value={num(gpu.power_w, 1)}
-              unit="W"
+              values={powerS}
+              intervalS={intervalS}
+              min={0}
+              max={powerMax}
               tone="load"
-              pct={powerFrac}
-              spark={powerS}
-              title={gpu.power_cap_w ? `${num(gpu.power_w, 1)} W of a ${gpu.power_cap_w} W limit — a full bar is the card working at its limit, not a warning` : 'no power sensor on this card'}
+              unit="W"
+              trendUnit=" W"
+              title={
+                gpu.power_cap_w
+                  ? `drawn against the ${gpu.power_cap_w} W limit — a full trace is the card at its limit, not a warning`
+                  : 'no power sensor on this card'
+              }
             />
-            <MetricRow
+            <GpuTrace
               label="fan"
-              value={gpu.fan_rpm == null ? '—' : gpu.fan_rpm === 0 ? 'passive' : num(gpu.fan_rpm)}
-              unit={gpu.fan_rpm ? 'rpm' : undefined}
+              values={fanS}
+              intervalS={intervalS}
+              min={fanAxis.min}
+              max={fanAxis.max}
               tone="muted"
-              pct={undefined}
-              spark={fanS}
-              title="fan1_input — 0 rpm means the fan is stopped (below the fan curve's floor), not broken"
+              unit="rpm"
+              trendUnit=" rpm"
+              title="fan1"
             />
-            <MetricRow
+            <GpuTrace
               label="clock"
-              value={num(gpu.clock_mhz)}
-              unit="MHz"
+              values={clockS}
+              intervalS={intervalS}
+              min={clockAxis.min}
+              max={clockAxis.max}
               tone="muted"
-              pct={undefined}
-              spark={clockS}
-              title={gpu.mem_clock_mhz ? `graphics clock; memory clock ${gpu.mem_clock_mhz} MHz` : 'graphics clock (sclk)'}
+              unit="MHz"
+              trendUnit=" MHz"
+              title={gpu.mem_clock_mhz ? `graphics clock (sclk); memory runs at ${gpu.mem_clock_mhz} MHz` : 'graphics clock (sclk)'}
             />
           </div>
         </div>
       )}
     </article>
+  )
+}
+
+/**
+ * One sensor's history over the window: its own scale, the window's min–max
+ * and rate under the trace. The current value stays out on purpose — the
+ * condensed row already says what is true now, so the expanded card is the
+ * history, not a repeat of it.
+ */
+function GpuTrace({
+  label,
+  values,
+  intervalS,
+  min,
+  max,
+  grid = [],
+  tone,
+  unit,
+  trendUnit,
+  title,
+}: {
+  label: string
+  values: (number | null)[]
+  intervalS: number
+  min: number
+  max: number
+  grid?: number[]
+  tone: Tone
+  /** unit shown after the window's min–max */
+  unit: string
+  /** unit inside the rate, e.g. "°" → "▲ +2°/min" */
+  trendUnit: string
+  title?: string
+}) {
+  const { min: lo, max: hi } = spread(values)
+  return (
+    <div className="gtr" title={title}>
+      <h5>
+        {label}
+        <span className="gt">
+          <TrendMark {...trend(values, intervalS, 0, trendUnit)} />
+        </span>
+      </h5>
+      <Chart series={[{ values, tone, fill: true }]} min={min} max={max} height={24} grid={grid} dot={false} />
+      <span className="gr">{lo == null ? 'no readings' : `${num(lo)}–${num(hi)} ${unit}`}</span>
+    </div>
   )
 }
 

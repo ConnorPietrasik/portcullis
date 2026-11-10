@@ -8,11 +8,11 @@
 // (accent/cyan). Anything else is a rainbow you have to decode.
 
 import type { ReactNode } from 'react'
-import { axis, clamp01 } from './fmt'
+import { clamp01 } from './fmt'
 import type { Tone } from './fmt'
 import type { Num } from './history'
 
-export const TONE_COLOR: Record<Tone, string> = {
+const TONE_COLOR: Record<Tone, string> = {
   ok: 'var(--green)',
   warn: 'var(--amber)',
   crit: 'var(--red)',
@@ -178,48 +178,6 @@ export function Chip({ children, title }: { children: ReactNode; title?: string 
     <span className="chip" title={title}>
       {children}
     </span>
-  )
-}
-
-/** One labelled reading: name · [history] · [bar] · value. */
-export function MetricRow({
-  label,
-  value,
-  unit,
-  tone = 'load',
-  pct,
-  ticks = [],
-  bands,
-  spark,
-  title,
-}: {
-  label: string
-  value: string
-  unit?: string
-  tone?: Tone
-  /** null = no reading (empty track); undefined = this metric has no scale to draw. */
-  pct?: Num
-  ticks?: number[]
-  bands?: [number, number]
-  spark?: Num[]
-  title?: string
-}) {
-  return (
-    <div className="mrow" title={title}>
-      <span className="k">{label}</span>
-      {spark && (
-        <span className="s">
-          <Chart series={[{ values: spark, tone, fill: true }]} min={axis(spark, { floorAt: 0 }).min} max={axis(spark, { floorAt: 0 }).max} height={16} dot={false} padTop={2} />
-        </span>
-      )}
-      {/* the slot is always there: without a scale the value must still line up
-          with the values in the rows above and below it */}
-      <span className="b">{pct !== undefined && <Meter pct={pct} tone={tone} ticks={ticks} bands={bands} />}</span>
-      <span className={`v t-${tone}`}>
-        {value}
-        {unit && <em>{unit}</em>}
-      </span>
-    </div>
   )
 }
 

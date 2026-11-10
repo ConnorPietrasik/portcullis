@@ -487,8 +487,7 @@ pre.out.err {
   text-transform: none;
 }
 
-.tile .foot,
-.hero .foot {
+.tile .foot {
   display: flex;
   align-items: baseline;
   font-size: 11px;
@@ -765,10 +764,11 @@ pre.out.err {
 }
 
 /* ── the condensed card: one at-a-glance row per GPU ──
-   The default state of every card — load, VRAM, the sensor that throttles,
-   and power, each with a slim indicator — so the whole pool reads top to
-   bottom without scrolling. Clicking the header reveals the full card
-   (.gdetail) beneath this row. */
+   The default state of every card — load (with clocks and fan), VRAM, the
+   sensor that throttles (with mem temp), and power, each with a slim
+   indicator — so the whole pool reads top to bottom without scrolling.
+   Clicking the header reveals every sensor's 5-min trace (.gdetail)
+   beneath this row. */
 .gsum {
   display: grid;
   grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr) minmax(0, 0.85fr) minmax(0, 0.85fr);
@@ -817,6 +817,16 @@ pre.out.err {
   margin-left: 4px;
 }
 
+/* the small print under a cell's main reading — clocks and fan under load,
+   mem temp under junction. It fills the cell so the indicator keeps the
+   bottom line without a hole between the number and the bar */
+.gstat .gsub {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 /* every cell's bar/trace sits on the same bottom line, whatever its height
    — `margin-top: auto` inside the flex column above absorbs the cell's spare
    height, so an 8px meter and a 20px chart share the same baseline */
@@ -825,7 +835,7 @@ pre.out.err {
   margin-top: auto;
 }
 
-/* the expanded body — heroes, the 5-min trace and the per-sensor rows keep
+/* the expanded body — the trace header and the per-sensor trace grid keep
    their own spacing; the card's grid gap handles the seam */
 .gdetail {
   display: grid;
@@ -870,50 +880,6 @@ pre.out.err {
   border-color: color-mix(in srgb, var(--red) 55%, var(--line));
 }
 
-.heroes {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
-}
-
-.hero {
-  background: var(--panel-2);
-  border: 1px solid var(--line-soft);
-  border-radius: 10px;
-  padding: 9px 11px 10px;
-  min-width: 0;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 6px;
-  align-content: start;
-}
-
-.hero h5 {
-  margin: 0;
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 1.3px;
-  text-transform: uppercase;
-  color: var(--dim);
-}
-
-.hero .big {
-  font-size: clamp(18px, 1.9vw, 24px);
-}
-
-.hero .foot {
-  font-size: 11px;
-}
-
-/* the 5m section inside a card: header over trace. (Must not be `.trend` —
-   that class is the little trend mark, and a grid in its place splits the
-   arrow off from its number.) */
-.gpu-trend {
-  display: grid;
-  gap: 4px;
-  min-width: 0;
-}
-
 .trendhead {
   display: flex;
   align-items: baseline;
@@ -936,63 +902,60 @@ pre.out.err {
   color: var(--dim);
 }
 
-.legend {
+/* the expanded card: every sensor's trace over the window, each on its own
+   scale. No big current values in here — the condensed row says what is true
+   now, so this section says what has been happening (shape, range, rate). */
+.gtrace {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+  min-width: 0;
+}
+
+.gtr {
+  background: var(--panel-2);
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  padding: 8px 10px 9px;
+  min-width: 0;
   display: flex;
-  gap: 14px;
+  flex-direction: column;
+  gap: 4px;
 }
 
-.legend .li {
-  display: inline-flex;
-  align-items: center;
+.gtr h5 {
+  margin: 0;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
   gap: 6px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1.3px;
+  text-transform: uppercase;
+  color: var(--dim);
 }
 
-.legend i {
-  width: 9px;
-  height: 3px;
-  border-radius: 2px;
-}
-
-.rows {
-  display: grid;
-  /* one mrow needs ≈291 px (label 76 + spark 52 + spark min 50 + value 86 + gaps);
-     a 250 px track let it overflow and print its value on the next label */
-  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-  gap: 2px 22px;
-}
-
-.mrow {
-  display: grid;
-  grid-template-columns: 76px 52px minmax(50px, 1fr) 86px;
-  align-items: center;
-  gap: 9px;
-  padding: 2.5px 0;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.025);
-}
-
-.mrow .k {
-  font-size: 11.5px;
-  color: var(--muted);
-  letter-spacing: 0.2px;
-}
-
-.mrow .s {
-  display: block;
-}
-
-.mrow .v {
-  text-align: right;
-  font-size: 13.5px;
-  font-weight: 600;
+/* the rate sits in the label row — the foot row is the whole range, and at
+   ~150 px per tile the two cannot share one line without one truncating */
+.gtr h5 .gt {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
+  letter-spacing: 0;
+  text-transform: none; /* the label is uppercase, the rate isn't */
 }
 
-.mrow .v em {
-  font-style: normal;
-  font-weight: 500;
-  font-size: 11px;
+.gtr h5 .gt .trend {
+  margin-right: 0;
+}
+
+.gtr .gr {
+  font-size: 10.5px;
   color: var(--muted);
-  margin-left: 3px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 /* ── panels below the GPUs ── */
@@ -1321,17 +1284,8 @@ pre.out.err {
   .gsum {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
-  .heroes {
-    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-  }
   .lower {
     grid-template-columns: 1fr;
-  }
-  .mrow {
-    grid-template-columns: 68px minmax(40px, 1fr) 78px;
-  }
-  .mrow .s {
-    display: none;
   }
   .disk .line {
     flex-wrap: wrap;
