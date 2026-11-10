@@ -157,7 +157,7 @@ services:
   # autostart list (GPU view) is what comes back. Model files:
   # /models/llm/*.rad (ro-mounted at /models). New instance (including a
   # second copy of a model, e.g. llm-27b-1): copy the block + the router pair
-  # (RUNBOOK → LLM fleet; make doctor checks all four name references match),
+  # (RUNBOOK → LLM fleet; make doctor checks all five name references match),
   # make update, then assign cards in the GPU view.
   llm-27b:
     <<: *llm-base

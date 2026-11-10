@@ -40,7 +40,7 @@ re-checks both. Forging either requires already controlling Traefik or the host.
 `sudo -n panel-do`. Container listing/control are registry actions (`list-containers`, `start/stop/restart-container` with anchored
 12-hex-ID regexes) alongside `restart-service` and `prune-docker` — same central arg validation, same journald audit, same timeouts,
 and the UI renders everything from `--list`. An earlier loopback docker socket-proxy is gone: its `POST`/`ALLOW_*` whitelist had no
-arg validation, no confirm gating, no audit. The registry is ~250 lines of Go; panel-api caches `list-containers` ~3s (the UI polls
+arg validation, no confirm gating, no audit. panel-api caches `list-containers` ~3s (the UI polls
 ~2s) and invalidates after any action.
 
 **Traefik runs the file provider only — no docker.sock, not even `:ro`.** A read-only socket mount does not make the Docker API
@@ -73,8 +73,11 @@ everything else on any subdomain requires a logged-in user. Rule order matters (
 (edge/junction/mem temps, power, fan). No `amd-smi` needed; revisit only for per-process VRAM or fan control.
 
 **Secrets.** One `.env` (chmod 600) is the single source of truth: it feeds compose, and deploy derives the reduced env files the
-panel-uid systemd units load — `/opt/panel/.panel-api.env` (0600, only the `PANEL_*` vars the API reads) and
-`/opt/panel/.panel-ddns.env` (0600, only `NAMESILO_API_KEY` + optional `DDNS_HOSTS`) — because a panel-uid process can read its own
-`/proc/<pid>/environ`, so the panel-uid services (long-lived panel-api, and the same-uid panel-ddns oneshot on each tick) must not
-hold the rest of the secret set (Authelia, LLM) in their environment. Deploy-time placeholders (`__PANEL_TOKEN__`, `__ACME_EMAIL__`)
-are substituted into Traefik's dynamic config by `setup/02-deploy-stack.sh`; the repo copy stays clean.
+panel-uid systemd units load — `/opt/panel/.panel-api.env` (0600; `PANEL_TOKEN`, `PANEL_DEV`, `PANEL_DISK_MOUNTS` +
+`LLM_API_KEY` — the one deliberately non-PANEL key) and `/opt/panel/.panel-ddns.env` (0600, only `NAMESILO_API_KEY` + optional
+`DDNS_HOSTS`) — because a panel-uid process can read its own `/proc/<pid>/environ`, so the panel-uid services (long-lived
+panel-api, and the same-uid panel-ddns oneshot on each tick) never load the full set: each gets only its slice (`LLM_API_KEY` is
+in panel-api's by design — the /v1 fallback router's bearer gate; the Authelia secrets are in neither). Deploy-time placeholders
+(`__PANEL_TOKEN__`, `__ACME_EMAIL__`, `__ACME_CA_SERVER__`) are substituted into the deployed Traefik configs (static
+`traefik.yml` + `dynamic/middlewares.yml`) by `stack_sync_configs` in `setup/common.sh` — run by both `setup/02-deploy-stack.sh`
+(first boot) and `setup/08-update.sh` (every `make update`); the repo copy stays clean.
