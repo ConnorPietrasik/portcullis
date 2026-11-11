@@ -96,6 +96,7 @@ services:
       LEGO_DISABLE_CNAME_SUPPORT: "true"
     labels:
       - panel.manage=edge router # shows in the panel's Services view
+      - panel.category=Panel # group header in the Services view (absent → "Other")
     volumes:
       - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
       - ./traefik/dynamic:/etc/traefik/dynamic:ro
@@ -117,6 +118,7 @@ services:
       AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET: ${AUTHELIA_JWT_SECRET}
     labels:
       - panel.manage=true # routed via traefik/dynamic/authelia.yml, not labels
+      - panel.category=Panel
 
   panel-web:
     build: ./panel-frontend
@@ -125,7 +127,7 @@ services:
     healthcheck:
       <<: *healthcheck-opts
       test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/"]
-    labels: ["panel.manage=true"] # routed via traefik/dynamic/panel.yml
+    labels: ["panel.manage=true", "panel.category=Panel"] # routed via traefik/dynamic/panel.yml
     networks: [edge]
 
   # Public portfolio site (bare domain — Authelia bypass rule for pietrasik.top
@@ -139,7 +141,7 @@ services:
       <<: *healthcheck-opts
       test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/"]
     volumes: ["./portfolio:/usr/share/nginx/html:ro"]
-    labels: ["panel.manage=true"] # shows in the panel's Services view
+    labels: ["panel.manage=true", "panel.category=Web"] # shows in the panel's Services view
     networks: [edge]
 
   # ── LLM fleet (Radiance) — start/stop instances from the panel ──────────────
@@ -179,6 +181,8 @@ services:
       --num-speculative-tokens 3 --max-num-batched-tokens 2048
     labels:
       - panel.manage=Qwen 27B IQ5R-S-V4 # Services view name (no card set — it moves)
+      - panel.category=LLM # NOT on x-llm-base: the per-block labels list replaces
+      # the anchor's on merge (shallow <<), so new instances carry it by copying the block
       - llm.cards=2 # the pool's auto-grab size (== --tp)
   llm-27b-1:
     <<: *llm-base
@@ -194,6 +198,7 @@ services:
       --num-speculative-tokens 3 --max-num-batched-tokens 2048
     labels:
       - panel.manage=Qwen 27B IQ5R-S-V4 1
+      - panel.category=LLM
       - llm.cards=2
   llm-27b-2:
     <<: *llm-base
@@ -209,6 +214,7 @@ services:
       --num-speculative-tokens 3 --max-num-batched-tokens 2048
     labels:
       - panel.manage=Qwen 27B IQ5R-S-V4 2
+      - panel.category=LLM
       - llm.cards=2
   llm-flashnext:
     <<: *llm-base
@@ -226,6 +232,7 @@ services:
       --num-speculative-tokens 3 --max-num-batched-tokens 2048
     labels:
       - panel.manage=Qwen Flash-Next # Services view name (no card set — it moves)
+      - panel.category=LLM
       - llm.cards=4 # the pool's auto-grab size (== --tp)
 
 volumes:

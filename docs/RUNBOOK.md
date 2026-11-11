@@ -341,7 +341,13 @@ in `traefik/dynamic/`:
     networks: [edge]
     labels:
       - panel.manage=Jellyfin        # shows up in the panel's Services view (optional)
+      - panel.category=Media         # collapsible group in the Services view (optional; absent → “Other”)
 ```
+
+Services group under collapsible category headers by `panel.category` (same no-commas rule as
+`panel.manage` — `docker ps` encodes labels comma-joined); unpinned groups sort alphabetically and
+uncategorized services land under “Other”. A new group needs no code — just start using the label
+(`panel-frontend/src/views/Services.tsx` only pins the display ORDER of a few known names).
 
 Tag it at the major line (`:10`, not `latest` or a full version): `make update` then floats it with the rest of the stack and never
 crosses a major on its own.
@@ -382,7 +388,8 @@ Machine APIs, not browser apps: no Authelia — the gate is the server's own API
 `x-llm-base`) ↔ `Host(`<name>.pietrasik.top`)` → `http://llm-<name>:8000` in `traefik/dynamic/llm.yml`. One subdomain per instance so
 agents pin the right server; the wildcard CNAME + cert make that zero DNS work. Port is always 8000 (own IP per container). The
 display name is the `panel.manage` label — **no commas** in it (`docker ps` encodes labels comma-joined and the Services view parses
-them that way).
+them that way); `panel.category=LLM` groups the fleet in the Services view, and copying a block
+for a new instance carries both labels with it.
 
 **Cards:** assigned at run time from the panel's **GPUs view** (a pool with auto-grab — see **GPU pool** below).
 The block's `ROCR_VISIBLE_DEVICES` is the FALLBACK default a hand-run compose

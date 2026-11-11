@@ -72,7 +72,8 @@ change, not a refactor. The "why" for each is in `docs/ARCHITECTURE.md`.
 ## Workflows (repo edit → sync → RUNBOOK section for the details)
 
 - **New app**: compose service on `edge`
-  + router/service in `compose/traefik/dynamic/`; optional Authelia rule in
+  + router/service in `compose/traefik/dynamic/`; optional `panel.category` label
+  for the Services view's collapsible group (absent → “Other”); optional Authelia rule in
   `configuration.yml` **above the wildcard** (first match wins; the
   bare-domain bypass must stay **last** so new subdomains are
   private-by-default). → `make update`. RUNBOOK → "Add an app".

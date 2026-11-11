@@ -105,6 +105,8 @@ export interface ContainerInfo {
   name: string
   /** compose service name (container label) — joins /api/stack-services */
   service?: string
+  /** panel.category compose label — the Services view's group (null/"" → Other) */
+  category?: string | null
   image: string
   state: string
   status: string
@@ -116,6 +118,8 @@ export interface StackService {
   image: string
   display: string
   restart: string
+  /** panel.category compose label (panel-do list-services) — same group as the container list */
+  category?: string | null
 }
 
 export interface ActionInfo {

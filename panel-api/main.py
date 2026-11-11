@@ -49,6 +49,7 @@ if DEV_MODE:  # local development: keep the file in the checkout, not /opt
     LLM_SETTINGS_PATH = Path("llm-settings.json")
 
 MANAGE_LABEL = "panel.manage"
+CATEGORY_LABEL = "panel.category"  # Services view group (collapsible); absent → "Other"
 CONTAINER_VERBS = frozenset({"start", "stop", "restart"})
 CID_RE = re.compile(r"^[0-9a-f]{12}$")  # mirrors panel-do's containerIDRe
 ARG_RE = re.compile(r"^[ -~]{1,128}$")  # mirrors panel-do's base arg validation
@@ -689,6 +690,8 @@ def _container_view(x: dict[str, Any]) -> dict[str, Any]:
         # compose service name (container label) — the UI joins this against
         # /api/stack-services to find defined services whose container is gone.
         "service": _cli_label_get(x.get("Labels") or "", "com.docker.compose.service"),
+        # Services view group (panel.category label); None/"" render as "Other".
+        "category": _cli_label_get(x.get("Labels") or "", CATEGORY_LABEL),
         "image": x.get("Image", ""),
         "state": x.get("State", "unknown"),
         "status": x.get("Status", ""),

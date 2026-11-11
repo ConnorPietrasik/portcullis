@@ -500,8 +500,10 @@ func startService(ctx context.Context, args []string, logf func(string, ...any))
 
 // listServices emits the deployed stack's services carrying the panel.manage
 // label — the Services view's contract — as a JSON array of {name, image,
-// display, restart}. Read-only, no args; the frontend diffs this against the
-// container list to offer create+start for services whose container is gone.
+// display, restart, category}. category is the panel.category label (the
+// view's collapsible group; "" = uncategorized, rendered as "Other").
+// Read-only, no args; the frontend diffs this against the container list to
+// offer create+start for services whose container is gone.
 func listServices(ctx context.Context, args []string, logf func(string, ...any)) error {
 	out, err := runCmd(ctx, "/usr/bin/docker", "compose", "--project-directory", "/opt/panel",
 		"-f", "/opt/panel/docker-compose.yml", "config", "--format", "json")
@@ -519,10 +521,11 @@ func listServices(ctx context.Context, args []string, logf func(string, ...any))
 		return fmt.Errorf("compose config: bad JSON: %v", err)
 	}
 	type svc struct {
-		Name    string `json:"name"`
-		Image   string `json:"image"`
-		Display string `json:"display"`
-		Restart string `json:"restart"`
+		Name     string `json:"name"`
+		Image    string `json:"image"`
+		Display  string `json:"display"`
+		Restart  string `json:"restart"`
+		Category string `json:"category"`
 	}
 	svcs := []svc{}
 	for name, s := range cfg.Services {
@@ -533,7 +536,8 @@ func listServices(ctx context.Context, args []string, logf func(string, ...any))
 		if display == "true" {
 			display = name
 		}
-		svcs = append(svcs, svc{name, s.Image, display, s.Restart})
+		category := composeLabel(s.Labels, "panel.category")
+		svcs = append(svcs, svc{name, s.Image, display, s.Restart, category})
 	}
 	sort.Slice(svcs, func(i, j int) bool { return svcs[i].Name < svcs[j].Name })
 	enc, err := json.Marshal(svcs)

@@ -1,6 +1,38 @@
+import { useState } from 'react'
 import { api } from '../api'
 import { usePoll } from '../usePoll'
 import type { ActionResult, ContainerInfo, StackService } from '../types'
+
+// Grouping key: the panel.category compose label (RUNBOOK → "add an app").
+// Order: pinned list first, then unknown categories alphabetically, then
+// uncategorized last. One line to tweak as the group set grows.
+const CATEGORY_ORDER = ['LLM', 'Panel', 'Web']
+const OTHER = 'Other'
+
+// Collapse state is a per-browser VIEW preference (the grouping itself is
+// data, from the compose labels), so localStorage keyed by category name.
+const COLLAPSED_KEY = 'panel.svc.collapsed'
+
+function categoryOf(x: { category?: string | null }): string {
+  return x.category && x.category.trim() ? x.category.trim() : OTHER
+}
+
+function orderedCats(cats: string[]): string[] {
+  const pinned = CATEGORY_ORDER.filter((c) => cats.includes(c))
+  const rest = cats
+    .filter((c) => !CATEGORY_ORDER.includes(c) && c !== OTHER)
+    .sort()
+  return [...pinned, ...rest, ...(cats.includes(OTHER) ? [OTHER] : [])]
+}
+
+function loadCollapsed(): Record<string, boolean> {
+  try {
+    const v = JSON.parse(localStorage.getItem(COLLAPSED_KEY) ?? '{}')
+    return v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, boolean>) : {}
+  } catch {
+    return {} // corrupt or first visit → everything open
+  }
+}
 
 function stateClass(state: string): string {
   if (state === 'running') return 'badge ok'
@@ -17,6 +49,19 @@ export default function Services({ intervalMs }: { intervalMs: number }) {
   // container list. With a panel-do binary that predates list-services this
   // 500s; the section simply stays hidden instead of erroring the whole view.
   const svcs = usePoll(() => api<{ services: StackService[] }>('/stack-services'), 15_000)
+
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>(loadCollapsed)
+  function setCatOpen(cat: string, open: boolean) {
+    const next = { ...collapsed }
+    if (open) delete next[cat]
+    else next[cat] = true
+    setCollapsed(next)
+    try {
+      localStorage.setItem(COLLAPSED_KEY, JSON.stringify(next))
+    } catch {
+      // private mode etc. — collapse state just won't persist
+    }
+  }
 
   async function act(c: ContainerInfo, action: string) {
     if (action !== 'start' && !window.confirm(`${action} ${c.name}?`)) return
@@ -68,6 +113,26 @@ export default function Services({ intervalMs }: { intervalMs: number }) {
   if (error) return <div className="banner err">containers: {error}</div>
   if (!data) return <div className="banner">loading…</div>
 
+  // Both tables group by category (uncategorized → "Other"). The collapse
+  // state is shared, so a closed "LLM" closes in both sections at once.
+  const groups = new Map<string, ContainerInfo[]>()
+  for (const c of data.containers) {
+    const cat = categoryOf(c)
+    const list = groups.get(cat)
+    if (list) list.push(c)
+    else groups.set(cat, [c])
+  }
+  const cats = orderedCats([...groups.keys()])
+
+  const missGroups = new Map<string, StackService[]>()
+  for (const s of missing) {
+    const cat = categoryOf(s)
+    const list = missGroups.get(cat)
+    if (list) list.push(s)
+    else missGroups.set(cat, [s])
+  }
+  const missCats = orderedCats([...missGroups.keys()])
+
   return (
     <>
       {data.containers.length === 0 ? (
@@ -76,75 +141,107 @@ export default function Services({ intervalMs }: { intervalMs: number }) {
           control here (see docs/RUNBOOK.md → “add an app”)
         </div>
       ) : (
-        <table>
-          <thead>
-            <tr>
-              <th>name</th>
-              <th>image</th>
-              <th>state</th>
-              <th>status</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            {data.containers.map((c) => (
-              <tr key={c.id}>
-                <td>{c.name}</td>
-                <td className="muted">{c.image}</td>
-                <td>
-                  <span className={stateClass(c.state)}>{c.state}</span>
-                </td>
-                <td className="muted">{c.status}</td>
-                <td className="btns">
-                  {/* running only — while the instance is down the /open bounce lands on a 502 */}
-                  {c.state === 'running' && c.service?.startsWith('llm-') && (
-                    <a
-                      href={`https://${c.service.slice(4)}.pietrasik.top/open`}
-                      target="_blank"
-                      rel="noreferrer"
-                      title="radiance dashboard — Authelia, then the API key is injected for this origin (panel-api /open)"
-                    >
-                      dashboard ↗
-                    </a>
-                  )}
-                  <button onClick={() => act(c, 'start')}>start</button>
-                  <button className="warn" onClick={() => act(c, 'restart')}>
-                    restart
-                  </button>
-                  <button className="danger" onClick={() => act(c, 'stop')}>
-                    stop
-                  </button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        cats.map((cat) => {
+          const rows = groups.get(cat)!
+          const up = rows.filter((c) => c.state === 'running').length
+          return (
+            <details
+              key={cat}
+              className="svc-cat"
+              open={!collapsed[cat]}
+              onToggle={(e) => setCatOpen(cat, (e.currentTarget as HTMLDetailsElement).open)}
+            >
+              <summary>
+                <span className="svc-cat-name">{cat}</span>
+                <span className="muted">
+                  {up}/{rows.length} up
+                </span>
+              </summary>
+              <table>
+                <thead>
+                  <tr>
+                    <th>name</th>
+                    <th>image</th>
+                    <th>state</th>
+                    <th>status</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((c) => (
+                    <tr key={c.id}>
+                      <td>{c.name}</td>
+                      <td className="muted">{c.image}</td>
+                      <td>
+                        <span className={stateClass(c.state)}>{c.state}</span>
+                      </td>
+                      <td className="muted">{c.status}</td>
+                      <td className="btns">
+                        {/* running only — while the instance is down the /open bounce lands on a 502 */}
+                        {c.state === 'running' && c.service?.startsWith('llm-') && (
+                          <a
+                            href={`https://${c.service.slice(4)}.pietrasik.top/open`}
+                            target="_blank"
+                            rel="noreferrer"
+                            title="radiance dashboard — Authelia, then the API key is injected for this origin (panel-api /open)"
+                          >
+                            dashboard ↗
+                          </a>
+                        )}
+                        <button onClick={() => act(c, 'start')}>start</button>
+                        <button className="warn" onClick={() => act(c, 'restart')}>
+                          restart
+                        </button>
+                        <button className="danger" onClick={() => act(c, 'stop')}>
+                          stop
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </details>
+          )
+        })
       )}
       {missing.length > 0 && (
         <>
           <h2 className="svc-missing">defined, no container</h2>
-          <table>
-            <thead>
-              <tr>
-                <th>service</th>
-                <th>image</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              {missing.map((s) => (
-                <tr key={s.name}>
-                  <td>
-                    {s.display} <span className="muted">{s.name}</span>
-                  </td>
-                  <td className="muted">{s.image}</td>
-                  <td className="btns">
-                    <button onClick={() => bringUp(s)}>create + start</button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          {missCats.map((cat) => (
+            <details
+              key={cat}
+              className="svc-cat"
+              open={!collapsed[cat]}
+              onToggle={(e) => setCatOpen(cat, (e.currentTarget as HTMLDetailsElement).open)}
+            >
+              <summary>
+                <span className="svc-cat-name">{cat}</span>
+                <span className="muted">{missGroups.get(cat)!.length} defined</span>
+              </summary>
+              <table>
+                <thead>
+                  <tr>
+                    <th>service</th>
+                    <th>image</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {missGroups.get(cat)!.map((s) => (
+                    <tr key={s.name}>
+                      <td>
+                        {s.display} <span className="muted">{s.name}</span>
+                      </td>
+                      <td className="muted">{s.image}</td>
+                      <td className="btns">
+                        <button onClick={() => bringUp(s)}>create + start</button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </details>
+          ))}
         </>
       )}
     </>
