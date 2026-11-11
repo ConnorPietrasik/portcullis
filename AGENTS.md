@@ -82,8 +82,9 @@ change, not a refactor. The "why" for each is in `docs/ARCHITECTURE.md`.
   RUNBOOK → "Add a privileged action".
 - **New LLM instance**: copy an `llm-*` compose block (keep `llm.cards` ==
   `--tp`, distinct display label) + its router pair in
-  `traefik/dynamic/llm.yml` + its host in the `fleet-open` `Host()` list —
-  five name references total; `make doctor` flags any that drift. →
+  `traefik/dynamic/llm.yml` + an `|| Host(...)` clause in the `fleet-open` rule —
+  five name references total; `make doctor` flags any that drift (it also flags the
+  v2-style multi-value `Host(a, b)` that Traefik v3 drops silently). →
   `make update`. RUNBOOK → "LLM fleet".
 - **After editing a route**: client machines pin names with
   `tools/panel-hosts.sh` (the server re-pins itself as part of `make update`).

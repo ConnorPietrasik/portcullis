@@ -412,10 +412,12 @@ After that the panel manages it as usual.
 
 **Add an instance** (including a second copy of a model — `llm-27b-1` next to `llm-27b`): copy the block
 (name, model, `llm.cards`, flags) + the router pair — four name references must all match (service key,
-router key, `Host(...)`, service `url`) + its host in the `fleet-open` rule's `Host()` list so the
-dashboard link works; `make doctor` flags any of the five that don't (`fleet-open` routes to
+router key, `Host(...)`, service `url`) + an `|| Host(`<name>.pietrasik.top`)` clause in the
+`fleet-open` rule so the dashboard link works (Traefik v3's `Host()` takes ONE host — the v2
+comma-list form is a parse error it drops silently, doctor flags it); `make doctor` flags any of
+the five that don't (`fleet-open` routes to
 panel-api, not an instance, so it sits outside the instance-pairing checks — in llm.yml the
-`llm-*` prefix marks instance routers and `fleet-*` names shared ones — but its `Host()` list
+`llm-*` prefix marks instance routers and `fleet-*` names shared ones — but its host list
 is verified against the compose services). Give the twins distinct display labels
 (append the instance name) so the Services view tells them apart. Then `git commit`, `make update`
 (deploys + pulls it, leaves it down) and start it — panel GPUs view → *start* (or the Services

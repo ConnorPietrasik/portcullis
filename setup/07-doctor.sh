@@ -162,19 +162,32 @@ fleet_routes() { # <compose.yml> <llm.yml> <label>
   [[ ${#svcs[@]} -eq 0 ]] && warn "$label: no llm-* services in compose (fleet not configured?)"
   # The fleet-open list — the one copy of instance names that is not a
   # router/service pair: the shared key-bootstrap router routes to the
-  # panel-api service (no compose service to pair), but its Host() list
-  # must still name EVERY instance. A missing host leaves that instance's
+  # panel-api service (no compose service to pair), but its host list must
+  # still name EVERY instance. A missing host leaves that instance's
   # dashboard link dead: /open falls through to the instance's bare-Host
-  # router, and radiance 404s it after the Authelia login. A stale host is
-  # harmless clutter (warn only). Empty fleet → nothing to compare.
+  # router (no forward-auth there), and radiance's API-key gate — which
+  # covers every path but GET / /health /dashboard /ping — answers the
+  # browser with 401 {"error":{"message":"invalid api key",…}}: that JSON
+  # IS the page the user sees. A stale host is harmless clutter (warn
+  # only). Empty fleet → nothing to compare.
   if (( ${#svcs[@]} )); then
-    local open_hosts inst_hosts missing stale add h
+    local open_hosts inst_hosts missing stale add h badhost
+    # Syntax canary: Traefik v3's Host() takes ONE value. The v2 multi-value
+    # form is a rule parse error — and traefik SWALLOWS it (logs the error,
+    # drops just that router, keeps serving the rest of the file): the
+    # host-list check below would still PASS on the dead rule, so flag the
+    # syntax itself.
+    badhost="$(grep -nE '^[[:space:]]*rule:.*Host\([^)]*,[^)]*\)' "$routes" | cut -d: -f1 | tr '\n' ' ')"
+    if [[ -n $badhost ]]; then
+      bad "$label: multi-value Host() at line(s) $badhost in $routes — Traefik v3 takes ONE host per Host() and SWALLOWS the parse error (the router is dropped, the rest of the file still loads), so every dashboard link falls through to the instance's bare-Host router and 401s 'invalid api key'"
+      hint "OR the hosts: (Host(\`a.pietrasik.top\`) || Host(\`b.pietrasik.top\`)) && PathPrefix(...)"
+    fi
     open_hosts="$(awk '/^  routers:/{f=1;next} f && /^  [a-z]/{f=0} f && /^    fleet-open:$/{g=1;next} f && g && /^    [a-z]/{g=0;next} f && g{print}' "$routes" \
       | sed 's/#.*$//' \
       | { grep -oE 'Host\([^)]*\)' || true; } | { grep -oE '`[^`]+`' || true; } | tr -d '`' | LC_ALL=C sort -u)"
     inst_hosts="$(for svc in "${svcs[@]}"; do printf '%s\n' "${svc#llm-}.pietrasik.top"; done | LC_ALL=C sort -u)"
     if [[ -z $open_hosts ]]; then
-      bad "$label: no hosts parseable from the fleet-open rule in llm.yml — every dashboard link 404s"
+      bad "$label: no hosts parseable from the fleet-open rule in llm.yml — every dashboard link 401s 'invalid api key'"
       hint "restore the fleet-open router block (key bootstrap → panel-api; see its comment in llm.yml)"
     else
       missing="$(LC_ALL=C comm -13 <(printf '%s\n' "$open_hosts") <(printf '%s\n' "$inst_hosts") || true)"
@@ -183,10 +196,10 @@ fleet_routes() { # <compose.yml> <llm.yml> <label>
         add=""
         while IFS= read -r h; do
           [[ -n $h ]] || continue
-          add+="${add:+, }\`${h}\`"
+          add+="${add:+ || }Host(\`${h}\`)"
         done <<<"$missing"
-        bad "$label: fleet-open rule missing $(tr '\n' ' ' <<<"$missing" | sed 's/ *$//') — its dashboard link(s) 404"
-        hint "add ${add} to the Host() list: llm.yml → fleet-open → rule"
+        bad "$label: fleet-open rule missing $(tr '\n' ' ' <<<"$missing" | sed 's/ *$//') — its dashboard link(s) 401 'invalid api key'"
+        hint "add ${add} to the fleet-open rule (between the parens): llm.yml → fleet-open → rule"
       fi
       [[ -n $stale ]] && warn "$label: fleet-open rule lists $(tr '\n' ' ' <<<"$stale" | sed 's/ *$//') with no compose service (instance deleted?) — trim the list"
       [[ -z $missing && -z $stale ]] && ok "$label: fleet-open Host() list ↔ ${#svcs[@]} instance host(s)"

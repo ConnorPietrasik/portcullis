@@ -60,13 +60,20 @@ http:
     # by design (a browser can't hold the panel token): a direct 172.17.0.1
     # bind hit 401s only while it leaves Remote-* unset — an edge container
     # that CAN spoof them already sits on the fleet's own network (accepted,
-    # see require_forward_auth_admin in panel-api). New instance = add its
-    # host to the Host() list — make doctor verifies that list against the
-    # compose services (make update refuses while it's red). Named fleet-*
-    # (not llm-*) on purpose — the name IS the instance marker (see header),
-    # so this router needs no exemption in doctor's orphan check.
+    # see require_forward_auth_admin in panel-api). New instance = add
+    # `|| Host(`<name>.pietrasik.top`)` to the rule — make doctor verifies
+    # that host list against the compose services (make update refuses while
+    # it's red). Named fleet-* (not llm-*) on purpose — the name IS the
+    # instance marker (see header), so this router needs no exemption in
+    # doctor's orphan check. Traefik v3's rule language takes ONE host per
+    # Host() — the v2 multi-value form is a parse error traefik SWALLOWS
+    # (logs it, drops just this router), and /open then falls through to
+    # the instance's bare-Host router, whose API-key gate answers every
+    # dashboard link with 401 {"error":{"message":"invalid api key",…}}.
+    # Hosts are OR'd with || and kept inside (): a top-level rule is one
+    # (possibly OR-ed) conjunction.
     fleet-open:
-      rule: "Host(`27b.pietrasik.top`, `27b-1.pietrasik.top`, `27b-2.pietrasik.top`, `flashnext.pietrasik.top`) && PathPrefix(`/open`)"
+      rule: "(Host(`27b.pietrasik.top`) || Host(`27b-1.pietrasik.top`) || Host(`27b-2.pietrasik.top`) || Host(`flashnext.pietrasik.top`)) && PathPrefix(`/open`)"
       middlewares: [auth-chain@file, llm-rate@file]
       service: panel-api
 
