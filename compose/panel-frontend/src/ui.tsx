@@ -71,18 +71,24 @@ export interface Series {
   values: Num[]
   tone: Tone
   fill?: boolean
-  dashed?: boolean
 }
 
 /**
- * A series that always spans whatever width it is given: x is drawn in
- * percentages, y in pixels (the height is fixed), and the svg is width:100%
- * with no viewBox. Nothing is measured, so nothing can feed back into the
- * parent's content-based sizing — a measured, pixel-sized <svg> used to be
- * the engine of a runaway: chart measured container, svg rendered that wide,
- * the grid track grew to the svg's intrinsic width, the chart re-measured
- * wider, and the card ended up ~1800 px wide inside a 696 px slot.
- * No scaling means strokes stay 1.6 px and the "now" dot stays a circle.
+ * A series that always spans whatever width it is given: x is drawn in a
+ * fixed 0–100 user-unit space that the viewBox stretches to the svg's
+ * 100% width, y in pixels (the height is fixed), and the svg is width:100%
+ * with preserveAspectRatio="none". Nothing is measured, so nothing can feed
+ * back into the parent's content-based sizing — a measured, pixel-sized
+ * <svg> used to be the engine of a runaway: chart measured container, svg
+ * rendered that wide, the grid track grew to the svg's intrinsic width, the
+ * chart re-measured wider, and the card ended up ~1800 px wide inside a
+ * 696 px slot. (Path data can't use % — only numbers in user units — so the
+ * % idea lives in the viewBox, not in `d`.)
+ * vector-effect="non-scaling-stroke" keeps strokes 1.6 px despite the x
+ * stretch. The "now" dot and the "no data" line are HTML overlays: under
+ * the non-uniform scaling a <circle> would render as an ellipse and
+ * stroke-dasharray would stretch with the width, while both are
+ * fixed-geometry, so neither needs measuring.
  * Nulls are gaps — a missing reading never becomes a dramatic drop to zero.
  */
 export function Chart({
@@ -107,7 +113,11 @@ export function Chart({
   const span = max - min || 1
   // ≥ 2 so x() never divides by zero (single reading → one point at the left edge)
   const n = Math.max(...series.map((s) => s.values.length), 2)
-  const x = (i: number) => (i / (n - 1)) * 100
+  // W is the viewBox's user-unit width; x() values are numbers for `d` (which
+  // rejects %), and the same numbers read as % of the rendered width for the
+  // HTML dot overlay.
+  const W = 100
+  const x = (i: number) => (i / (n - 1)) * W
   const y = (v: number) => padTop + usable - ((Math.max(min, Math.min(max, v)) - min) / span) * usable
 
   const paths = series.map((s) => {
@@ -118,27 +128,27 @@ export function Chart({
         open = false
         return
       }
-      d += `${open ? 'L' : 'M'}${x(i).toFixed(3)}% ${y(v).toFixed(2)}`
+      d += `${open ? 'L' : 'M'}${x(i).toFixed(3)} ${y(v).toFixed(2)}`
       open = true
     })
     const first = s.values.findIndex((v) => v != null)
     const lastIdx = lastIndexOf(s.values)
     const area =
       s.fill && first >= 0 && lastIdx > first
-        ? `${d}L${x(lastIdx).toFixed(3)}% ${h}L${x(first).toFixed(3)}% ${h}Z`
+        ? `${d}L${x(lastIdx).toFixed(3)} ${h}L${x(first).toFixed(3)} ${h}Z`
         : ''
-    let dotAt: [string, string] | null = null
-    if (lastIdx >= 0 && s.values[lastIdx] != null) dotAt = [`${x(lastIdx).toFixed(3)}%`, y(s.values[lastIdx] as number).toFixed(2)]
+    let dotAt: { xPct: number; y: number } | null = null
+    if (lastIdx >= 0 && s.values[lastIdx] != null) dotAt = { xPct: x(lastIdx), y: y(s.values[lastIdx] as number) }
     return { d, area, dotAt, s }
   })
 
   return (
     <div className="chart" style={{ height: h }}>
-      <svg width="100%" height={h} role="img">
+      <svg width="100%" height={h} viewBox={`0 0 ${W} ${h}`} preserveAspectRatio="none" role="img">
         {grid.filter((g) => g > min && g < max).map((g) => (
-          <line key={g} x1="0" x2="100%" y1={y(g)} y2={y(g)} className="grid" />
+          <line key={g} x1={0} x2={W} y1={y(g)} y2={y(g)} className="grid" />
         ))}
-        {paths.map(({ d, area, dotAt, s }, i) => (
+        {paths.map(({ d, area, s }, i) => (
           <g key={i}>
             {area && <path d={area} fill={TONE_COLOR[s.tone]} fillOpacity={0.12} stroke="none" />}
             <path
@@ -148,13 +158,30 @@ export function Chart({
               strokeWidth={1.6}
               strokeLinejoin="round"
               strokeLinecap="round"
-              strokeDasharray={s.dashed ? '3 3' : undefined}
+              vectorEffect="non-scaling-stroke"
             />
-            {dot && dotAt && <circle cx={dotAt[0]} cy={dotAt[1]} r={2.4} fill={TONE_COLOR[s.tone]} />}
           </g>
         ))}
-        {paths.every((p) => !p.d) && <line x1="0" x2="100%" y1={h / 2} y2={h / 2} className="grid" strokeDasharray="2 4" />}
       </svg>
+      {/* "now" markers live outside the svg: the x stretch is non-uniform, so a
+          <circle> would render as an ellipse. y is 1:1 (viewBox height ==
+          element height); --x maps 0–100 user units onto 0–100% of the width,
+          and .chart-now clamps it so the dot can't spill into the tile
+          padding at the chart's edges. */}
+      {paths.map(({ dotAt, s }, i) =>
+        dot && dotAt ? (
+          <span
+            key={i}
+            className="chart-now"
+            style={{ '--x': `${dotAt.xPct}%`, top: dotAt.y, background: TONE_COLOR[s.tone] } as React.CSSProperties}
+          />
+        ) : null,
+      )}
+      {/* "no data" placeholder: HTML for the same reason as the dots — an SVG
+          <line>'s dash lengths sit in user space and stretch with the x-scale
+          (wider tile, coarser dashes). The line is fixed-geometry (full width,
+          mid height), so a fixed-px 2/4 pattern needs no measurement. */}
+      {paths.every((p) => !p.d) && <span className="chart-empty" style={{ top: h / 2 - 0.5 }} />}
     </div>
   )
 }
