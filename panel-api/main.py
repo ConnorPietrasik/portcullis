@@ -926,7 +926,16 @@ LLM_PROBE_TIMEOUT_S = 3.0  # /health budget (connect+read)
 LLM_STALE_AFTER_S = 90.0  # a cached "up" older than this forces an on-demand re-probe
 LLM_COOLDOWN_S = 30.0  # passive: a failed proxied request parks the instance this long
 LLM_MAX_ORDER = 8
-LLM_MAX_BODY = 10 * 1024 * 1024
+# Hard cap on /v1 request bodies (bytes). Buffering is intrinsic to the
+# fallback router: the serving instance is picked per request, and a 5xx
+# from the first choice must fall through to the next — so the whole body
+# sits in panel-api's RAM before any forward. That makes the cap a
+# memory-exhaustion guard on this internet-facing, bearer-gated endpoint:
+# without it, a leaked key or a buggy client could trickle gigabytes in
+# and OOM the host service that also runs the whole admin surface. Sized
+# for coding-agent workloads: base64 images inflate ~33%, and one request
+# can carry several multi-MB crops (screenshot/OCR-style work).
+LLM_MAX_BODY = 64 * 1024 * 1024
 LLM_NAME_RE = re.compile(r"^llm-[a-z0-9][a-z0-9-]{0,62}$")
 
 # Stripped in both directions: RFC 7230 §6.1 hop-by-hop + content-length
