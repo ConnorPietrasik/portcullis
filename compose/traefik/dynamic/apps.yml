@@ -5,8 +5,8 @@
 http:
   routers:
     portfolio:
-      rule: "Host(`pietrasik.top`)"
-      middlewares: [sec-headers@file] # public: no authelia — bypass rule in configuration.yml
+      rule: "Host(`pietrasik.top`) || Host(`www.pietrasik.top`)"
+      middlewares: [sec-headers@file] # public: no authelia — bypass rules in configuration.yml
       service: portfolio
 
   services:

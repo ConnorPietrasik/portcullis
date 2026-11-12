@@ -391,6 +391,7 @@ fi
 section "https endpoints"
 https_check "https://auth.pietrasik.top"   200 "auth portal"
 https_check "https://pietrasik.top"        200 "portfolio (public)"
+https_check "https://www.pietrasik.top"    200 "portfolio via www (public)"
 https_check "https://panel.pietrasik.top"  30x "panel (unauth → Authelia redirect)"
 # LLM fallback router: 200 (some instance up) or 503 (all down) is both
 # HEALTHY — the router is answering. 401 = key mismatch, 404/502 = broken

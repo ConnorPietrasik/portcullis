@@ -45,10 +45,13 @@ access_control:
     # - domain: demo.pietrasik.top # public demo — the app does its own auth
     #   policy: bypass
 
+    - domain: www.pietrasik.top # portfolio: public
+      policy: bypass
+
     - domain: '*.pietrasik.top' # everything else: any authenticated user
       policy: two_factor
 
-    - domain: pietrasik.top # portfolio: public (bare domain only)
+    - domain: pietrasik.top # portfolio: public (bare domain + www above)
       policy: bypass
 
 session:

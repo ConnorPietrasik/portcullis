@@ -138,6 +138,7 @@ Verify (subdomains resolve via the `*` CNAME → apex A; if the apex A was just 
 - `curl -I https://auth.pietrasik.top` → 200 (valid prod wildcard cert; an *untrusted* staging cert means promotion hasn't run yet —
   `make promote`)
 - `curl -I https://pietrasik.top` → 200 (portfolio placeholder — public, no auth)
+- `curl -I https://www.pietrasik.top` → 200 (same portfolio — explicit www host, public)
 - `curl -I https://panel.pietrasik.top` → redirects to Authelia login (no user yet)
 
 First login: open `https://auth.pietrasik.top`, log in, register TOTP when prompted. Then `https://panel.pietrasik.top` should show
