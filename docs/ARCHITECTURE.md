@@ -51,7 +51,9 @@ All routers/services live in reviewed files under `traefik/dynamic/`, versioned 
 
 **Dynamic IP, self-healing DNS.** The public IP isn't static, and a stale A record takes down everything at once — including the
 panel you'd fix it with. `panel-ddns` is a stdlib-python systemd timer (user `panel`, no root, outbound only): every 10 minutes it
-detects the public IPv4 (OpenDNS resolver first, then HTTPS fallbacks) and reconciles — updating stale A records, creating missing
+detects the public IPv4 (2-of-3 agreement: an OpenDNS UDP resolver plus two
+HTTPS services — the unauthenticated UDP answer can be spoofed on-path, so it
+never decides alone) and reconciles — updating stale A records, creating missing
 ones; CNAMEs at a configured host are respected and skipped (the wildcard `*` is a manual CNAME → apex, so it follows for free and
 must never get its own A). Deliberately stateless with no short-circuit: a "nothing changed, skip" check can silently trust a stale
 assumption, for ~6 tiny API calls/hour saved. Reuses the API key Traefik already needs for DNS-01 (nothing new to leak; never

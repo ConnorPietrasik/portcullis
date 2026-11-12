@@ -10,14 +10,15 @@ only). Reuses NAMESILO_API_KEY via the unit's EnvironmentFile
 (/opt/panel/.panel-ddns.env, derived from /opt/panel/.env) — the same key
 Traefik uses for DNS-01; the key is never logged.
 
-Purely declarative, no state: every tick it detects the public IPv4 (OpenDNS
-resolver first, then HTTPS fallbacks), lists the domain's records, updates
-every stale A record and creates missing ones. CNAMEs at a configured host
-are respected and skipped. Whatever drifted is fixed within one tick — a
-"nothing changed, skip" short-circuit was deliberately rejected: it can
-silently trust a stale assumption, for ~6 tiny API calls/hour saved. TTL is
-pinned at 3600 (NameSilo's minimum), so worst-case cutover ≈ timer interval
-+ 1h of resolver caching.
+Purely declarative, no state: every tick it detects the public IPv4 (2-of-3
+agreement across an OpenDNS UDP resolver and two HTTPS services — the
+unauthenticated UDP answer is spoofable on-path, so it never decides alone),
+lists the domain's records, updates every stale A record and creates missing
+ones; CNAMEs at a configured host are respected and skipped. Whatever drifted
+is fixed within one tick — a "nothing changed, skip" short-circuit was
+deliberately rejected: it can silently trust a stale assumption, for ~6 tiny
+API calls/hour saved. TTL is pinned at 3600 (NameSilo's minimum), so
+worst-case cutover ≈ timer interval + 1h of resolver caching.
 
 The domain is fixed at pietrasik.top and hardcoded: every other
 domain-aware piece of this project is pinned to it, so an env override here
@@ -56,27 +57,61 @@ def die(msg: str) -> None:
     sys.exit(1)
 
 
-def public_ip() -> str:
-    """Current public IPv4. OpenDNS resolver first (no web service involved)."""
+def _ip_opendns() -> str | None:
+    """OpenDNS myip via plain UDP. The only unauthenticated source, so its
+    answer is one witness among three, never the decision (see public_ip())."""
     try:
         out = subprocess.run(
             ["dig", "-4", "+short", "myip.opendns.com", "@resolver1.opendns.com"],
             capture_output=True, text=True, timeout=15,
         ).stdout.split()
-        for candidate in out:
-            if IPV4_RE.match(candidate):
-                return candidate
     except (OSError, subprocess.TimeoutExpired):
-        pass  # dig missing or resolver unreachable — fall through to HTTPS
-    for url in ("https://api.ipify.org", "https://ipv4.icanhazip.com"):
-        try:
-            with urllib.request.urlopen(url, timeout=15) as r:
-                ip = r.read().decode().strip()
-            if IPV4_RE.match(ip):
-                return ip
-        except OSError:
-            continue
-    die("could not determine public IPv4 (dig and all HTTPS fallbacks failed)")
+        return None  # dig missing or resolver unreachable
+    for candidate in out:
+        if IPV4_RE.match(candidate):
+            return candidate
+    return None
+
+
+def _ip_https(url: str) -> str | None:
+    try:
+        with urllib.request.urlopen(url, timeout=15) as r:
+            ip = r.read().decode().strip()
+    except (OSError, http.client.HTTPException, UnicodeDecodeError):
+        # URLError/socket/SSL, wire-level garbage (BadStatusLine, …), or a
+        # non-UTF-8 body — all "no vote", never a crash.
+        return None
+    return ip if IPV4_RE.match(ip) else None
+
+
+def public_ip() -> str:
+    """Current public IPv4, used only on 2-of-3 responder agreement.
+
+    The UDP dig is unauthenticated: an on-path attacker can forge its reply
+    (well-known resolver, well-known response shape, 16-bit TXID). The two
+    HTTPS services are transport-authenticated — forging their answers means
+    breaking TLS, out of the threat model. The guarantee is per single fault:
+    an attacker can drop the HTTPS answers (availability only: no write this
+    tick) or compromise one service, but cannot force a write alone, because
+    the honest pair still disagrees with the forged value; combining an
+    on-path spoof with one compromised service would (out of model). Fewer
+    than two responders, or no agreeing pair, → die and skip: the next tick
+    re-detects, and the safe direction is simply not to write.
+    """
+    sources = (
+        ("opendns/udp", _ip_opendns()),
+        ("ipify/https", _ip_https("https://api.ipify.org")),
+        ("icanhazip/https", _ip_https("https://ipv4.icanhazip.com")),
+    )
+    votes: dict[str, list[str]] = {}
+    for name, ip in sources:
+        if ip is not None:
+            votes.setdefault(ip, []).append(name)
+    for ip, names in votes.items():
+        if len(names) >= 2:
+            return ip
+    observed = ", ".join(f"{name}={ip or 'no answer'}" for name, ip in sources)
+    die(f"no 2-of-3 agreement on public IPv4 ({observed}) — not writing this tick")
 
 
 def api(key: str, op: str, **params: object) -> ET.Element:
