@@ -1,5 +1,5 @@
-# Traefik static config. __ACME_EMAIL__ and __ACME_CA_SERVER__ are substituted
-# by setup/02-deploy-stack.sh.
+# Traefik static config. The ACME email + caServer placeholder lines are
+# substituted by stack_sync_configs (setup/common.sh — make deploy/update).
 
 log:
   level: INFO

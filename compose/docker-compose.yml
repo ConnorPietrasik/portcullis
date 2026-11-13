@@ -279,11 +279,15 @@ services:
       # NO SEARXNG_SECRET line — and this absence is a security control,
       # not an omission: SearXNG applies env > settings.yml (SCHEMA in
       # searx/settings_defaults.py). The secret rides the sed machinery:
-      # .env → stack_sync_configs fills __SEARXNG_SECRET__ in the deployed
-      # searxng/settings.yml (chown 977:977 + chmod 600 — the app reads it
-      # as 977). An env line here would OVERRIDE the file — and put the
-      # secret in the container environ (docker inspect), the exposure the
-      # reduced-env files exist to avoid.
+      # .env → stack_sync_configs substitutes the secret_key placeholder
+      # in the deployed searxng/settings.yml (chown 977:977 + chmod 600 —
+      # the app reads it as 977). An env line here would OVERRIDE the file
+      # — and put the secret in the container environ (docker inspect),
+      # the exposure the reduced-env files exist to avoid.
+      # (This prose deliberately never writes the placeholder token: this
+      # file is inside the sync's placeholder-survival grep, which dies on
+      # ANY token it finds, and the sed never rewrites this file — a named
+      # token in a comment would red-light every update.)
       # The listener port is env-owned (entrypoint aliases
       # SEARXNG_PORT→GRANIAN_PORT); pin it or an upstream default change
       # moves the listener out from under the route, the healthcheck and

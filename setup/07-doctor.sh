@@ -551,6 +551,29 @@ else
     bad "placeholder sets differ — owned by the sync's seds: [$(tr '\n' ' ' <<<"$owned" | sed 's/ $//')] vs in the trees: [$(tr '\n' ' ' <<<"$found" | sed 's/ $//')]"
     hint "a token with no sed line is a public string running live; a sed line with no token is a dead fill"
   fi
+  # Placement: set equality is blind to WHERE a token lives — a token in a
+  # file the sync's sed never rewrites (the 2026-11-13 bug: a comment in
+  # docker-compose.yml named the searxng one) survives the sync verbatim,
+  # and the deployed survival grep then red-lights every update. Every
+  # token-carrying file must be a sed target of stack_sync_configs.
+  token_files="$(grep -rlE '__[A-Z_]+__' "$REPO_ROOT/compose/traefik/" "$REPO_ROOT/compose/searxng/" "$REPO_ROOT/compose/docker-compose.yml" 2>/dev/null || true)"
+  misplaced=""
+  while IFS= read -r tf; do
+    [[ -n "$tf" ]] || continue
+    case "$tf" in
+      "$REPO_ROOT/compose/traefik/traefik.yml"|\
+      "$REPO_ROOT/compose/traefik/dynamic/middlewares.yml"|\
+      "$REPO_ROOT/compose/searxng/settings.yml") : ;;   # the sync's sed targets
+      *) misplaced+="$tf"$'\n' ;;
+    esac
+  done <<<"$token_files"
+  if [[ -n "$misplaced" ]]; then
+    bad "placeholder token(s) in file(s) the sync's sed does not rewrite:
+$(sed "s|^${REPO_ROOT}/|  |" <<<"$misplaced")"
+    hint "tokens belong only in the sed targets (traefik.yml, dynamic/middlewares.yml, searxng/settings.yml) — name them descriptively in prose"
+  else
+    ok "every __X__ token lives in a sed-targeted file (the sync rewrites each one)"
+  fi
 fi
 
 if (( ! deployed_has_searxng )); then

@@ -1,5 +1,6 @@
-# Shared middlewares. __PANEL_TOKEN__ is substituted by setup/02-deploy-stack.sh
-# (this file therefore contains a secret — it is chmod 600 on the server).
+# Shared middlewares. The X-Panel-Token header value is a placeholder —
+# stack_sync_configs (setup/common.sh) substitutes it in the deployed file
+# (which therefore contains a secret — it is chmod 600 on the server).
 
 http:
   middlewares:
