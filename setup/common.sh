@@ -116,7 +116,8 @@ stack_sync_configs() { # <target-dir>
   fi
   STACK_CONFIG_SNAP="$(mktemp -d)"
   trap 'rm -rf "$STACK_CONFIG_SNAP"' EXIT
-  for f in authelia/configuration.yml authelia/users_database.yml traefik/traefik.yml; do
+  for f in authelia/configuration.yml authelia/users_database.yml traefik/traefik.yml \
+           searxng/settings.yml; do
     if [[ -f "$target/$f" ]]; then
       sudo cp -p "$target/$f" "$STACK_CONFIG_SNAP/${f//\//_}"
     fi
@@ -137,8 +138,26 @@ stack_sync_configs() { # <target-dir>
       sudo rm -f "$target/traefik/$f"
     fi
   done <<<"$target_list"
+
+  # searxng/ — the deployed dir is a config ROOT, not a single file: SearXNG
+  # reads settings.yml from it AND, if present, optional favicons.toml
+  # (loaded at import by favicons.init()) and limiter.toml (lazy-loaded via
+  # limiter.get_cfg() on every /config request) — a stale or renamed file
+  # among those is LIVE config, not dead weight. Safe to prune: runtime data
+  # lives in the named volume (/var/cache/searxng) and the bind is :ro.
+  # Tolerates a missing dir (first landing: the tar below creates it).
+  target_list="$(cd "$target/searxng" 2>/dev/null && find . -type f | sed 's|^\./||' | sort || true)"
+  repo_list="$(cd "$REPO_ROOT/compose/searxng" && find . -type f | sed 's|^\./||' | sort)"
+  [[ -n "$repo_list" ]] || die "repo searxng tree unexpectedly empty — aborting before touching $target"
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    if ! grep -Fxq -- "$f" <<<"$repo_list"; then
+      info "Removing stale managed config: searxng/$f"
+      sudo rm -f "$target/searxng/$f"
+    fi
+  done <<<"$target_list"
   info "Writing secrets into deployed configs (repo copies keep placeholders)"
-  local v_acme_email v_acme_ca v_panel_token
+  local v_acme_email v_acme_ca v_panel_token v_searxng_secret
   v_acme_email="$(sed_escape_replacement "$ACME_EMAIL")"
   v_acme_ca="$(sed_escape_replacement "${ACME_CA_SERVER:-https://acme-v02.api.letsencrypt.org/directory}")"
   v_panel_token="$(sed_escape_replacement "$PANEL_TOKEN")"
@@ -148,7 +167,19 @@ stack_sync_configs() { # <target-dir>
     -e "s|__PANEL_TOKEN__|${v_panel_token}|g" \
     "$target/traefik/traefik.yml" \
     "$target/traefik/dynamic/middlewares.yml"
-  if sudo grep -RqE '__ACME_EMAIL__|__ACME_CA_SERVER__|__PANEL_TOKEN__' "$target/traefik" "$target/docker-compose.yml" 2>/dev/null; then
+  # The SearXNG instance secret. The container env carries no SEARXNG_SECRET
+  # (that absence is what makes the deployed file's value win — env > file),
+  # so the secret rides this sed exactly like the others. The value must be
+  # usable BEFORE the substitution: an empty or placeholder value would be
+  # written into the deployed file and the instance would sign cookies with
+  # a public string.
+  [[ -n "$SEARXNG_SECRET" && "$SEARXNG_SECRET" != __*__ ]] \
+    || die "SEARXNG_SECRET missing or still a placeholder in .env — make secrets (fresh install) or add SEARXNG_SECRET=$(openssl rand -hex 32) to the repo .env (an existing .env predates this feature)"
+  if [[ -f "$target/searxng/settings.yml" ]]; then
+    v_searxng_secret="$(sed_escape_replacement "$SEARXNG_SECRET")"
+    sudo sed -i -e "s|__SEARXNG_SECRET__|${v_searxng_secret}|g" "$target/searxng/settings.yml"
+  fi
+  if sudo grep -RqE '__ACME_EMAIL__|__ACME_CA_SERVER__|__PANEL_TOKEN__|__SEARXNG_SECRET__' "$target/traefik" "$target/searxng" "$target/docker-compose.yml" 2>/dev/null; then
     die "secret substitution failed — placeholders remain under $target"
   fi
   sudo install -m 600 "$REPO_ROOT/.env" "$target/.env"
@@ -156,6 +187,14 @@ stack_sync_configs() { # <target-dir>
   sync_panel_api_env "$target"
   sync_ddns_env "$target"
   sudo chmod 600 "$target/traefik/dynamic/middlewares.yml"   # contains PANEL_TOKEN
+  # The deployed settings.yml carries the instance secret — tar restores the
+  # repo's root:root 0644 on every sync, so BOTH lines run every sync: the
+  # chown because the app reads it as uid 977 at import (root:root 0600
+  # would be EACCES → crashloop), the chmod for confidentiality.
+  if [[ -f "$target/searxng/settings.yml" ]]; then
+    sudo chown 977:977 "$target/searxng/settings.yml"
+    sudo chmod 600 "$target/searxng/settings.yml"
+  fi
   if [[ ! -f "$target/authelia/users_database.yml" ]]; then
     die "authelia/users_database.yml missing (fresh clone? it's gitignored — hashes stay off GitHub).
 
@@ -184,7 +223,7 @@ Generate a hash for each user:
 
 stack_restart_if_configs_changed() { # <target-dir> — call AFTER `up -d`
   local target="$1"
-  local f authelia_changed=0 traefik_changed=0 services=()
+  local f authelia_changed=0 traefik_changed=0 searxng_changed=0 services=()
   for f in authelia/configuration.yml authelia/users_database.yml; do
     if [[ -f "$STACK_CONFIG_SNAP/${f//\//_}" ]] && ! sudo cmp -s "$STACK_CONFIG_SNAP/${f//\//_}" "$target/$f"; then
       authelia_changed=1
@@ -194,9 +233,17 @@ stack_restart_if_configs_changed() { # <target-dir> — call AFTER `up -d`
      && ! sudo cmp -s "$STACK_CONFIG_SNAP/traefik_traefik.yml" "$target/traefik/traefik.yml"; then
     traefik_changed=1
   fi
-  if (( authelia_changed || traefik_changed )); then
+  # searxng/settings.yml is start-time-only — a secret rotation or any other
+  # content change restarts (does not recreate) the container. No snapshot on
+  # first landing: the container was created fresh by the `up -d` above.
+  if [[ -f "$STACK_CONFIG_SNAP/searxng_settings.yml" ]] \
+     && ! sudo cmp -s "$STACK_CONFIG_SNAP/searxng_settings.yml" "$target/searxng/settings.yml"; then
+    searxng_changed=1
+  fi
+  if (( authelia_changed || traefik_changed || searxng_changed )); then
     if (( authelia_changed )); then services+=(authelia); fi
     if (( traefik_changed )); then services+=(traefik); fi
+    if (( searxng_changed )); then services+=(searxng); fi
     info "Config content changed — restarting ${services[*]} (read only at container start, no hot reload)"
     sudo docker compose --project-directory "$target" -f "$target/docker-compose.yml" restart "${services[@]}"
   fi
@@ -639,7 +686,7 @@ snapshot_host_stack() { # <snapshot-dir>
   # Explicit members only, so runtime data is never in it: authelia/db.sqlite3
   # (TOTP seeds) and panel-frontend's node_modules/dist.
   local members=()
-  for m in docker-compose.yml traefik portfolio authelia/configuration.yml \
+  for m in docker-compose.yml traefik portfolio searxng authelia/configuration.yml \
            authelia/users_database.yml panel-frontend .env .panel-api.env \
            .panel-ddns.env; do
     # if, not `[[ ]] &&`: when the test fails the &&-list is the loop body's

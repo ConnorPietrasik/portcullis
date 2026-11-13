@@ -1,0 +1,106 @@
+# Search — SearXNG. Two hosts, one router each:
+#   search.pietrasik.top = agent API — whole-host key-gated (LLM_API_KEY,
+#     reused — owner decision), NO path scoping (mcp-searxng probes
+#     /config + /autocompleter on the same host). Whole-host is safe
+#     because the host has no state-changing surface (instance state
+#     lives in settings.yml) and no arbitrary-fetch surface (/image
+#     needs an HMAC under the sed-filled instance secret; /metrics needs
+#     its own password) — and the two settings guards (enable_metrics on,
+#     open_metrics empty) carry the decision. (limiter: false is a
+#     deliberate default, not a guard — it needs Valkey and 429s clients
+#     it can't see, which is the entire agent population; see the
+#     settings.yml comment. The key-gate is the control.)
+#   searx.pietrasik.top  = browser UI — Authelia auth chain, riding the
+#     existing *.pietrasik.top two_factor wildcard. ZERO Authelia ACL
+#     edits; the bare-domain bypass stays last. Droppable: removing this
+#     router + the base_url line in settings.yml leaves the agent path
+#     byte-identical.
+#
+# The gate is panel-api's /gate/search (forwardAuth) — a KEY CHECKER, not
+# a proxy: it answers 200/401/503 ONLY, and forwardAuth forwards the
+# request to searxng only when the answer is in [200, 300); every other
+# status — 3xx included — is copied to the client verbatim, so a 3xx
+# would hand the client a redirect to follow. A proxy-through-panel-api
+# design would put every search byte through a second process for zero
+# security gain (the gate IS the auth) and adds a streaming/timeout
+# failure surface between the agent and the engine results — the direct
+# path is faster and has one fewer thing to fail. The address is the
+# docker0 bridge IP, literally: panel-api is a host unit bound to
+# 172.17.0.1 — there is no panel-api DNS name on edge, and
+# host.docker.internal resolves to the EDGE gateway where nothing listens
+# (panel.yml documents the same reasoning). authRequestHeaders UNSET =
+# the full client header set is forwarded (that's what carries
+# Authorization); authResponseHeaders UNSET = the gate injects nothing
+# and must never learn to echo Remote-* — it is a key checker, not an
+# identity provider.
+# Both forwardAuth keys here are version-gated (the repo floats
+# traefik:v3): maxResponseBodySize needs >= v3.6.9; trustForwardHeader is
+# valid through v3 but DEPRECATED as of v3.6.14 and removed in the next
+# MAJOR (v4) — on v4 the key is unknown and the line must go (the v4
+# posture is entrypoint-level forwardedHeaders.trustedIPs, unset = no
+# client XFF trusted = what we want). On current v3 (>= v3.6.14) explicit
+# false is the STRONG behavior, not a compromise (#12994): it strips ALL
+# X-Forwarded-* headers from the gate subrequest (unset = legacy
+# strip-some/forward-rest + startup warning). (Neither affects rate-limit
+# source — that's the socket address, see search-rate.) The failure mode
+# of an unknown key is a parser "field not found" DECODE ERROR — the file
+# provider then sends NO new dynamic config AT ALL (it does not drop just
+# this file): on a hot reload (update lands the file on a running traefik)
+# the watcher callback error is logged ("Error occurred during watcher
+# callback") and the LAST GOOD config stays in effect — the feature simply
+# doesn't land, everything else keeps routing; on a FIRST LOAD / traefik
+# RESTART with the bad file on disk the file provider contributes ZERO
+# routes, and since EVERY route in this repo (panel, llm fleet, portfolio,
+# authelia) lives in the file provider, every host 404s with traefik
+# itself healthy — a full edge outage until the file is fixed or removed.
+# (The doctor's multi-value Host() note — "router is dropped, the rest of
+# the file still loads" — is a DIFFERENT mechanism: server-side rule
+# parsing, not this one.) Hence the assert GATES THE WHOLE FILE: ship
+# search.yml only behind a printed `docker exec traefik traefik version`
+# check that verifies BOTH constraints (>= v3.6.9 AND major v3) in the
+# landing stage; if it fails, do not ship the file at all — defer the
+# feature (or the offending key) as its own change.
+#
+# Naming: no llm-*/fleet-* prefix — not a fleet instance (invariant 6,
+# doctor's orphan check). Placeholder-free by invariant: no secret may
+# ever live in a dynamic file; the key lives only in .panel-api.env.
+http:
+  routers:
+    search:
+      rule: "Host(`search.pietrasik.top`)"
+      # rate BEFORE gate: key-guessing/scan traffic consumes budget too.
+      middlewares: [sec-headers@file, search-rate@file, search-gate@file]
+      service: searxng
+
+    searx:
+      rule: "Host(`searx.pietrasik.top`)"
+      middlewares: [sec-headers@file, search-rate@file, authelia@file]
+      service: searxng
+
+  services:
+    searxng:
+      loadBalancer:
+        servers:
+          - url: "http://searxng:8080"
+
+  middlewares:
+    search-gate:
+      forwardAuth:
+        address: "http://172.17.0.1:8010/gate/search"
+        trustForwardHeader: false   # v3-only key — deprecated v3.6.14+, gone in v4 (header above)
+        maxResponseBodySize: 4096   # v3.6.9+ only — lands WITH the file; the landing version check gates both keys
+
+    search-rate:
+      rateLimit:
+        # Budget sized to the 4-thread ceiling, not to llm-rate's
+        # inference scale. Search and the UI share the pool; the rate
+        # limit blunts abuse, GRANIAN_BLOCKING_THREADS is the capacity.
+        average: 2
+        period: 1s
+        burst: 10
+      # Source is the socket address (default ipStrategy). XFF is
+      # untrusted BY CONSTRUCTION here — Traefik publishes 80/443 directly
+      # and terminates TLS itself, so the peer IS the client. Do not add
+      # forwardedHeaders/trustedIPs anywhere: it would hand the shared-key
+      # holder their own rate-limit identity and a spoofable access-log
+      # client field.

@@ -15,6 +15,7 @@ checks for local development ONLY (loopback) — not the /v1/* LLM key gate
 from __future__ import annotations
 
 import asyncio
+import base64
 import glob
 import json
 import os
@@ -29,7 +30,7 @@ from typing import Any, Callable, Optional
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 import llm_gpus
@@ -1195,6 +1196,77 @@ def llm_dashboard_open(_admin: Optional[str] = Depends(require_forward_auth_admi
         "field in the header.</noscript>"
     )
     return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+
+
+# ─────────────────────────── search gate (forwardAuth) ──────────────────────
+# /gate/search — Traefik forwardAuth target for search.pietrasik.top.
+# Answers EXACTLY 200 / 401 / 503, never 3xx: forwardAuth forwards the
+# request to searxng only when the answer is in [200, 300) and copies every
+# other status — 3xx included — + body to the client verbatim (a 3xx would
+# arrive as a redirect the client follows). 503 means "LLM_API_KEY not
+# configured" (fleet never set up) — with the key present the gate answers
+# 200/401 only, so a direct probe failing on 503 is attributable (RUNBOOK →
+# Web search → status table).
+#
+# Key reuse is an owner decision: the gate authenticates with the SAME
+# LLM_API_KEY as the /v1 router (trade-offs recorded in
+# docs/ARCHITECTURE.md: no search-only rotation — rotating the key re-
+# creates the llm-* containers; a leaked key grants search too). Bearer AND
+# Basic (username ignored, constant-time on the key bytes) — Basic exists
+# for mcp-searxng, which is Basic-only. open_metrics must never be set to
+# this key (see compose/searxng/settings.yml) — the doctor's /metrics→404
+# probe makes that structural.
+#
+# Placement: ROOT, never /api. This handler deliberately carries NO
+# require_admin (it is a key checker) — under /api it would ride the
+# panel-api router, whose panel-secret middleware auto-injects the token for
+# whatever Authelia session arrives (admins only — and the key's own holder
+# — but a machine-facing key endpoint should have no browser-routable path
+# at all, and one future panel.yml edit changes that). At ROOT no router on
+# the panel host forwards to it: the panel-web router matches the host but
+# serves the SPA, and only PathPrefix(/api) hits panel-api — the gate is
+# internet-unreachable except via search.'s forwardAuth. /open is the
+# root-level include_in_schema=False precedent. The doctor pins the negative
+# reachability (panel-host /gate/search must answer Authelia/panel-web, never
+# gate JSON).
+#
+# Reads ONLY Authorization; never consults Remote-*; NOT bypassed by
+# PANEL_DEV=1 (the /v1 precedent). The forwardAuth subrequest is GET by
+# default (preserveRequestMethod is unset repo-wide); the all-methods
+# declaration is hardening for the direct probe, not a router requirement.
+
+
+def _search_key_ok(authorization: str | None) -> bool:
+    """True iff authorization carries LLM_API_KEY (Bearer or Basic password)."""
+    scheme, _, token = (authorization or "").partition(" ")
+    if not LLM_API_KEY:
+        return False
+    t = token.strip()
+    if scheme.lower() == "bearer":
+        # .encode() like require_admin: compare_digest(str, str) raises
+        # TypeError on non-ASCII — a 500 where a 401 belongs.
+        return secrets.compare_digest(t.encode(), LLM_API_KEY.encode())
+    if scheme.lower() == "basic":
+        try:
+            user_pass = base64.b64decode(t).decode()
+        except Exception:
+            return False
+        password = user_pass.partition(":")[2]
+        return secrets.compare_digest(password.encode(), LLM_API_KEY.encode())
+    return False
+
+
+@app.api_route(
+    "/gate/search",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"],
+    include_in_schema=False,
+)
+def search_gate(request: Request):
+    if not LLM_API_KEY:
+        return JSONResponse({"error": "LLM_API_KEY not configured"}, status_code=503)
+    if _search_key_ok(request.headers.get("authorization")):
+        return Response(status_code=200)
+    return JSONResponse({"error": "invalid api key"}, status_code=401)
 
 
 @app.get("/")

@@ -77,6 +77,9 @@ change, not a refactor. The "why" for each is in `docs/ARCHITECTURE.md`.
   `configuration.yml` **above the wildcard** (first match wins; the
   bare-domain bypass must stay **last** so new subdomains are
   private-by-default). → `make update`. RUNBOOK → "Add an app".
+  Machine-facing (key-gated, no Authelia) apps follow the SearXNG pattern — a
+  `forwardAuth` key checker on panel-api, never a data-path proxy — RUNBOOK →
+  "Web search (SearXNG)".
 - **New privileged action**: one Go function + one registry entry in the
   `ACTIONS` section of `panel-do/main.go` → `make panel-do`.
   RUNBOOK → "Add a privileged action".

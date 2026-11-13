@@ -13,6 +13,8 @@ Traefik ─┬─ pietrasik.top            → portfolio container (public)
          ├─ llm.pietrasik.top/v1     → LLM fallback router (panel-api: first instance UP in the
          │                             panel-configured order — Settings view; /v1 only)
          ├─ <name>.pietrasik.top     → llm-<name> container (OpenAI-style, bearer LLM_API_KEY)
+         ├─ search.pietrasik.top     → SearXNG agent API (panel-api gate, bearer LLM_API_KEY)
+         ├─ searx.pietrasik.top      → SearXNG UI (Authelia)
          ├─ auth.pietrasik.top       → Authelia portal
          └─ *.pietrasik.top          → future apps (per-group rules, private by default)
 

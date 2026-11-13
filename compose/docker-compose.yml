@@ -5,6 +5,8 @@
 #   pietrasik.top            → portfolio container (public, uncomment below)
 #   panel.pietrasik.top/     → panel-web (Authelia: admins)
 #   panel.pietrasik.top/api  → host API :8010 (Authelia + X-Panel-Token, via docker0 gateway 172.17.0.1)
+#   search.pietrasik.top     → searxng (agent API — panel-api forwardAuth gate, bearer LLM_API_KEY)
+#   searx.pietrasik.top      → searxng (browser UI — Authelia)
 #   auth.pietrasik.top       → authelia portal
 #
 # Traefik runs the FILE provider only (traefik/dynamic/*.yml) — no docker
@@ -235,8 +237,105 @@ services:
       - panel.category=LLM
       - llm.cards=4 # the pool's auto-grab size (== --tp)
 
+  # ── SearXNG — web search for agents + private browser UI ──────────────────
+  # Image floats on latest — declared OUTSIDE the declared-line policy (the
+  # radiance precedent): the project ships rolling date tags, no releases.
+  # Bad build: make rollback WHAT=searxng (IMAGE ONLY — a settings rollback
+  # needs the FULL make rollback). Hold a known build: pin the tag.
+  # Image-bump duty (RUNBOOK → Web search): diff our settings.yml against the
+  # file the new image ships — under use_default_settings, an upstream default
+  # flip is a silent behavior change (formats is the live example) — AND diff
+  # searx/settings_defaults.py's SCHEMA: the environ_name list (a new
+  # env-override name is a new channel over our settings.yml) AND the default
+  # values (a flip for a key our settings.yml doesn't set is invisible in the
+  # shipped-file diff; the doctor's probes cover the security-critical ones),
+  # confirm the app uid is still 977 (the compose user pin, the sync's chown
+  # target and the doctor's owner check all name it), and re-run the
+  # effective-secret probe (RUNBOOK → Web search → image-bump duty; make
+  # doctor carries it).
+  searxng:
+    image: searxng/searxng:latest
+    # restart: unless-stopped — and do NOT merge x-llm-base (it carries
+    # restart: "no", which the update's on-demand test treats as "leave
+    # down"). searxng is always-on, not on-demand.
+    restart: unless-stopped
+    logging: *default-logging
+    # The image's own uid (the image sets no USER — a bare `docker run` is
+    # root; this line is what drops the app to 977). As 977 the entrypoint
+    # can't chown, so it prints ONE benign 'is not owned by
+    # "searxng:searxng"' line per start and continues — for the config DIR, which the sync's
+    # tar leaves non-977 (the data volume seeds 977:977 from the image and
+    # stays quiet; the log-line count is in the RUNBOOK verification). Nothing
+    # in the normal path writes the config dir (we ship settings.yml, so the
+    # template copy never runs) — but the app READS it: the sync chowns the
+    # deployed settings.yml to 977:977 (root:root 0600 would be EACCES at
+    # import → crashloop). RUNBOOK pre-empts the three wrong fixes: dropping
+    # user: (root + FORCE_OWNERSHIP=true → chown -R of the synced tree every
+    # start), hand-chown under /opt/panel (undone by the next tar sync — the
+    # sync's OWN chown line is the sanctioned one), making the mount writable
+    # to silence it.
+    user: "977:977"
+    environment:
+      # NO SEARXNG_SECRET line — and this absence is a security control,
+      # not an omission: SearXNG applies env > settings.yml (SCHEMA in
+      # searx/settings_defaults.py). The secret rides the sed machinery:
+      # .env → stack_sync_configs fills __SEARXNG_SECRET__ in the deployed
+      # searxng/settings.yml (chown 977:977 + chmod 600 — the app reads it
+      # as 977). An env line here would OVERRIDE the file — and put the
+      # secret in the container environ (docker inspect), the exposure the
+      # reduced-env files exist to avoid.
+      # The listener port is env-owned (entrypoint aliases
+      # SEARXNG_PORT→GRANIAN_PORT); pin it or an upstream default change
+      # moves the listener out from under the route, the healthcheck and
+      # the gate.
+      SEARXNG_PORT: "8080"
+      # Makes the "drop user:" wrong-fix harmless instead of chown -R'ing
+      # the repo-synced tree.
+      FORCE_OWNERSHIP: "false"
+      # The image's real capacity ceiling is ~4 concurrent requests, not
+      # the rate limit. The image's ENV default is ALREADY 4 — this pin is
+      # a no-op today; its job is to keep a future upstream default change
+      # from moving the ceiling (that change shows up in the image-bump
+      # Dockerfile diff, not as silent queueing). (Doctor enforces this
+      # block as a NAMED allow-list — additions are a deliberate diff,
+      # illegal members fail, and a guard key fails loudly. GRANIAN_HOST
+      # is NOT a member: the 2026-11-13 spike forced no host pin — both
+      # loopback families answered.)
+      GRANIAN_BLOCKING_THREADS: "4"
+    healthcheck:
+      <<: *healthcheck-opts
+      # The image ships NO HEALTHCHECK, and make update counts a
+      # healthcheck-less running container as healthy — this test is the
+      # only health gate. Loopback family verified 2026-11-13 (127.0.0.1
+      # answers; [::1] does too — dual-stack, no GRANIAN_HOST pin).
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/healthz"]
+    volumes:
+      # The image declares /etc/searxng as a VOLUME — a dropped or renamed
+      # bind does not fail: Docker hands out an ANONYMOUS volume, the
+      # entrypoint copies the upstream template in (the template's own
+      # image_proxy: true; formats: [html] inherited from the shipped
+      # defaults it use_default_settings's), and the instance boots
+      # healthy (agents 403, healthcheck green, compose diff clean).
+      # make doctor's mount check asserts the exact bind — anonymous
+      # volumes carry NO inspect flag, so it greps the bind string, not
+      # 'AnonymousVolume'.
+      - ./searxng:/etc/searxng:ro
+      # Named volume, never a repo bind — runtime data must not flow back
+      # into the repo. Seeded from the image's 977:977 dir (no warning).
+      - searxng-cache:/var/cache/searxng
+    labels:
+      - panel.manage=SearXNG     # Services view: start/stop like any app
+      - panel.category=Search    # unpinned groups sort alphabetically by
+                                 # design — no frontend code; do NOT pin
+                                 # 'Search' in CATEGORY_ORDER
+    networks: [edge]
+    # NO published ports. The only internet path is the two routers in
+    # traefik/dynamic/search.yml; the API router is whole-host key-gated
+    # (see its header).
+
 volumes:
   acme: {}
+  searxng-cache: {}
 
 networks:
   edge:

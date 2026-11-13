@@ -410,6 +410,287 @@ else
   skip "llm.pietrasik.top (no LLM_API_KEY in .env — fleet not configured)"
 fi
 
+# ── search (searxng) ─────────────────────────────────────────────────────────
+# SearXNG agent API + private browser UI (docs/RUNBOOK.md → "Web search (SearXNG)").
+#
+# Tri-state gate mirroring the fleet's deadlock protection: the repo-side NEW
+# doctor runs as the precondition of the update that introduces the feature,
+# so feature-absent = SKIP, never FAIL. Defined-but-not-running = FAIL
+# (searxng is always-on — restart: unless-stopped, not on-demand: a WARN
+# would green-light the "defined, no container" state). Running = the full
+# probe matrix.
+#
+# Never `docker compose config` for expectations (interpolation makes healthy
+# containers look dead — the 4x phantom-FAIL incident); the deployed files
+# are grepped raw and container state comes from compose LABELS
+# (config-independent).
+section "search (searxng)"
+# The searxng service's environment: keys. The block must carry ONLY the
+# allow-list — additions are a deliberate diff, and a guard key fails
+# LOUDLY: a guard key in env silently overrides the deployed settings.yml
+# (env > file) and every deployed-file check would pass on it. GRANIAN_HOST
+# is NOT a member: the 2026-11-13 spike forced no host pin (both loopback
+# families answered) — a future spike that does forces a deliberate edit here.
+SEARXNG_ENV_ALLOW=(SEARXNG_PORT FORCE_OWNERSHIP GRANIAN_BLOCKING_THREADS)
+SEARXNG_ENV_GUARDS=(SEARXNG_SECRET SEARXNG_BASE_URL SEARXNG_LIMITER SEARXNG_PUBLIC_INSTANCE SEARXNG_IMAGE_PROXY)
+searxng_env_keys() { # <compose-file> → key, one per line
+  awk '/^  searxng:/{f=1;next} f && /^  [a-z]/{f=0}
+       f && /^    environment:/{e=1;next} f && e && /^    [a-z]/{e=0}
+       f && e && /^[[:space:]]+[A-Za-z_][A-Za-z0-9_]*:/{print}' "$1" \
+    | sed -E 's/^[[:space:]]+([A-Za-z_][A-Za-z0-9_]*):.*/\1/' | LC_ALL=C sort -u
+}
+searxng_env_check() { # <label> <compose-file>
+  local label="$1" file="$2" k g keys allowed clean=1 is_guard
+  keys="$(searxng_env_keys "$file")"
+  allowed="$(printf '%s\n' "${SEARXNG_ENV_ALLOW[@]}" | LC_ALL=C sort -u)"
+  for k in $SEARXNG_ENV_GUARDS; do
+    if grep -qx "$k" <<<"$keys"; then
+      bad "$label: guard key $k in the searxng env block — env > settings.yml, the deployed file is overridden (the secret path's premise is 'the env name is absent')"
+      hint "remove $k from the compose environment: block — the named allow-list is the control (RUNBOOK → Web search)"
+      clean=0
+    fi
+  done
+  for k in $keys; do
+    is_guard=0
+    for g in ${SEARXNG_ENV_GUARDS[@]}; do [[ "$k" == "$g" ]] && is_guard=1; done
+    if (( is_guard )); then continue; fi   # already reported
+    if ! grep -qx "$k" <<<"$allowed"; then
+      bad "$label: env member $k outside the searxng allow-list (${SEARXNG_ENV_ALLOW[*]})"
+      hint "additions are a deliberate diff — add it to SEARXNG_ENV_ALLOW in this script with a reason, or remove it from compose"
+      clean=0
+    fi
+  done
+  (( clean )) && ok "$label: searxng env block carries only allow-list members"
+  return 0
+}
+# One search-matrix probe. Sets SX_CODE / SX_BODY / SX_INSECURE. NEVER -L:
+# following redirects would turn the API host's 302 auth-chain drift into a
+# 200 from the Authelia portal. Trusted cert first; a transport failure
+# (000) is retried with -k to classify "staging cert" from "actually down".
+SX_CODE=""; SX_BODY=""; SX_INSECURE=0
+sx_get() { # <url> <curl args...>
+  local url="$1" resp
+  shift
+  resp="$(curl -s --max-time 10 -w '|%{http_code}' "$@" "$url" 2>/dev/null)"
+  SX_CODE="${resp##*|}"; SX_BODY="${resp%|*}"
+  [[ -z "$SX_CODE" ]] && SX_CODE="000"
+  if [[ "$SX_CODE" == "000" ]]; then
+    SX_INSECURE=1
+    resp="$(curl -sk --max-time 10 -w '|%{http_code}' "$@" "$url" 2>/dev/null)"
+    SX_CODE="${resp##*|}"; SX_BODY="${resp%|*}"
+    [[ -z "$SX_CODE" ]] && SX_CODE="000"
+  fi
+}
+
+repo_has_searxng=0; deployed_has_searxng=0
+[[ -f "$REPO_ROOT/compose/docker-compose.yml" ]] && grep -q '^  searxng:' "$REPO_ROOT/compose/docker-compose.yml" && repo_has_searxng=1
+[[ -f /opt/panel/docker-compose.yml ]] && grep -q '^  searxng:' /opt/panel/docker-compose.yml && deployed_has_searxng=1
+
+if (( ! repo_has_searxng )); then
+  skip "searxng not in the repo compose (feature not in this checkout)"
+else
+  # Repo-side pairing — a half-landed feature is the failure mode: route
+  # without service, service without settings, settings without the json
+  # surface.
+  if [[ ! -f "$REPO_ROOT/compose/traefik/dynamic/search.yml" ]]; then
+    bad "repo compose defines searxng but traefik/dynamic/search.yml is missing"
+    hint "the container would run with no route — restore the route file"
+  else
+    ok "repo: search.yml ↔ compose searxng block (route pair present)"
+  fi
+  if [[ ! -f "$REPO_ROOT/compose/searxng/settings.yml" ]]; then
+    bad "repo compose defines searxng but compose/searxng/settings.yml is missing"
+    hint "restore the settings file (the deployed dir is a config ROOT — the sync prunes stale files from it)"
+  else
+    s="$REPO_ROOT/compose/searxng/settings.yml"
+    if grep -qE '^[[:space:]]*formats:.*json' "$s"; then
+      ok "repo settings.yml: json in formats (the agent API surface — 403 without it)"
+    else
+      bad "repo settings.yml: json NOT in formats — every keyed /search?format=json would 403 (the single most likely silent misconfiguration)"
+    fi
+    if grep -qE '^[[:space:]]*lock:.*image_proxy' "$s"; then
+      ok "repo settings.yml: preferences.lock carries image_proxy (the per-request re-arm is locked)"
+    else
+      bad "repo settings.yml: preferences.lock missing image_proxy — a bare &image_proxy=1 on a keyed /search would re-arm the image proxy"
+    fi
+    if grep -qF 'secret_key: "__SEARXNG_SECRET__"' "$s"; then
+      ok "repo settings.yml: secret_key placeholder intact (the deployed-file sed owns it)"
+    else
+      bad "repo settings.yml: secret_key is not the __SEARXNG_SECRET__ placeholder — the secret path (01-secrets → sync sed) is broken"
+    fi
+  fi
+  searxng_env_check "repo" "$REPO_ROOT/compose/docker-compose.yml"
+  if [[ ! -f "$REPO_ROOT/.env" ]]; then
+    skip "searxng .env checks (no .env — make secrets, RUNBOOK Phase 1)"
+  else
+    if [[ -n "${SEARXNG_SECRET:-}" && "${SEARXNG_SECRET}" != __*__ ]]; then
+      ok ".env: SEARXNG_SECRET set (non-placeholder)"
+    else
+      bad ".env: SEARXNG_SECRET missing or still a placeholder"
+      hint "make secrets (fresh install) or add SEARXNG_SECRET=\$(openssl rand -hex 32) to the repo .env, then make update"
+    fi
+    if [[ -n "${LLM_API_KEY:-}" ]]; then
+      ok ".env: LLM_API_KEY set (the search GATE key — reused from the fleet, owner decision)"
+    else
+      bad ".env: LLM_API_KEY missing — the gate answers 503 until it exists (search reuses the fleet key)"
+      hint "set LLM_API_KEY in .env (fleet + search share it), then make update"
+    fi
+  fi
+  # Placeholder-set equality: every __X__ token in the route/config trees
+  # must be owned by a sed line in stack_sync_configs, and vice versa — a
+  # token with no sed line is a public string running live. Scoped: unscoped
+  # it is permanently red on node_modules. Mirrors the deployed-side
+  # survival grep (which covers docker-compose.yml too).
+  owned="$(grep -oE 's\|__[A-Z_]+__\|' "$REPO_ROOT/setup/common.sh" | grep -oE '__[A-Z_]+__' | LC_ALL=C sort -u || true)"
+  found="$(grep -rohE '__[A-Z_]+__' "$REPO_ROOT/compose/traefik/" "$REPO_ROOT/compose/searxng/" "$REPO_ROOT/compose/docker-compose.yml" 2>/dev/null | LC_ALL=C sort -u || true)"
+  if [[ -z "$owned" ]]; then
+    bad "placeholder-set derivation is empty (the sed lines in setup/common.sh changed shape — this check is blind)"
+  elif [[ "$owned" == "$found" ]]; then
+    ok "placeholder sets equal ($(tr '\n' ' ' <<<"$owned" | sed 's/ $//')) — every __X__ token in compose/traefik+searxng+docker-compose.yml is owned by a sed line"
+  else
+    bad "placeholder sets differ — owned by the sync's seds: [$(tr '\n' ' ' <<<"$owned" | sed 's/ $//')] vs in the trees: [$(tr '\n' ' ' <<<"$found" | sed 's/ $//')]"
+    hint "a token with no sed line is a public string running live; a sed line with no token is a dead fill"
+  fi
+fi
+
+if (( ! deployed_has_searxng )); then
+  if (( repo_has_searxng )); then
+    warn "deployed compose lacks searxng (repo has it) — lands on the next make update (WARN only: a cross-tree FAIL would red-light the very update that introduces the feature)"
+  else
+    skip "searxng not in the deployed compose (feature not landed)"
+  fi
+else
+  # Deployed-file checks — run whenever the deployed compose defines searxng,
+  # running or not.
+  f=/opt/panel/searxng/settings.yml
+  if [[ ! -f "$f" ]]; then
+    bad "deployed searxng/settings.yml missing"
+    hint "make update (the sync ships compose/searxng/ + fills the secret)"
+  else
+    og="$(stat -c '%u:%g' "$f" 2>/dev/null || true)"   # numeric — %U:%G would print a NAME if the host has a local uid-977 user
+    mo="$(stat -c '%a' "$f" 2>/dev/null || true)"
+    if [[ "$og" == "977:977" && "$mo" == "600" ]]; then
+      ok "deployed settings.yml 977:977/600 (the app reads it as uid 977 at import; the sync re-applies both after every tar)"
+    elif [[ "$og" != "977:977" ]]; then
+      bad "deployed settings.yml owner ${og:-unreadable} (want 977:977) — the next boot crashloops on EACCES (root:root 0600 is unreadable to the app)"
+      hint "sudo chown 977:977 $f (make update re-applies it)"
+    else
+      bad "deployed settings.yml mode ${mo:-unreadable} (want 600) — the instance secret is over-exposed"
+      hint "sudo chmod 600 $f (make update re-applies it)"
+    fi
+    if sudo grep -qE '__[A-Z_]+__' "$f"; then
+      bad "placeholder(s) survived in the deployed settings.yml — the sed line was skipped; the instance would run on a literal public string"
+      hint "make update (re-runs the substitution + the survival check)"
+    else
+      ok "no __*__ placeholder survives in the deployed settings.yml"
+    fi
+  fi
+  searxng_env_check "deployed" /opt/panel/docker-compose.yml
+
+  running="$(stack_running_services)"
+  if ! grep -qx searxng <<<"$running"; then
+    bad "searxng defined but not running (always-on service — restart: unless-stopped, not on-demand)"
+    hint "sudo docker compose --project-directory /opt/panel up -d searxng (a WARN would green-light the defined-no-container state)"
+  else
+    cid="$(sudo docker ps --filter "label=com.docker.compose.project=$STACK_PROJECT" \
+      --filter 'label=com.docker.compose.service=searxng' --format '{{.ID}}' 2>/dev/null | head -1 || true)"
+    # Mount check: a dropped/renamed bind hands out an ANONYMOUS volume (it
+    # carries NO inspect flag — grep the bind string) and the entrypoint
+    # template-copies (the template's image_proxy: true + formats [html] —
+    # agents 403, healthcheck green, compose diff clean).
+    mounts="$(sudo docker inspect --format '{{range .Mounts}}{{.Type}} {{.Source}} {{.Destination}} {{.Mode}}{{"\n"}}{{end}}' "$cid" 2>/dev/null || true)"
+    if grep -qx 'bind /opt/panel/searxng /etc/searxng ro' <<<"$mounts"; then
+      ok "config bind intact: /opt/panel/searxng → /etc/searxng (ro)"
+    else
+      bad "config bind missing/renamed — an anonymous volume would carry the entrypoint template and boot healthy"
+      hint "make update (re-syncs the volume line); check: sudo docker inspect --format '{{json .Mounts}}' \$(docker compose --project-directory /opt/panel ps -q searxng)"
+    fi
+    # Effective-secret probe — the POST-INIT searx.settings value (env
+    # overrides included), compared against the deployed file INSIDE the
+    # container: verdict only, the secret never leaves (the landing spike's
+    # stage-0 check, at day-2 cadence).
+    verdict="$(sudo docker exec -w /usr/local/searxng "$cid" /usr/local/searxng/.venv/bin/python -c 'from searx import settings
+file_val = ""
+for line in open("/etc/searxng/settings.yml"):
+    if line.strip().startswith("secret_key:"):
+        file_val = line.split(":", 1)[1].strip().strip(chr(34)).strip(chr(39))
+eff = settings["server"]["secret_key"]
+print("OK" if eff == file_val and eff not in ("ultrasecretkey", "__SEARXNG_SECRET__") and len(eff) >= 32 else "FAIL")' 2>/dev/null || true)"
+    if [[ "$verdict" == "OK" ]]; then
+      ok "effective secret == deployed file value (post-init — an env override would show up here)"
+    else
+      bad "effective-secret probe FAIL (override mode: the image set SEARXNG_* in its own ENV, or an env line slipped the allow-list; sed-skip mode: file and effective both bad)"
+      hint "check the env allow-list + owner/mode checks above; re-run: make update"
+    fi
+
+    # ── probe matrix ── Exact status codes + body shape. `code != 401`-style
+    # assertions are forbidden (403/404/502/503 would all pass one and hide
+    # the drift). Never a live search: the no-q 400 and the /healthz +
+    # /metrics probes all run before any engine contact — the matrix must
+    # stay engine-free (twice per update, from the home IP, against engines
+    # that throttle).
+    if [[ -n "${LLM_API_KEY:-}" ]]; then
+      sx_get "https://search.pietrasik.top/search?format=json"
+      if [[ "$SX_CODE" == "401" ]]; then
+        ok "unkeyed search. /search?format=json → 401 (the key gate answers)"
+      else
+        bad "unkeyed search. /search?format=json → ${SX_CODE} (want exactly 401)"
+        hint "400 = the gate middleware fell off — WIDENED ROUTE, incident class (this probe carries no q, so SearXNG answering directly is 400 'No query', never 200): restore search-gate in search.yml; 200 = not SearXNG answering (it cannot 200 a no-q json request) — the router's service drifted; 302 = auth-chain drift; 404 = router/file-tree missing; 500 = the gate (panel-api) unreachable; 429 = the shared search-rate bucket is busy (live traffic — RUNBOOK → Web search, shared-bucket note): re-run in a few seconds"
+        (( SX_INSECURE )) && hint "over an UNTRUSTED cert — staging? make promote"
+      fi
+      sx_get "https://search.pietrasik.top/search?format=json" -H "Authorization: Bearer $LLM_API_KEY"
+      if [[ "$SX_CODE" == "400" && "$SX_BODY" == *"No query"* ]]; then
+        ok "keyed /search (no q) → 400 'No query' (credential + chain + json format, zero engine queries)"
+      else
+        bad "keyed /search (no q) → ${SX_CODE} (want exactly 400 with JSON containing 'No query')"
+        hint "401 = key mismatch (repo .env vs deployed); 403 = json missing from the deployed formats (the silent misconfiguration — re-run: make update); 500 = the gate unreachable (panel-api down); 429 = the shared search-rate bucket is busy (live traffic — RUNBOOK → Web search, shared-bucket note): re-run in a few seconds"
+        (( SX_INSECURE )) && hint "over an UNTRUSTED cert — staging? make promote"
+      fi
+      sx_get "https://search.pietrasik.top/healthz" -H "Authorization: Bearer $LLM_API_KEY"
+      if [[ "$SX_CODE" == "200" && "$SX_BODY" == "OK" ]]; then
+        ok "keyed /healthz → 200 OK"
+      else
+        bad "keyed /healthz → ${SX_CODE} (want 200, body OK)"
+        hint "liveness disambiguator: 503 = the gate answered key-unset OR no healthy searxng server; 500 = the gate unreachable"
+      fi
+      sx_get "https://search.pietrasik.top/metrics" -H "Authorization: Bearer $LLM_API_KEY"
+      if [[ "$SX_CODE" == "404" ]]; then
+        ok "keyed /metrics → 404 (open_metrics still empty — the fleet key does not open Prometheus)"
+      else
+        bad "keyed /metrics → ${SX_CODE} (want exactly 404 — open_metrics was SET)"
+        hint "if it was set to the LLM key, the fleet key now opens Prometheus: clear open_metrics in compose/searxng/settings.yml + make update"
+      fi
+    else
+      skip "keyed probes (no LLM_API_KEY in the repo .env — the gate answers 503 until the fleet key exists)"
+    fi
+    # The direct gate probe — the CONFIGURED check, independent of traefik.
+    gcode="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://172.17.0.1:8010/gate/search 2>/dev/null || true)"
+    if [[ "$gcode" == "401" ]]; then
+      ok "direct gate probe → 401 (gate configured; 503 would mean LLM_API_KEY missing from the reduced env)"
+    else
+      bad "direct gate probe → ${gcode:-000} (want exactly 401, never 503)"
+      hint "503 = LLM_API_KEY missing from /opt/panel/.panel-api.env (make api re-derives it); 404 = stale panel-api code (make api); 000 = panel-api down (systemctl status panel-api)"
+    fi
+    # Negative reachability: the gate must NOT answer on the panel host — an
+    # unauth curl sees the Authelia redirect; gate JSON there means a router
+    # edit turned /gate/search into a browser-routable key oracle.
+    px_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://panel.pietrasik.top/gate/search" 2>/dev/null || true)"
+    px_insecure=0
+    if [[ "$px_code" == "000" || -z "$px_code" ]]; then
+      px_code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "https://panel.pietrasik.top/gate/search" 2>/dev/null || true)"; px_insecure=1
+    fi
+    if [[ "$px_code" =~ ^30 ]]; then
+      ok "panel host /gate/search → $px_code (Authelia answers, never the gate${px_insecure:+ — over an UNTRUSTED cert, staging? make promote})"
+    elif [[ "$px_code" == "401" || "$px_code" == "503" ]]; then
+      bad "panel host /gate/search → $px_code — the GATE is answering on the panel host (route drifted to panel-api)"
+      hint "root-level placement is one panel.yml edit from becoming a key oracle — audit compose/traefik/dynamic/panel.yml"
+    else
+      bad "panel host /gate/search → ${px_code:-000} (want 30x — the Authelia redirect for an unauth curl)"
+      hint "200 = an authed session or the auth-chain fell off; 000 = unreachable (DNS checks above)"
+    fi
+  fi
+fi
+
 # ── panel-api ────────────────────────────────────────────────────────────────
 section "panel-api (host service)"
 if systemctl is-active --quiet panel-api 2>/dev/null; then

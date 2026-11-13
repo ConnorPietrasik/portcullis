@@ -263,6 +263,7 @@ happens through a deliberate edit of that component's line:
 | panel-api pip deps | the ranges in `requirements.txt` (e.g. `fastapi>=0.115,<1`) | a range in `panel-api/requirements.txt` + commit |
 | stack configs + secrets | whatever is committed in this repo (compose, routes, Authelia ACLs, `.env`) | — the repo edit **is** the change (holding a line = a full-version pin, e.g. `traefik:v3.7.9`) |
 | radiance (LLM fleet) | `latest` — deliberately OUTSIDE the declared-line policy (frequent builds wanted) | the tag in `x-llm-base`; a build that breaks behavior → `make rollback WHAT=radiance` |
+| searxng | `latest` — deliberately OUTSIDE the declared-line policy (rolling date tags, no releases — see the image-bump duty in **Web search (SearXNG)**) | the tag in `compose/docker-compose.yml`; a build that breaks behavior → `make rollback WHAT=searxng` (images only) |
 
 ### If something goes wrong
 
@@ -282,7 +283,7 @@ Mechanics in `setup/08-update.sh` (shared helpers in `setup/common.sh`):
   `make deploy` gates on it too, and `make doctor` checks both trees).
 - **Snapshot** = `/opt/panel/.update-snapshot-<ts>` (state in `/opt/panel/.update-state`): the exact *image IDs* of what is running
   (tags move, IDs don't), re-tagged `portcullis-rollback/<svc>:<ts>`; **the deployed config tree** (`/opt/panel`: docker-compose.yml,
-  traefik/, portfolio/, the authelia configs, panel-frontend, `.env`, the reduced env files — a tarball; runtime data like
+  traefik/, portfolio/, searxng/, the authelia configs, panel-frontend, `.env`, the reduced env files — a tarball; runtime data like
   `db.sqlite3` excluded); an **exact copy of `/opt/panel-api` (venv included)**; and the npm files about to be bumped. A failed npm
   bump, config sync, or pull stops the run *before* any container is touched.
 - **npm bump** = `npm update --package-lock-only` in `compose/panel-frontend` — floats every dependency within the range declared in
@@ -533,6 +534,281 @@ a **pick…** row for exact card sets, and a **boot** checkbox.
   e.g. `llm-27b` on 0,1 and `llm-27b-1` on 2,3, each with its own subdomain, each assignable
   independently here.
 
+## Web search (SearXNG)
+
+Self-hosted metasearch: an agent-facing keyed JSON API (`search.pietrasik.top`) and a private
+browser UI (`searx.pietrasik.top`, the Authelia `*.pietrasik.top` two_factor wildcard — any 2FA
+user, zero ACL edits, droppable later — the agent path is byte-identical without it). The API
+gate is `panel-api`'s `/gate/search` — a **key checker, not a proxy** (forwardAuth's contract and
+the no-proxy rationale are in `search.yml`'s header) — and the key is the fleet's `LLM_API_KEY`,
+reused on an owner decision: there is no search-only rotation (rotating it re-creates the `llm-*`
+containers), and a leaked key grants search too.
+
+### Agent contract
+
+- `GET` or `POST` `https://search.pietrasik.top/search`, `Authorization: Bearer <LLM_API_KEY>`
+  (Basic works too — `user` ignored, password = the key — for Basic-only clients).
+- Query params pass through to SearXNG: `q`, `format=json` (mandatory — it is in the deployed
+  `formats`, 403 without it; `make doctor` probes it), `categories`, `engines`, `language`,
+  `pageno`, `time_range`, `safesearch`.
+- Response: SearXNG's native JSON — `{"query":…, "results": [{title, url, content, engine, …}],
+  "number_of_results":…, …}`.
+- The host is **key-gated whole, not path-scoped**: `mcp-searxng` probes `/config` +
+  `/autocompleter` on the same host, and whole-host is safe because the host exposes no
+  state-changing surface (instance state lives in `settings.yml`) and no arbitrary-fetch surface
+  (`/image` needs an HMAC under the sed-filled instance secret; `/metrics` needs its own
+  password).
+- **POST keeps the query out of the request line** — query params in GET URLs leak into logs and
+  proxies (see the access-log note below). Prefer POST for query-sensitive clients; pi-web-access
+  is GET-only.
+- No Authelia on this host: the key is the identity. The browser UI is the separate `searx.`
+  host behind the wildcard.
+
+### Traefik version gate (landing check)
+
+`search.yml` uses two version-gated forwardAuth keys (`maxResponseBodySize` ≥ v3.6.9;
+`trustForwardHeader` valid through v3, deprecated v3.6.14+, gone in v4). An unknown key is a
+parser decode error that voids the **whole file provider** — on a traefik restart with the bad
+file on disk, every host 404s with traefik itself healthy (full edge outage; see the
+troubleshooting row). Before landing, print the version and verify BOTH constraints (major v3
+AND ≥ v3.6.9); if it fails, do not ship the file — defer the feature (or the offending key) as
+its own change:
+
+```bash
+sudo docker exec traefik traefik version
+```
+
+### Status table (attribution — one place)
+
+| code (keyed, on `search.`) | reading |
+|---|---|
+| 400 | authenticated + configured + `json` present — the `No query` 400 is the healthiest possible answer (zero engine queries) |
+| 401 | credential — key mismatch (repo `.env` vs deployed) or unkeyed |
+| 403 | `json` not in the deployed `formats` — the silent misconfiguration; re-run `make update` |
+| 404 | router missing — may be the **whole file tree** (a decode failure — see the troubleshooting row) |
+| 500 | the gate was UNREACHABLE (panel-api down/restarting — forwardAuth on an unreachable auth server is a 500, not a 503; `pkg/middlewares/auth/forward.go`, verified on v3.6.14 AND v3.7.9) or a gate-handler fault |
+| 502 | searxng process faulting mid-request |
+| 503 | the gate answered key-unset, OR no healthy searxng server (router matched, no backend ready) |
+| unkeyed 400 (no `q`) or 200 (with a `q`) on `search.` | **the gate middleware fell off — WIDENED ROUTE, incident**: SearXNG answering keyless is 400 `No query` without a `q` (the doctor's probe) and 200-with-results with one — a 200 on the no-q probe instead means a different backend now serves the host: restore `search-gate` in `search.yml` |
+| unkeyed 302 on `search.` | auth-chain drift — an Authelia router now matches the API host; audit `search.yml` |
+| keyed `/metrics` ≠ 404 | `open_metrics` was set — if to the LLM key, the fleet key now opens Prometheus; clear it in `compose/searxng/settings.yml` + `make update` |
+
+(No 405 row: the forwardAuth hop is GET by construction — the gate handler declares all methods
+for hardening, but the router never sees a method-rejected request.)
+
+**Attribute a public 503/500 with the direct gate probe** `curl http://172.17.0.1:8010/gate/search`
+(exactly 401 when configured; the doctor runs it):
+
+- it says **503 itself** → `LLM_API_KEY` missing from `/opt/panel/.panel-api.env` → the public
+  503 is the gate's own (`make api` re-derives the reduced env);
+- it says **401** → gate configured → the public 503 is downstream of the gate: no healthy
+  searxng server (check `sudo docker compose --project-directory /opt/panel ps searxng`);
+- it **refuses / times out / 404s** → panel-api down or stale code (a 404 = the pre-gate binary,
+  `make api`) → the public 500 is the unreachable gate.
+
+### Rotating the keys (reuse-aware)
+
+- **`SEARXNG_SECRET`** (the instance secret — cookie signing, `/image` HMAC): repo-`.env` edit +
+  `make update`. The sync's sed re-fills the deployed `settings.yml` (chown/chmod re-land), and
+  the restart-on-change hook restarts searxng — start-time-only config, no re-create.
+- **`LLM_API_KEY`** (the GATE key — and the fleet's): the existing fleet procedure (repo `.env`
+  edit + `make update`, `llm-*` re-create expected). It re-keys every search client at the same
+  time — the `web-search.json` / MCP config on each machine.
+- Rotate the **repo** `.env`, never the server copy: a full rollback restores `.env` + both
+  reduced env files from the update's snapshot with no re-derivation.
+
+### Access-log note
+
+Traefik's `accessLog: {}` **keeps query strings** — agents searching via GET (pi-web-access
+does) leave their queries in the docker json-file log. Query-sensitive clients should POST
+(query in the body, not the line). Deliberately NOT touching `traefik.yml` in this change: the
+drop-the-query option needs traefik ≥ 3.7.3 under a floating v3, and the static file is
+start-time config → a restart of the edge. Not worth it for this traffic.
+
+### The shared-bucket note (accepted)
+
+`search.` and `searx.` draw on the **SAME** `search-rate` bucket (2/s sustained, burst 10 —
+sized to the 4-thread capacity ceiling, not to inference). An agent burst plus a UI page load
+(document + `/config` + bundles) can 429 the load's tail. It self-heals on refresh (the bucket
+refills at 2/s), and a 429 on the UI is the limit working, not a fault. If it gets noisy: raise
+the burst, or give `searx.` its own rateLimit middleware (separate state). The limit keys on
+the socket address (never client XFF — see `search.yml`'s header): behind the one proxy it is a
+per-client-IP flood brake, and the key is the identity control.
+
+### Image-bump duty
+
+The image floats on `latest` — rolling date tags, no releases (declared OUTSIDE the
+declared-line policy, the radiance precedent; see the "The lines" table row). Before an update
+lands a new build:
+
+1. Diff `compose/searxng/settings.yml` against the file the new image ships — under
+   `use_default_settings`, an upstream default flip is a silent behavior change (`formats` is
+   the live example).
+2. Diff the image's `searx/settings_defaults.py` `SCHEMA`: the `environ_name` list (a new
+   env-override name is a new channel over our settings.yml) AND the default values (a flip for
+   a key our settings.yml doesn't set is invisible in the shipped-file diff; the doctor's
+   probes cover the security-critical ones).
+3. Confirm the app uid is still 977 — the compose `user` pin, the sync's `chown` target and the
+   doctor's owner check all name it.
+4. Re-run the effective-secret probe (the doctor carries the file-comparing variant at day-2 cadence):
+
+```bash
+sudo docker exec -w /usr/local/searxng "$(sudo docker compose --project-directory /opt/panel ps -q searxng)" \
+  /usr/local/searxng/.venv/bin/python -c \
+  "from searx import settings; s=settings['server']['secret_key']; print('OK' if len(s) >= 32 and s not in ('ultrasecretkey','__SEARXNG_SECRET__') else 'FAIL')"
+```
+
+Hold a known build: pin the tag in `compose/docker-compose.yml`. A build that passes the gates
+but breaks behavior: `make rollback WHAT=searxng`.
+
+### Rollback split
+
+- **Images only** (`make rollback WHAT=searxng`): a bad build — the settings file (secret-filled
+  on disk) is untouched.
+- **Full** (`make rollback`): a settings/route regression — the config tree, including
+  `searxng/settings.yml`, is part of the snapshot and is restored with the secret already in it.
+
+### First-landing transient (expected, fail-closed)
+
+Between update step 3/7 (route hot-reload lands `search.yml`) and 6/7 (panel-api re-deploy
+installs `/gate/search`), the API host answers denied — the forwardAuth target 404s and the gate
+copies that to the client. Fail-closed, zero users, seconds long. **Do NOT pre-run `make api`
+before the update**: the 1/7 snapshot would then anchor the NEW gate code, and a rollback would
+silently keep it.
+
+### The ownership warning (pre-empted)
+
+The container runs as uid 977 (the image's own uid; the image sets no `USER`). The sync's tar
+leaves the config DIR non-977, so every start prints ONE benign line — `/etc/searxng is not
+owned by "searxng:searxng"` — and continues (the data volume seeds 977:977 from the image and
+stays quiet). **Do not "fix" it**:
+
+- dropping `user: "977:977"` → the app runs as root, and with `FORCE_OWNERSHIP=true` it would
+  `chown -R` the repo-synced tree every start;
+- hand-`chown`-ing under `/opt/panel` → undone by the next tar sync. The sync's OWN
+  `chown 977:977` of the deployed `settings.yml` (landed with the chmod, every sync) is the
+  sanctioned chown — a hand chown elsewhere is the one that gets undone;
+- making the config bind writable to silence it → the bind is `:ro` because the app never writes
+  the config dir in this mode (we ship `settings.yml`, so the template copy never runs).
+
+The warning is expected output, not an error — ONE line per start, naming the config dir only.
+The container log accumulates one line per start (and rotates at 10m×3), so count per start:
+(a line naming the data volume, or **two lines in a single start**, is a real problem — check
+the mount + the volume.)
+
+### Rollback residue (pre-searxng rollback)
+
+Config restore is additive and the file provider hot-reloads: after a rollback to a
+pre-searxng snapshot, `search.yml` STAYS live on disk, pointing at a gate/container that no
+longer exist — fail-closed in two places (the gate 404s → the client gets 500; the container is
+gone → no backend). Cure = a later `make update` (re-syncs + prunes the stale route), or
+`sudo rm /opt/panel/traefik/dynamic/search.yml` now (the watcher reloads). The searxng
+container itself is dropped by the rollback's recreate (`--remove-orphans`); the
+`searxng-cache` named volume survives (runtime data is never auto-deleted) — remove it with
+`docker volume rm panel-searxng-cache` if you want it gone.
+
+### Client setup
+
+**pi-web-access** (current latest: 0.47.0 — its SearXNG provider speaks exactly this endpoint:
+`GET {base}/search?q=…&format=json` (+ `time_range`)). Per pi machine, NOT in the repo — merge
+into the `web-search.json` that pi ACTUALLY reads (**chmod 600 — it holds the key**): pi checks
+`~/.pi/agent/web-search.json` first and falls back to the legacy `~/.pi/web-search.json` only
+while the agent-dir file is absent — so if both exist, a field written to the legacy file is
+silently shadowed and the routing never engages:
+
+```json
+{
+  "exaApiKey": "…",
+  "searxngBaseUrl": "https://search.pietrasik.top",
+  "searxngHeaders": { "Authorization": "Bearer <LLM_API_KEY>" },
+  "searchRouting": {
+    "providers": ["searxng", "exa"],
+    "fallbackOn": ["network", "transient", "quota", "invalid-response", "empty"]
+  }
+}
+```
+
+- `searxngHeaders` carries the key (the extension has no native SearXNG key concept; the hook
+  exists for reverse-proxy auth). Same value the fleet clients already hold.
+- A selected-provider failure does NOT cascade to Exa implicitly — `searchRouting` is the
+  explicit fallback. `auth`-kind (401) is deliberately not a valid fallback kind: a wrong key
+  stays loud.
+- The extension is **GET-only with the query in the URL** — see the access-log note above.
+
+**mcp-searxng** — Basic-only client (the gate's Basic branch exists for it). stdio, client-side
+only — an MCP server container on `edge` would be an SSRF pivot into panel-api/authelia/LAN:
+
+```bash
+pi mcp add searxng -- npx -y mcp-searxng
+```
+
+with the instance URL as `https://<anything>:<LLM_API_KEY>@search.pietrasik.top` (URL
+userinfo). Behavior verified against 2.10.1 (current latest at plan time; `npx -y` floats on
+latest by preference — the design is robust to change: whole-host routing serves its
+`/config` + `/autocompleter` probes and the gate answers both schemes; the fallback is curl):
+
+- SearXNG instance auth is HTTP Basic only — URL userinfo or the `AUTH_USERNAME`/
+  `AUTH_PASSWORD` env fallback — applied to all three endpoints (`/search` + the two probes).
+- URL userinfo needs a **non-empty username**: 2.10.1 treats password-only userinfo as ABSENT
+  (silent fallback to the `AUTH_*` env) — hence `<anything>:`.
+- The username is ignored by the gate; the password IS the key. Percent-encode the key first
+  if it carries URL userinfo specials (inert for a hex key).
+- The 2.x static-bearer/OAuth options protect the MCP server's own HTTP transport, not the
+  SearXNG instance connection (and the recipe runs stdio, where there is no transport at all).
+
+**Raw**: `curl -H "Authorization: Bearer $LLM_API_KEY" …/search?q=…&format=json` (POST is a
+first-class verb).
+
+### Verification (post-deploy / post-update)
+
+`make doctor` runs the whole matrix — it must stay engine-free (every probe runs before any
+engine contact; the doctor runs twice per update, from the home IP, against engines that
+throttle):
+
+| probe | expect | proves |
+|---|---|---|
+| unkeyed `GET https://search.pietrasik.top/search?format=json` | exactly **401** | the gate answers (302 = auth-chain drift; 400 = gate fell off = WIDENED ROUTE, incident — this probe has no `q`, so a widened route is 400 `No query`, never 200) |
+| keyed `GET https://search.pietrasik.top/search?format=json` (no `q`) | exactly **400**, JSON body containing `No query` | credential + Traefik→gate→searxng chain + `json` in deployed formats — ZERO engine queries |
+| keyed `GET https://search.pietrasik.top/healthz` | exactly **200**, body `OK` | liveness disambiguator (a 503 here is ambiguous between gate-unconfigured and no healthy server) |
+| keyed `GET https://search.pietrasik.top/metrics` | exactly **404** | `open_metrics` still empty — any other code means it was set |
+| `GET http://172.17.0.1:8010/gate/search` | exactly **401**, NEVER 503 | gate CONFIGURED (503 = `LLM_API_KEY` missing from the reduced env; 404 = old panel-api, run `make api`) |
+| unkeyed `GET https://panel.pietrasik.top/gate/search` | 30x for an unauth curl (Authelia); an authed browser gets the SPA 200 — NEVER 401/503 gate JSON | negative reachability — the root-level placement is one future panel.yml edit from becoming a key oracle |
+
+Every FAIL names the code expected and the code seen; `code != 401`-style assertions are
+forbidden in these checks (403/404/502/503 would all pass one). A **429** on the keyed probes
+is the shared `search-rate` bucket consumed by live traffic — wait a few seconds and re-run.
+
+Plus the container-side checks (doctor, always on when the feature is deployed): `settings.yml`
+owner `977:977` + mode `600`, zero `__*__` tokens in the deployed file, the
+`/opt/panel/searxng → /etc/searxng (ro)` bind intact (a dropped bind boots healthy on the
+anonymous-volume template — the mount check is the only thing that catches it), the
+effective-secret probe (post-init value compared against the deployed file inside the container —
+catches the env-override mode the file checks can't see), and the env allow-list (the compose
+`environment:` block carries no guard key — that absence IS the secret path).
+
+**Manual one-offs (never from the doctor — it must stay engine-free)**:
+
+```bash
+# one real search (the doctor's matrix proves the chain without touching an engine):
+K="$(sudo grep '^LLM_API_KEY=' /opt/panel/.panel-api.env | cut -d= -f2)"
+curl -s -H "Authorization: Bearer $K" \
+  "https://search.pietrasik.top/search?q=traefik+healthz&format=json" | jq '.results | length'   # > 0
+```
+
+- **Lock falsification** (the `image_proxy` lock is structural — falsify it, don't trust it):
+  in a fresh browser/cookie jar with `image_proxy=1` set (UI preferences or a bare `&image_proxy=1`
+  on a keyed `/search`), the result URLs must STILL be plain — no `/image` path.
+- **Ownership log line** (manual — deliberately NOT a doctor check: the line lands once PER
+  START and the json-file log accumulates across restarts and rotates at 10m×3, so a bare count
+  is only meaningful against a known start count):
+  `sudo docker compose --project-directory /opt/panel logs searxng | grep -cF 'not owned by "searxng:searxng"'`
+  → expect **1 per start** (1 on a fresh container — an image-float update re-created it — plus
+  one more per restart since). The line names the config dir (`/etc/searxng`) only; the data
+  volume seeds 977:977 and stays quiet (the embedded quote is part of the pattern). A line
+  naming `/var/cache/searxng`, or **two lines in a single start**, is a real problem — check the
+  mount + the volume.
+- **From a configured pi machine**: `web_search({ query: "traefik healthz", provider: "searxng" })`
+  — the real client against the real endpoint.
 ## Add a privileged action
 
 One Go function in the ACTIONS section of `panel-do/main.go` + one registry entry, then `make panel-do`. The UI picks it up from
@@ -584,6 +860,7 @@ either is missing; on CachyOS both are distro defaults, so this is usually a no-
 | GPUs view errors (`panel-do llm-* failed`) | panel-do too old for the GPU pool actions → `make panel-do`; `make doctor` checks for `llm-apply` in the registry |
 | container action → 500 | panel-do too old for the container actions → `make panel-do`; details in `sudo journalctl -u panel-api -n 50` |
 | `up -d` → "network edge declared as external, but could not be found" | the `edge` network was deleted — it's created only by `make deploy` / `make stack`, never by compose (`external: true`). Cause: the edge containers were stopped (or removed) and unused networks pruned — `docker system prune` does both in one run (that's what the panel's *old* `prune-docker` action ran). The current `prune-docker` never touches networks. Fix: `sudo docker network create edge`, then `sudo docker compose --project-directory /opt/panel up -d` (or re-run `make deploy`); `make doctor` checks for this |
+| all hosts 404 + traefik container healthy | a dynamic route file failed to parse — an unknown/invalid key makes the file provider send NO config at all. On a hot reload (the common case — the update landing the file on a running traefik) the LAST GOOD config persists (the feature simply doesn't land; everything else routes) and traefik logs "Error occurred during watcher callback"; on a traefik RESTART with the bad file on disk EVERY file-provider route (panel, llm, portfolio, authelia) 404s with traefik itself healthy — full edge outage. `sudo docker compose --project-directory /opt/panel logs traefik 2>&1 | grep -iE "watcher callback|building configuration"` ("building configuration" only appears on a first load / restart) — fix or remove the offending file at the repo (the single source of truth) and `make update`, or `sudo rm` it from `/opt/panel/traefik/dynamic/` to let the watcher reload |
 | update gate: `llm-* (exited)`, and the update started the WHOLE fleet | a stopped fleet container was pruned (raw `docker container prune` / `docker system prune`), so the update read the missing container as a new service and started every instance at once — invalid when they share cards. The auto-rollback leaves the fleet containers in place, so a re-run of `make update` classifies them as deliberately stopped again (deploys the new configs, pulls the images, starts nothing fleet). With the current guard, a pruned (or brand-new) `restart: "no"` service is never auto-started — the update names it and leaves it down. Bring it back from the panel: Services view → *defined, no container* → *create + start*. Don't raw-prune containers on this box — use the panel's `prune-docker` action (images + build cache only) |
 | domain resolves to an old IP | panel-ddns failing → `journalctl -u panel-ddns`; then `sudo systemctl start panel-ddns` (missing/stale records are fixed in place) |
 | panel-api won't bind | docker failed to start (`panel-api` does `Wants=docker.service`, so a docker *failure* surfaces here too): `systemctl status docker`, `ip addr show docker0` missing |

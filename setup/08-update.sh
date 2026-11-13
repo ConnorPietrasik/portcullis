@@ -79,7 +79,7 @@ info "2/7 bumping the panel frontend's npm deps (within the declared ranges — 
 # that copy. (A fresh clone has no lockfile; this step generates it.)
 npm_bump_panel_frontend
 
-info "3/7 syncing the repo's configs to /opt/panel (compose + traefik + authelia + portfolio + .env)"
+info "3/7 syncing the repo's configs to /opt/panel (compose + traefik + authelia + portfolio + searxng + .env)"
 # The same sync make deploy performs (stack_sync_configs): file content only —
 # nothing is recreated yet, and a sync failure aborts with every container
 # untouched.

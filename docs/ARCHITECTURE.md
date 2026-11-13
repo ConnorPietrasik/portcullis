@@ -79,7 +79,32 @@ panel-uid systemd units load — `/opt/panel/.panel-api.env` (0600; `PANEL_TOKEN
 `LLM_API_KEY` — the one deliberately non-PANEL key) and `/opt/panel/.panel-ddns.env` (0600, only `NAMESILO_API_KEY` + optional
 `DDNS_HOSTS`) — because a panel-uid process can read its own `/proc/<pid>/environ`, so the panel-uid services (long-lived
 panel-api, and the same-uid panel-ddns oneshot on each tick) never load the full set: each gets only its slice (`LLM_API_KEY` is
-in panel-api's by design — the /v1 fallback router's bearer gate; the Authelia secrets are in neither). Deploy-time placeholders
+in panel-api's by design — the /v1 fallback router's bearer gate and the SearXNG search gate, which reuses it; the Authelia secrets are in neither). Deploy-time placeholders
 (`__PANEL_TOKEN__`, `__ACME_EMAIL__`, `__ACME_CA_SERVER__`) are substituted into the deployed Traefik configs (static
-`traefik.yml` + `dynamic/middlewares.yml`) by `stack_sync_configs` in `setup/common.sh` — run by both `setup/02-deploy-stack.sh`
-(first boot) and `setup/08-update.sh` (every `make update`); the repo copy stays clean.
+`traefik.yml` + `dynamic/middlewares.yml`), and `__SEARXNG_SECRET__` into the deployed
+`searxng/settings.yml` (the instance secret — see below), by `stack_sync_configs` in `setup/common.sh` — run by both
+`setup/02-deploy-stack.sh` (first boot) and `setup/08-update.sh` (every `make update`); the repo copy stays clean.
+
+**SearXNG: a forwardAuth key-gate, not a data path.** `search.pietrasik.top` (agent JSON API) is gated whole-host by
+panel-api's `/gate/search` — a key CHECKER answering only 200/401/503, reached as Traefik's `forwardAuth` address, with the
+search bytes going directly traefik→searxng (a proxy-through-panel-api would add a streaming failure surface for zero
+gain — the gate IS the auth). Whole-host is safe because the host has no state-changing surface (instance state lives in
+`settings.yml`; preferences are cookies) and no arbitrary-fetch surface: `/image` needs an HMAC under the sed-filled
+instance secret, and `/metrics` needs its own password — carried structurally by the two settings guards
+(`enable_metrics: true` so the stats surface exists, `open_metrics` empty so nothing opens Prometheus; and never setting
+`open_metrics` to the gate key — the doctor's keyed `/metrics`→404 probe makes that tripwire-able). The key is the fleet's
+`LLM_API_KEY` by owner decision: no search-only rotation (rotating it re-creates the `llm-*` containers), a leaked key
+grants search too, and the reduced-env plumbing is zero. The instance secret rides the repo's sed machinery, NOT the
+image's env: SearXNG applies env > settings.yml (the `SCHEMA` in `searx/settings_defaults.py` carries `environ_name`
+overrides applied at every boot), so the deployed file's guards (`secret_key`, `base_url`, `limiter`, `public_instance`,
+`image_proxy`) are effective only while none of the guards' env names (`SEARXNG_SECRET`, `SEARXNG_BASE_URL`,
+`SEARXNG_LIMITER`, `SEARXNG_PUBLIC_INSTANCE`, `SEARXNG_IMAGE_PROXY`) is set — the named compose env allow-list (its only
+`SEARXNG_*` member, `SEARXNG_PORT`, maps to `server.port`, a non-guard) is that control, and the doctor's effective-value
+probe (post-init `searx.settings`, compared against the deployed file inside the container, verdict-only) is the tripwire.
+The deployed file is 977:977/0600: the owner is the container uid because the app reads it as uid 977 at import
+(root:root 0600 would be EACCES → crashloop), and the sync lands chown + chmod together, every sync. Accepted edge-network
+property: any edge container reaches `http://searxng:8080` unkeyed — search-only, attacker already on the fleet bridge,
+same class as the accepted `/open` hole. No Authelia rule: the UI rides the `*.pietrasik.top` two_factor wildcard
+(private-by-default), the API host never meets Authelia. Rate-limit/identity is the socket address — XFF is untrusted by
+construction (the host never trusts client-supplied `X-Forwarded-*`), so the limit is a per-client-IP flood brake and the
+key is the identity.
