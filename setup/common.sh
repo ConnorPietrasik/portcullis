@@ -422,6 +422,15 @@ update_acquire_lock() {
     || die "cannot create lock file $STACK_LOCK_FILE"
   exec 9>>"$STACK_LOCK_FILE" || die "cannot open lock file $STACK_LOCK_FILE"
   flock -n 9 || die "another update/rollback is already running (lock: $STACK_LOCK_FILE — wait for it, or kill the other run)"
+  # 08 runs doctor WHILE holding this lock — and its PRE-doctor runs BEFORE
+  # the snapshot flips status to in-progress — so doctor's stale-lock probe
+  # (07) must not flag the run's own lock as a leftover. The marker is
+  # exported AFTER the flock (marker set ⇒ this tree holds the lock) and into
+  # THIS process tree only: a standalone `make doctor` (or the next run)
+  # never sees it, and still gets flagged. 09 shares this path (marker set,
+  # never needed — 09 runs no doctor in its own tree; the `make doctor` it
+  # tells the operator to run afterwards is a fresh tree that never sees it).
+  export PANEL_UPDATE_INSIDE=1
 }
 
 # --detach support for panel-do (update-run / update-run-force / update-rollback):

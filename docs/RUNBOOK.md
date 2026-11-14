@@ -389,6 +389,7 @@ panel-do update-run  →  setup/08-update.sh --detach   (the exact same make upd
 | tick fails: "clone … is a git checkout but git status failed" | the clone's index is unreadable/corrupt (power loss or an interrupted git write) — inspect/fix the clone (worst case: re-clone + re-copy `.env`/`users_database.yml`), then re-run; *run anyway* applies the working tree as-is, deliberately |
 | action fails: "update state holds an invalid repo_root" | the state file was hand-edited — `sudo rm /opt/panel/.update-state`, then `make update` |
 | doctor: "update stuck in-progress" | the update process died mid-run — `sudo tail /opt/panel/.update-run.log`, `pgrep -af '08-update.sh\|09-rollback.sh'`, kill the leftover, then `make rollback` |
+| doctor: "update lock held with no in-progress update" | a leftover from an interrupted run is still alive and holds the lock — flock is released only on process exit, so a held lock proves the holder never died; `sudo fuser -v /opt/panel/.update.lock` names it; kill it if stale, then `make doctor` |
 | doctor: clone "fails panel-do's auto-exec check" | the clone, its `setup/`, or a directory ABOVE the clone became group/other-writable (or is owned by `panel`) — `chmod go-w` it; `08/09-update.sh` not executable, panel-owned, or missing the bash shebang → re-pull the repo (exec bit + shebang are committed) |
 
 ## Add an app

@@ -1002,8 +1002,9 @@ fi
 # ── auto-update ──────────────────────────────────────────────────────────────
 # The update state file (the dashboard's control plane) + the clone's
 # auto-exec safety when the timer is enabled. Read-only — the lock probe
-# takes and releases the flock immediately (a held lock can only mean a live
-# run, which the in-progress status below explains).
+# takes and releases the flock immediately (it only READS who holds it).
+# A held lock means either a live run (status in-progress, or this doctor's
+# own run via PANEL_UPDATE_INSIDE) or a stale leftover (flagged).
 section "auto-update (update state + timer)"
 USTATE=/opt/panel/.update-state
 if [[ -f $USTATE ]]; then
@@ -1034,13 +1035,21 @@ except Exception:
   # A held lock with no in-progress status means a leftover process keeps the
   # fd open (flock releases on process exit). The probe only runs on the real
   # file — a fallback open (e.g. /dev/null) would make flock fail and
-  # false-positive.
+  # false-positive. ONE exception: this doctor is a gate of the run ITSELF
+  # (PANEL_UPDATE_INSIDE — exported by update_acquire_lock): 08 locks BEFORE
+  # its pre-doctor, and the snapshot that flips status to in-progress runs
+  # AFTER it, so its own held lock is expected and must not red-light the very
+  # update it is gating. (The flock, not this probe, is the exclusion.)
   if [[ -f /opt/panel/.update.lock ]] && exec 8</opt/panel/.update.lock 2>/dev/null; then
     if ! flock -n 8 2>/dev/null; then
       exec 8>&-
-      if ! grep -q '"status": "in-progress"' "$USTATE" 2>/dev/null; then
+      if grep -q '"status": "in-progress"' "$USTATE" 2>/dev/null; then
+        : # a live run — the in-progress line above reports it
+      elif [[ -n "${PANEL_UPDATE_INSIDE:-}" ]]; then
+        ok "update lock held by this run itself (pre-snapshot doctor — expected)"
+      else
         bad "update lock held with no in-progress update (leftover process?)"
-        hint "pgrep -af '08-update.sh|09-rollback.sh' — kill it if it is stale, then: make doctor"
+        hint "holder: sudo fuser -v /opt/panel/.update.lock — kill it if it is a leftover from an interrupted run, then: make doctor"
       fi
     else
       exec 8>&-
