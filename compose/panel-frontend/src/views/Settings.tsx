@@ -99,14 +99,13 @@ function AutoUpdateCard({ intervalMs }: { intervalMs: number }) {
         )}
         {data?.state?.status === 'in-progress' && <span className="t-warn"> · update in progress</span>}
       </p>
-      <div className="btns">
-        <button onClick={() => toggle(false)} disabled={busy || enabled == null}>
-          disable
-        </button>
-        <button onClick={() => toggle(true)} disabled={busy || enabled == null}>
-          enable
-        </button>
-      </div>
+      {enabled !== null && (
+        <div className="btns">
+          <button onClick={() => toggle(!enabled)} disabled={busy}>
+            {enabled ? 'disable' : 'enable'}
+          </button>
+        </div>
+      )}
     </div>
   )
 }
