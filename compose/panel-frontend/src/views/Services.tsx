@@ -46,9 +46,12 @@ export default function Services({ intervalMs }: { intervalMs: number }) {
     intervalMs,
   )
   // The defined set only changes via `make update` — poll slower than the
-  // container list. With a panel-do binary that predates list-services this
-  // 500s; the section simply stays hidden instead of erroring the whole view.
-  const svcs = usePoll(() => api<{ services: StackService[] }>('/stack-services'), 15_000)
+  // container list, and never faster than the user's interval (same data-
+  // budget rule as the update views: a metered phone sees this effectively on
+  // load; action buttons refresh it immediately anyway). With a panel-do
+  // binary that predates list-services this 500s; the section simply stays
+  // hidden instead of erroring the whole view.
+  const svcs = usePoll(() => api<{ services: StackService[] }>('/stack-services'), Math.max(15_000, intervalMs))
 
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>(loadCollapsed)
   function setCatOpen(cat: string, open: boolean) {

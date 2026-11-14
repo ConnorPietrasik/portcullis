@@ -10,6 +10,13 @@
 # make deploy remains the FIRST-BOOT path; a Day-2 re-run of it applies config
 # ungated and warns. Details: docs/RUNBOOK.md → Updates.
 #
+# The snapshot records repo_root (this checkout's path) + repo_head (git HEAD,
+# when it is a repo) in the state file: that registration is how the
+# auto-update (panel-do update-run — dashboard button or daily timer) re-runs
+# THIS script, detached, via update_maybe_detach (common.sh). The update never
+# touches git: the auto path floats the lines; the clone only moves when the
+# admin edits it.
+#
 # Env:
 #   UPDATE_HEALTH_TIMEOUT=600   health-gate budget (seconds) — one knob for the
 #                               update's final gate and EVERY rollback re-gate:
@@ -21,6 +28,9 @@
 #                               every update.
 set -euo pipefail
 source "$(dirname "$(realpath "$0")")/common.sh"
+# panel-do's update-run/-force launch this script with --detach: re-exec in a
+# new session and return to the caller in seconds (update_maybe_detach).
+update_maybe_detach "$@"
 need docker
 need flock
 need npm

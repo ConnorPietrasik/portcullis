@@ -1,0 +1,21 @@
+[Unit]
+Description=panel auto-update — fire the gated make-update via panel-do (update-run)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Root, directly into panel-do: the single privileged path stays intact (the
+# action validates the clone + script, then runs the very same 08-update.sh a
+# manual `make update` runs — doctor precondition, snapshot, gates,
+# auto-rollback), and the full audit lands in THIS unit's journal.
+# update-run makes the script self-detach (setsid + /opt/panel/.update-run.log)
+# and returns within seconds, so this oneshot finishes fast even though the
+# update itself runs for minutes — including the step that restarts panel-api.
+ExecStart=/usr/local/libexec/panel-do update-run
+TimeoutStartSec=10min
+# A skipped tick (dirty clone, or an update already running) exits 75
+# (EX_TEMPFAIL): an expected decline, not a fault — treat it as a clean exit
+# so the oneshot never enters the failed state. The reason is panel-do's
+# SKIPPED line in this unit's journal (panel-do exit 75, see main.go).
+SuccessExitStatus=TEMPFAIL

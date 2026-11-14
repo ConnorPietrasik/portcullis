@@ -67,6 +67,24 @@ whatever `panel-do --list` reports, so the registry can never drift from what th
 startup — it refuses to run unless it is at the pinned path, root-owned, and not group/other-writable, so a swapped or loosened
 binary fails at runtime, not just at install time.
 
+**Auto-update: the same gated command, unattended.** The daily auto-update (`panel-autoupdate.timer` →
+`panel-do update-run`) is *not* a second update path — it re-runs `setup/08-update.sh`, the identical script `make update`
+runs, with the identical doctor precondition, snapshot, health + doctor gates and auto-rollback; the `flock` in the script
+makes a double-fire a no-op. Two new trust facts. (1) **The auto path never pulls code** — no git is in the loop: it floats
+image/npm/pip lines within their declared ranges and applies only what the server clone already holds. The clone moves only
+when the admin edits it, majors are deliberate edits (the panel flags a line whose major version moved), and the admin who
+edits the clone already has sudo — the clone is trusted by definition. (2) **The clone to run from is self-registered** —
+every `make update` writes `repo_root` (+ `repo_head`) into the root-written state file, and every auto-exec re-validates the
+registered clone the way `panel-do` validates itself: the script, its `setup/` directory, and every
+ancestor directory up to `/` must not be group/other-writable and must not be owned by the `panel` user — a writable directory in the
+chain would let a local user delete-and-replace a script root executes on the next tick. The check, not the ownership, is the control (which is why the
+repo is *not* chowned to root: the admin's clone stays the admin's). The long work self-detaches before doing anything (new
+session, root run log) — an update takes tens of minutes and restarts panel-api mid-run, so the trigger must not sit in its
+process tree; the state file and run log are the control plane the dashboard reads (in-progress banner with the live log
+tail, MAJOR badges on the last update's before→after, rolled-back alert), and a dirty clone is skipped rather than
+applied — a clone whose cleanness cannot be verified is refused outright (fail closed) — keeping in-progress edits a
+manual decision.
+
 **Authelia groups.** `admins` (you) → panel; `friends` → e.g. Jellyfin; public demos bypass Authelia entirely and do their own auth;
 everything else on any subdomain requires a logged-in user. Rule order matters (first match wins) and the bare-domain `bypass` sits
 **last** so new subdomains are private by default.

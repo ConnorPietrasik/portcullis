@@ -999,6 +999,124 @@ else
   warn "fstrim.timer not active — SSDs skip weekly TRIM"; hint "sudo systemctl enable --now fstrim.timer (RUNBOOK → Hardening)"
 fi
 
+# ── auto-update ──────────────────────────────────────────────────────────────
+# The update state file (the dashboard's control plane) + the clone's
+# auto-exec safety when the timer is enabled. Read-only — the lock probe
+# takes and releases the flock immediately (a held lock can only mean a live
+# run, which the in-progress status below explains).
+section "auto-update (update state + timer)"
+USTATE=/opt/panel/.update-state
+if [[ -f $USTATE ]]; then
+  if python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$USTATE" 2>/dev/null; then
+    ok "update state file parses"
+    # Stuck in-progress: the update process died without finishing (power
+    # loss, kill). Snapshot + log survive; the fix is manual.
+    stuck="$(python3 -c '
+import calendar, json, sys, time
+try:
+    d = json.load(open(sys.argv[1]))
+    if d.get("status") != "in-progress":
+        sys.exit(0)
+    ts = (d.get("snapshot") or "")[:15]  # 20250107T012345 — UTC
+    print(max(0, int(time.time() - calendar.timegm(time.strptime(ts, "%Y%m%dT%H%M%S")))))
+except Exception:
+    pass' "$USTATE" 2>/dev/null)"
+    if [[ -n ${stuck:-} && $stuck -gt 7200 ]]; then
+      bad "update stuck in-progress for ${stuck}s"
+      hint "the update process died mid-run: sudo tail /opt/panel/.update-run.log, pgrep -af '08-update.sh|09-rollback.sh' — kill the leftover, then: make rollback (or re-run make update)"
+    elif [[ ${stuck:-0} -gt 0 ]]; then
+      ok "update in progress (${stuck}s in) — the gates + auto-rollback finish it"
+    fi
+  else
+    bad "update state file is corrupt"
+    hint "sudo rm /opt/panel/.update-state and re-run: make update (it re-snapshots)"
+  fi
+  # A held lock with no in-progress status means a leftover process keeps the
+  # fd open (flock releases on process exit). The probe only runs on the real
+  # file — a fallback open (e.g. /dev/null) would make flock fail and
+  # false-positive.
+  if [[ -f /opt/panel/.update.lock ]] && exec 8</opt/panel/.update.lock 2>/dev/null; then
+    if ! flock -n 8 2>/dev/null; then
+      exec 8>&-
+      if ! grep -q '"status": "in-progress"' "$USTATE" 2>/dev/null; then
+        bad "update lock held with no in-progress update (leftover process?)"
+        hint "pgrep -af '08-update.sh|09-rollback.sh' — kill it if it is stale, then: make doctor"
+      fi
+    else
+      exec 8>&-
+    fi
+  fi
+  if systemctl is-enabled --quiet panel-autoupdate.timer 2>/dev/null; then
+    repo="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("repo_root",""))' "$USTATE" 2>/dev/null)"
+    if [[ -z $repo ]]; then
+      bad "auto-update timer enabled but no repo_root registered in the state"
+      hint "run: make update (from the server clone) once to register it"
+    elif [[ $repo != /* ]]; then
+      # panel-do's validUpdatePath rejects a non-absolute repo_root at runtime;
+      # mirror it HERE too — the ancestor walk below would otherwise loop on a
+      # relative path (dirname "x" → "." → "." …) if the dir exists. Only a
+      # hand-edited state file can hold one (snapshot_stack always writes the
+      # absolute REPO_ROOT).
+      bad "update state holds a non-absolute repo_root ($repo) — the state was hand-edited"
+      hint "sudo rm /opt/panel/.update-state, then: make update (it re-registers the clone)"
+    elif [[ ! -d $repo ]]; then
+      bad "registered clone $repo is gone"
+      hint "re-clone, copy .env + compose/authelia/users_database.yml, run: make update (RUNBOOK → Auto-updates)"
+    else
+      # The SAME checks panel-do's update-run makes before EVERY auto-exec:
+      # the script, its setup/ dir, and every ancestor directory up to / must
+      # not be group/other-writable (a writable dir ANYWHERE in the chain =
+      # delete-and-replace the clone or the script) and not be owned by the
+      # panel user; 08/09 must be executable with the repo's bash shebang.
+      #
+      # NOTE: bash's file tests do NOT mean group/other-writable — [[ -g ]]
+      # is the setgid bit and [[ -o ]]/"-o" means "owned by the effective
+      # user" — so the writable check reads the octal mode bits directly
+      # (stat -c %a), exactly like panel-do's Mode()&0o022.
+      mode_gw_or_ow() { # arg: octal mode; true if the group- or other-write bit is set
+        local m="$1"
+        (( (8#${m: -2:1} & 2) || (8#${m: -1:1} & 2) ))
+      }
+      mode_any_exec() { # arg: octal mode; true if ANY execute bit is set
+        local m="$1"
+        (( (8#${m: -3:1} | 8#${m: -2:1} | 8#${m: -1:1}) & 1 ))
+      }
+      panel_uid="$(id -u panel 2>/dev/null)"
+      clone_ok=1
+      d="$repo"
+      while :; do
+        m="$(stat -c %a "$d" 2>/dev/null)"
+        if [[ ! -d $d || -z $m ]] || mode_gw_or_ow "$m" \
+           || [[ -n $panel_uid && "$(stat -c %u "$d" 2>/dev/null)" == "$panel_uid" ]]; then
+          clone_ok=0; break
+        fi
+        [[ $d == / ]] && break
+        d="$(dirname "$d")"
+      done
+      script_ok=1
+      for s in 08-update.sh 09-rollback.sh; do
+        p="$repo/setup/$s"
+        m="$(stat -c %a "$p" 2>/dev/null)"
+        if [[ ! -f $p || -z $m ]] || mode_gw_or_ow "$m" || ! mode_any_exec "$m" \
+           || [[ -n $panel_uid && "$(stat -c %u "$p" 2>/dev/null)" == "$panel_uid" ]] \
+           || [[ "$(head -n1 "$p" 2>/dev/null)" != "#!/usr/bin/env bash" ]]; then
+          script_ok=0; break
+        fi
+      done
+      if (( clone_ok )) && (( script_ok )); then
+        ok "registered clone $repo is auto-update safe (private directory chain, scripts executable with the bash shebang)"
+      else
+        bad "registered clone $repo fails panel-do's auto-exec check"
+        hint "the clone, its setup/, and every directory above them must be writable only by you (and root) and not owned by the panel user; 08/09-update.sh must be executable with the '#!/usr/bin/env bash' first line (both committed — re-pull the repo if missing)"
+      fi
+    fi
+  else
+    skip "auto-update timer not enabled (install: make autoupdate, then the panel's Settings or systemctl enable --now panel-autoupdate.timer)"
+  fi
+else
+  skip "no update state yet (make update has never run on this host — nothing to check)"
+fi
+
 # ── summary ──────────────────────────────────────────────────────────────────
 section "summary"
 printf '  %d pass, %d fail, %d warn, %d skip\n' "$pass" "$fail" "$warnn" "$skipn"

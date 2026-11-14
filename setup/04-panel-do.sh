@@ -113,5 +113,15 @@ else
   die "  FAIL: llm-live disagrees with the host — host has: [$(echo $want_live | tr '\n' ' ')] llm-live: [$(echo $got_live | tr '\n' ' ')]"
 fi
 
+# update-report must emit valid JSON even before the first update (no state
+# file yet, no images) — the dashboard polls it unconditionally.
+if sudo -u panel sudo -n /usr/local/libexec/panel-do update-report | python3 -c 'import json,sys
+d = json.load(sys.stdin)
+assert isinstance(d, dict) and "services" in d and "log_tail" in d and "timer_enabled" in d'; then
+  info "  ok: update-report emits valid JSON"
+else
+  die "  FAIL: update-report did not emit valid JSON"
+fi
+
 info "panel-do installed. /api/actions in the panel now works."
 echo "  registry: sudo -u panel sudo -n /usr/local/libexec/panel-do --list | python3 -m json.tool"

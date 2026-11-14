@@ -1,0 +1,17 @@
+[Unit]
+Description=Daily gated stack update (floating images + npm/pip within declared ranges)
+
+[Timer]
+# On boot, after docker/ufw have a moment to come up. If anything is still
+# down, the update's own doctor precondition aborts BEFORE touching anything
+# and the next daily tick picks it up — a racy boot can never half-apply.
+# OnBootSec= is measured from the LAST boot: a box that was off for days
+# updates on its next boot, not a day after. (Do NOT add Persistent= here to
+# "fix" that — it only means anything for OnCalendar= timers, per
+# systemd.timer(5); it would be a dead knob.)
+OnBootSec=2min
+OnUnitActiveSec=24h
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

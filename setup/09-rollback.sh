@@ -18,8 +18,13 @@
 # but changed BEHAVIOR (the gates only see health — a broken new `latest`
 # build is green to both). The next `make update` re-snapshots the reverted
 # build as the new anchor.
+#
+# Like 08-update.sh, it accepts --detach as the first arg (panel-do's
+# update-rollback action): re-exec in a new session, log to
+# /opt/panel/.update-run.log, return to the caller in seconds.
 set -euo pipefail
 source "$(dirname "$(realpath "$0")")/common.sh"
+update_maybe_detach "$@"
 need docker
 need flock
 need python3

@@ -52,9 +52,12 @@ function ActionCard({ a }: { a: ActionInfo }) {
   )
 }
 
-export default function Actions() {
-  // Registry changes rarely; poll slower than the metrics view.
-  const { data, error } = usePoll(() => api<{ actions: ActionInfo[] }>('/actions'), 60_000)
+export default function Actions({ intervalMs }: { intervalMs: number }) {
+  // The registry only changes when the panel-do binary updates — 60 s on
+  // desktop, and never faster than the user's interval (a metered phone sees
+  // it effectively on load; no in-view refresh is needed, the list is static
+  // between panel-do reinstalls).
+  const { data, error } = usePoll(() => api<{ actions: ActionInfo[] }>('/actions'), Math.max(60_000, intervalMs))
 
   if (error) return <div className="banner err">actions: {error}</div>
   if (!data) return <div className="banner">loading…</div>

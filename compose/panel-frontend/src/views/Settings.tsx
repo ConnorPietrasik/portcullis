@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
 import { usePoll } from '../usePoll'
-import type { LLMSettings } from '../types'
+import type { ActionResult, LLMSettings, UpdateReport } from '../types'
 
 function stateClass(state: 'up' | 'down' | 'unknown' | string): string {
   if (state === 'up') return 'badge ok'
@@ -39,6 +39,74 @@ export default function Settings({
         </p>
       </div>
       <LLMRouterCard intervalMs={intervalMs} />
+      <AutoUpdateCard intervalMs={intervalMs} />
+    </div>
+  )
+}
+
+function AutoUpdateCard({ intervalMs }: { intervalMs: number }) {
+  // timer_enabled comes from the update-report poll (panel-do asks
+  // systemctl): null when the unit isn't installed (`make autoupdate`).
+  // Same data-budget rule as Overview: never faster than the user's interval.
+  const { data, refresh } = usePoll(() => api<UpdateReport>('/update'), Math.max(30_000, intervalMs))
+  const [busy, setBusy] = useState(false)
+  const enabled = data?.timer_enabled ?? null
+
+  const toggle = async (on: boolean) => {
+    // The registry's Confirm:true is honored by the Actions view only — this
+    // card POSTs directly, so it confirms itself. Enable gets the extra line:
+    // systemd elapses a past-due OnBootSec immediately on activation, so on a
+    // box already up the first tick (a gated update-run) starts at once.
+    if (
+      !window.confirm(
+        on
+          ? 'enable the daily auto-update timer?\n\nit fires 2 min after boot + daily — on a box that is already up, the first tick fires immediately (the same gated, auto-rolling-back make update; a dirty clone skips)'
+          : 'disable the daily auto-update timer?',
+      )
+    )
+      return
+    setBusy(true)
+    try {
+      const r = await api<ActionResult>('/action/autoupdate-toggle', {
+        method: 'POST',
+        body: JSON.stringify({ args: [on ? 'on' : 'off'] }),
+      })
+      if (!r.ok) window.alert(r.stderr || r.stdout)
+      await refresh()
+    } catch (e) {
+      window.alert(String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="card">
+      <h3>auto-update</h3>
+      <p className="muted">
+        Re-runs <code>make update</code> daily (and after boot): floating container images, panel-web's build
+        bases, npm/pip within their declared ranges — with the same doctor precondition, snapshot, health gate and
+        auto-rollback as a manual run. It applies only what the server clone holds — no git pull; a dirty clone is
+        skipped, and majors only land when you commit them.
+      </p>
+      <p className="muted">
+        {enabled == null ? (
+          'timer not installed — run <code>make autoupdate</code> on the server'
+        ) : enabled ? (
+          <b className="t-ok">enabled</b>
+        ) : (
+          <b className="t-warn">disabled</b>
+        )}
+        {data?.state?.status === 'in-progress' && <span className="t-warn"> · update in progress</span>}
+      </p>
+      <div className="btns">
+        <button onClick={() => toggle(false)} disabled={busy || enabled == null}>
+          disable
+        </button>
+        <button onClick={() => toggle(true)} disabled={busy || enabled == null}>
+          enable
+        </button>
+      </div>
     </div>
   )
 }

@@ -46,7 +46,7 @@ export default function App() {
           {tab === 'Overview' && <Overview intervalMs={intervalMs} />}
           {tab === 'Services' && <Services intervalMs={intervalMs} />}
           {tab === 'GPUs' && <Gpus intervalMs={intervalMs} />}
-          {tab === 'Actions' && <Actions />}
+          {tab === 'Actions' && <Actions intervalMs={intervalMs} />}
           {tab === 'Settings' && <Settings intervalMs={intervalMs} onChange={changeInterval} />}
         </Suspense>
       </main>

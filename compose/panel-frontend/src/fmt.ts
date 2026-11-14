@@ -90,6 +90,14 @@ export function clockOf(t: number): string {
   return new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 }
 
+/** An update snapshot ts ("20250107T012345Z" — UTC) as a local date-time. */
+export function updateTs(ts: string | null | undefined): string {
+  if (!ts) return '—'
+  const m = ts.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z?$/)
+  if (!m) return ts
+  return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6])).toLocaleString()
+}
+
 export interface Trend {
   arrow: '' | '▲' | '▼'
   text: string

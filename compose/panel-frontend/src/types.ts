@@ -182,3 +182,67 @@ export interface ActionResult {
   stdout: string
   stderr: string
 }
+
+// ── auto-update (panel-do update-* actions; see panel-api /api/update*) ───────
+// A before→after row of the LAST update, classified by panel-api.
+export type UpdateChange =
+  | 'major' // a deliberate line edit landed: the leading version integer moved
+  | 'minor' // same major, new version — a patch/minor release floated in
+  | 'moved' // registry image without a version label (radiance/searxng `latest`)
+  | 'rebuilt' // locally built image (panel-web) — a new build, no upstream
+  | 'unchanged'
+  | 'removed' // the service no longer has a container after the update
+  | 'changed' // no comparable version on one side
+
+export interface UpdateRow {
+  service: string
+  pre_image: string
+  pre_tags: string
+  pre_version: string | null
+  post_image: string | null
+  post_version: string | null
+  state: string
+  change: UpdateChange
+}
+
+export interface UpdateReport {
+  /** the raw state file (null before the first update) */
+  state: {
+    snapshot?: string
+    status?: string
+    repo_root?: string
+    repo_head?: string
+    services?: Record<string, { image_id: string; rollback_image: string; image_tags: string }>
+  } | null
+  /** the daily timer's state (null when the unit isn't installed) */
+  timer_enabled: boolean | null
+  services: UpdateRow[]
+  /** ANSI-stripped tail of /opt/panel/.update-run.log (the in-progress view) */
+  log_tail: string
+}
+
+/** One changed line of what the NEXT update would apply. */
+export interface PreviewChange {
+  kind: 'image' | 'base' | 'npm' | 'pip'
+  name: string
+  old: string
+  new: string
+  change: UpdateChange
+}
+
+export interface UpdatePreview {
+  repo_root: string
+  deployed_head: string | null
+  clone_head: string | null
+  deployed_at: string | null
+  status: string | null
+  commits: string[]
+  /** the FULL pending-commit count (`commits` is capped at the last 30) */
+  commit_count: number
+  /** `git status --porcelain` — non-empty ⇒ the auto-update skips */
+  dirty: string[]
+  /** set when the clone is a git checkout whose status cannot be read —
+   *  the auto-update REFUSES it (fail closed); only "run anyway" applies it */
+  git_error: string | null
+  changes: PreviewChange[]
+}

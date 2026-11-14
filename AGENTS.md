@@ -26,7 +26,7 @@ when you change the behavior they explain.
 
 | path | what |
 |---|---|
-| `setup/` | idempotent bash, numeric run order
+| `setup/` | idempotent bash, numeric run order; `11-autoupdate.sh` installs the auto-update timer (disabled by default)
 | `compose/` | edge stack → `/opt/panel`: `docker-compose.yml` (traefik, authelia, panel-web, portfolio, `llm-*` fleet via the `x-llm-base` anchor), `traefik/dynamic/*.yml` (routes — file provider, hot-reloaded), `authelia/configuration.yml` (+ `users_database.yml.example`), `panel-frontend/` (React+TS+Vite UI, multi-stage Dockerfile), `portfolio/` |
 | `panel-api/` | FastAPI host service → `/opt/panel-api`, user `panel`, binds `172.17.0.1:8010` (docker0 gateway): `main.py` (metrics, containers, actions, LLM fallback router), `llm_gpus.py` (GPU pool: ledger/override/allocation), `llm_autostart.py` (boot oneshot), `panel-api.service` + `llm-autostart.service` |
 | `panel-do/` | Go whitelist dispatcher → `/usr/local/libexec/panel-do` — the ONLY privileged path (`sudo -n panel-do`) |
@@ -68,6 +68,12 @@ change, not a refactor. The "why" for each is in `docs/ARCHITECTURE.md`.
    include `-f /opt/panel-api/llm-gpu-override.yml`** (the GPU pool's pins) —
    `panel-do` actions and `setup/common.sh` already do; a render without it
    pins fallback cards and shows up as drift in the GPU view.
+8. **The auto-update re-runs `setup/08-update.sh` verbatim — no second update
+   path** (no git pull: it floats the lines and applies what the server clone
+   holds). The `panel-do` `update-*` actions re-validate the self-registered
+   clone (state file's `repo_root`) before every exec — mode/owner/shebang,
+   walking the whole directory chain up to `/` (a writable ancestor dir =
+   replaceable clone); don't `chown` the clone to root.
 
 ## Workflows (repo edit → sync → RUNBOOK section for the details)
 
@@ -97,5 +103,5 @@ change, not a refactor. The "why" for each is in `docs/ARCHITECTURE.md`.
 - The `edge` network is `external: true` and **auto-subnetted** at creation —
   derive the subnet wherever it's needed; never hardcode `172.18.0.0/16`.
 - `make update` does not touch: majors in any line, `panel-do` / `panel-ddns`
-  (stdlib-only — their update is a repo edit + their make target), or host OS
-  packages.
+  (stdlib-only — their update is a repo edit + their make target), the auto-update
+  timer (`make autoupdate`), or host OS packages.

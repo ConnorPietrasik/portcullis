@@ -355,6 +355,11 @@ STACK_LOCK_FILE=/opt/panel/.update.lock
 ROLLBACK_TAG_PREFIX=portcullis-rollback
 ROLLBACK_RETAIN_DAYS=14
 SNAPSHOT_DIR_PREFIX=/opt/panel/.update-snapshot-   # + <ts>: panel-api copy + npm files
+# Append-only log of every DETACHED run (panel-do update-run / update-rollback
+# / the timer). Root-owned 0600 — update_maybe_detach enforces the mode (a
+# default umask would leave it 0644); written by the root context only, and
+# the panel-do update-report action (root) tails it for the dashboard.
+UPDATE_RUN_LOG=/opt/panel/.update-run.log
 
 update_snapshot_dir() { # <ts> → that snapshot's dir
   echo "${SNAPSHOT_DIR_PREFIX}$1"
@@ -417,6 +422,52 @@ update_acquire_lock() {
     || die "cannot create lock file $STACK_LOCK_FILE"
   exec 9>>"$STACK_LOCK_FILE" || die "cannot open lock file $STACK_LOCK_FILE"
   flock -n 9 || die "another update/rollback is already running (lock: $STACK_LOCK_FILE — wait for it, or kill the other run)"
+}
+
+# --detach support for panel-do (update-run / update-run-force / update-rollback):
+# the caller passes --detach as the FIRST arg and the script re-execs itself in
+# its own session (setsid) with its output appended to $UPDATE_RUN_LOG, and the
+# caller's copy returns within seconds. An update takes tens of minutes AND
+# restarts panel-api — the caller in the panel-initiated case — mid-run, so the
+# trigger must not sit in its process tree. `make update` / `make rollback`
+# pass no flag and stay attached, streaming to the terminal as before.
+#
+# The lock is probed BEFORE detaching so "already running" fails fast and
+# visibly instead of the detached child dying two seconds after launch. The
+# probe is racy by design: the worst case is one child dying on the real
+# update_acquire_lock (recorded in $UPDATE_RUN_LOG) — never a double update.
+# Called with its own positional args, right after sourcing common.sh.
+update_maybe_detach() { # [--detach] [args…]
+  [[ $# -ge 1 && "$1" == "--detach" && -z "${PANEL_UPDATE_DETACHED:-}" ]] || return 0
+  shift
+  need setsid
+  [[ -f "$STACK_LOCK_FILE" ]] || sudo install -m 666 /dev/null "$STACK_LOCK_FILE" \
+    || die "cannot create lock file $STACK_LOCK_FILE"
+  exec 9>>"$STACK_LOCK_FILE" || die "cannot open lock file $STACK_LOCK_FILE"
+  if ! flock -n 9; then
+    exec 9>&-
+    die "another update/rollback is already running (lock: $STACK_LOCK_FILE — wait for it, or kill the other run)"
+  fi
+  exec 9>&-
+  # Keep the log bounded: one update's output is small (KB–100s of KB); .old
+  # preserves the previous detached run for comparison.
+  if [[ -f "$UPDATE_RUN_LOG" ]] && (( $(stat -c%s "$UPDATE_RUN_LOG") > 1048576 )); then
+    mv -f "$UPDATE_RUN_LOG" "${UPDATE_RUN_LOG}.old"
+  fi
+  # 0600 by construction: the tail reaches the dashboard via panel-do (root),
+  # nothing else needs the file.
+  if [[ -f "$UPDATE_RUN_LOG" ]]; then
+    sudo chmod 600 "$UPDATE_RUN_LOG" || die "cannot chmod $UPDATE_RUN_LOG 0600"
+  else
+    sudo install -m 600 /dev/null "$UPDATE_RUN_LOG" || die "cannot create $UPDATE_RUN_LOG"
+  fi
+  # --detach is consumed HERE: the child re-runs the plain command (the marker
+  # env makes its own update_maybe_detach a no-op), so 09's $1=WHAT parsing
+  # never sees the flag.
+  setsid env PANEL_UPDATE_DETACHED=1 bash "$0" "$@" </dev/null >>"$UPDATE_RUN_LOG" 2>&1 &
+  disown
+  info "launched detached (pid $!) — log: $UPDATE_RUN_LOG (tail -f to follow)"
+  exit 0
 }
 
 sudo_warm() { # re-warm the sudo timestamp so long operations don't prompt mid-run
@@ -506,6 +557,18 @@ snapshot_stack() {
     lines+="${svc}|${image_id}|${ROLLBACK_TAG_PREFIX}/${svc}:${ts}|${image_tags}"$'\n'
   done
   tmp="$(mktemp)"
+  # The clone this run came from: how the auto-update (panel-do update-run) finds
+  # the checkout — registered by every run, not configured. repo_head (git only —
+  # absent when the checkout isn't a repo) is what the dashboard's update
+  # preview diffs against.
+  repo_head=""
+  if command -v git >/dev/null 2>&1; then
+    # -c safe.directory: the auto run executes this as ROOT in the admin-owned
+    # clone (scrubbed env, no SUDO_UID) — without it, git ≥2.35.2 dies with
+    # "detected dubious ownership" and repo_head is silently lost (the
+    # preview's commit diff needs it). No-op for the admin's manual runs.
+    repo_head="$(git -c safe.directory="$REPO_ROOT" -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)"
+  fi
   printf '%s' "$lines" | python3 -c '
 import json, sys
 svcs = {}
@@ -515,9 +578,12 @@ for line in sys.stdin:
         parts = line.split("|")
         svcs[parts[0]] = {"image_id": parts[1], "rollback_image": parts[2],
                           "image_tags": parts[3] if len(parts) > 3 else ""}
-json.dump({"snapshot": sys.argv[1], "status": "in-progress", "services": svcs},
-          open(sys.argv[2], "w"), indent=2)
-' "$ts" "$tmp"
+d = {"snapshot": sys.argv[1], "status": "in-progress", "services": svcs,
+     "repo_root": sys.argv[3]}
+if sys.argv[4]:
+    d["repo_head"] = sys.argv[4]
+json.dump(d, open(sys.argv[2], "w"), indent=2)
+' "$ts" "$tmp" "$REPO_ROOT" "$repo_head"
   sudo install -m 644 "$tmp" "$STACK_STATE_FILE"
   rm -f "$tmp"
   # Global consumed by setup/08-update.sh (which sources this file) —
@@ -713,6 +779,7 @@ npm_bump_panel_frontend() {
       die "npm install --package-lock-only failed — the running stack is untouched; fix the registry/network issue and re-run: make update"
     fi
     info "npm: no lockfile on this server yet — generated it from the declared ranges (server-local state, not committed)"
+    npm_restore_clone_ownership "$fe"
     return 0
   fi
   # --package-lock-only: a plain `npm update` also materializes node_modules
@@ -723,6 +790,21 @@ npm_bump_panel_frontend() {
     die "npm update failed — the running stack is untouched; fix the registry/network issue and re-run: make update"
   fi
   info "npm: $(tail -n1 <<<"$out")"
+  npm_restore_clone_ownership "$fe"
+}
+
+# A root run (the auto-update via panel-do) must not leave root-owned npm files
+# behind in the admin-owned clone: the next MANUAL `make update`'s npm would
+# EACCES on a root-owned lockfile. Restore the build-context dir's ownership;
+# a non-root run (the normal make update) is already the owner — no-op.
+npm_restore_clone_ownership() { # <panel-frontend dir>
+  local fe="$1" f
+  [[ "$(id -u)" == "0" ]] || return 0
+  for f in "$fe/package.json" "$fe/package-lock.json"; do
+    if [[ -f $f ]]; then
+      sudo chown --reference="$fe" "$f" || warn "could not restore clone ownership of $f"
+    fi
+  done
 }
 
 # Wait for panel-api to be active and serving (0 yes; 1 no — reason in

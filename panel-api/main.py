@@ -903,6 +903,283 @@ def run_action(name: str, body: ActionBody, _admin: Optional[str] = Depends(requ
     }
 
 
+# ─────────────────────────────── updates ────────────────────────────
+# The stack's update lifecycle is panel-do's work (update-run / -force /
+# -report / -preview / -rollback — see panel-do/main.go). This section adds
+# only the HTTP shape and the MAJOR classification the dashboard badges off.
+# The long work is detached INSIDE the update script (its step 6 restarts
+# THIS service — the trigger must not be in its process tree), so every call
+# here returns in seconds. The update state file (/opt/panel/.update-state,
+# root-written) is the control plane: every `make update` registers
+# repo_root (+ repo_head) and the pre-update snapshot, and update-report joins
+# that snapshot against the running stack.
+
+
+def _first_int(s: Optional[str]) -> Optional[int]:
+    """First digit run of a version-ish string: '3.7.9'→3, 'v3'→3,
+    '22-alpine'→22, '>=0.115,<1'→0. None when there are no digits at all
+    (`latest`, `stable-alpine`) — those lines have no major to compare
+    (RUNBOOK → Updates, "The lines")."""
+    if not s:
+        return None
+    m = re.search(r"\d+", s)
+    return int(m.group(0)) if m else None
+
+
+def _classify_change(old: str, new: str) -> str:
+    """major / minor / changed / unchanged for a version pair: major = the
+    leading integer moved, minor = same major, changed = no comparable
+    integer on one side."""
+    if old == new:
+        return "unchanged"
+    if not old or not new:
+        return "changed"
+    po, pn = _first_int(old), _first_int(new)
+    if po is None or pn is None:
+        return "changed"
+    return "major" if po != pn else "minor"
+
+
+def _image_tag(ref: str) -> str:
+    """'traefik:v3' → 'v3' — the comparable part (the registry host carries
+    no version)."""
+    return ref.rsplit(":", 1)[1] if ":" in ref else ""
+
+
+def _read_text_or_empty(p: str) -> str:
+    try:
+        return Path(p).read_text()
+    except OSError:
+        return ""
+
+
+def _parse_compose_images(text: str) -> dict[str, str]:
+    """service → image ref from a compose file. Line-based (this file is
+    hand-kept at 2/4-indent): an explicit `image:` wins, a `<<: *anchor` merge
+    resolves to the anchor's own image (the x-llm-base pattern — llm-* fleet
+    instances carry no image line of their own)."""
+    anchors: dict[str, str] = {}
+    images: dict[str, str] = {}
+    svc_anchor: dict[str, str] = {}
+    section = None
+    service = None
+    for raw in text.splitlines():
+        # inline comments stripped (compose allows `value # comment`) — the
+        # radiance line depends on it
+        line = raw.split(" #", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        key = line.strip()
+        if indent == 0:
+            section, service = None, None
+            m = re.match(r"^x-([A-Za-z0-9_-]*):\s*&([A-Za-z0-9_-]+)\s*$", key)
+            if m:
+                section = f"anchor:{m.group(2)}"
+                anchors[m.group(2)] = ""
+            elif key.endswith(":"):
+                section = "services" if key.rstrip(":") == "services" else "other"
+        elif section == "services" and indent == 2 and key.endswith(":"):
+            service = key[:-1].strip()
+            svc_anchor.setdefault(service, "")
+        elif section and section.startswith("anchor:") and indent == 2:
+            if key.startswith("image:"):
+                anchors[section[7:]] = key.split(":", 1)[1].strip()
+        elif section == "services" and indent == 4 and service is not None:
+            if key.startswith("image:"):
+                images[service] = key.split(":", 1)[1].strip()
+            elif key.startswith("<<:"):
+                m = re.search(r"\*([A-Za-z0-9_-]+)", key)
+                if m:
+                    svc_anchor[service] = m.group(1)
+    for service, alias in svc_anchor.items():
+        if service not in images and anchors.get(alias):
+            images[service] = anchors[alias]
+    return images
+
+
+def _parse_froms(text: str) -> list[str]:
+    """FROM bases of a Dockerfile, in stage order."""
+    out = []
+    for line in text.splitlines():
+        m = re.match(r"^\s*FROM\s+(\S+)", line, re.IGNORECASE)
+        if m:
+            out.append(m.group(1))
+    return out
+
+
+def _parse_ranges(text: str) -> dict[str, str]:
+    """name → declared range from a requirements.txt line set."""
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"^([A-Za-z0-9._-]+)\s*(\S.*)$", line)
+        if m:
+            out[m.group(1)] = m.group(2)
+    return out
+
+
+def _npm_deps(text: str) -> dict[str, str]:
+    try:
+        d = json.loads(text)
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(d, dict):
+        return {}
+    return {**d.get("dependencies", {}), **d.get("devDependencies", {})}
+
+
+def _classify_update_row(s: dict[str, Any], images: dict[str, str]) -> str:
+    """One update-report row (images = the deployed compose's service → image
+    refs, parsed once by the caller):
+      removed    — no container for the service after the update
+      unchanged  — running image is the pre-update image (byte-identical)
+      rebuilt    — a locally built image (no `image:` in compose): the
+                   version IS the build, there is no upstream to compare
+      major      — the registry image's leading version integer moved: a
+                   deliberate line edit — this is what the notification is for
+      minor      — same major, new version: a patch/minor release floated in
+      moved      — a registry image without a comparable version label
+                   (radiance / searxng `latest` — a new build moved)
+    """
+    if s.get("post_image") is None:
+        return "removed"
+    if s["post_image"] == s.get("pre_image"):
+        return "unchanged"
+    if s["service"] not in images:
+        return "rebuilt"
+    if s.get("pre_version") is None or s.get("post_version") is None:
+        return "moved"
+    return _classify_change(s["pre_version"], s["post_version"])
+
+
+def _preview_changes(data: dict[str, Any]) -> list[dict[str, str]]:
+    """What the next update would move: the clone's line files (from panel-do
+    — the clone is NOT panel-readable: its users_database.yml holds argon2
+    hashes) vs the deployed copies (readable here: the sync keeps them 0644).
+    One row per changed line; the dashboard highlights every `major`."""
+    files = data.get("files") or {}
+    changes: list[dict[str, str]] = []
+
+    dep = _parse_compose_images(_read_text_or_empty("/opt/panel/docker-compose.yml"))
+    new = _parse_compose_images(files.get("compose") or "")
+    for svc in sorted(set(dep) | set(new)):
+        old, nw = dep.get(svc, ""), new.get(svc, "")
+        if old != nw:
+            changes.append({"kind": "image", "name": svc, "old": old, "new": nw,
+                            "change": _classify_change(_image_tag(old), _image_tag(nw))})
+
+    depf = _parse_froms(_read_text_or_empty("/opt/panel/panel-frontend/Dockerfile"))
+    newf = _parse_froms(files.get("dockerfile") or "")
+    for i in range(max(len(depf), len(newf))):
+        old = depf[i] if i < len(depf) else ""
+        nw = newf[i] if i < len(newf) else ""
+        if old != nw:
+            changes.append({"kind": "base", "name": f"panel-web FROM #{i + 1}", "old": old, "new": nw,
+                            "change": _classify_change(_image_tag(old), _image_tag(nw))})
+
+    depn = _npm_deps(_read_text_or_empty("/opt/panel/panel-frontend/package.json"))
+    newn = _npm_deps(files.get("package_json") or "")
+    for pkg in sorted(set(depn) | set(newn)):
+        old, nw = depn.get(pkg, ""), newn.get(pkg, "")
+        if old != nw:
+            changes.append({"kind": "npm", "name": pkg, "old": old, "new": nw,
+                            "change": _classify_change(old, nw)})
+
+    depp = _parse_ranges(_read_text_or_empty("/opt/panel-api/requirements.txt"))
+    newp = _parse_ranges(files.get("requirements") or "")
+    for pkg in sorted(set(depp) | set(newp)):
+        old, nw = depp.get(pkg, ""), newp.get(pkg, "")
+        if old != nw:
+            changes.append({"kind": "pip", "name": pkg, "old": old, "new": nw,
+                            "change": _classify_change(old, nw)})
+    return changes
+
+
+def _update_fetch(name: str) -> dict[str, Any]:
+    try:
+        proc = _sudo_panel_do(name, [], 60.0)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        raise HTTPException(500, f"panel-do {name}: {e}") from e
+    if proc.returncode != 0:
+        raise HTTPException(500, f"{name} failed: {proc.stderr.strip()[-300:]}")
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError as e:
+        raise HTTPException(502, f"{name}: bad JSON: {e}") from e
+    if not isinstance(data, dict):
+        raise HTTPException(502, f"{name}: expected a JSON object")
+    return data
+
+
+def _update_action(name: str, user: Optional[str], timeout: float) -> dict[str, Any]:
+    """Run a fast (detached-launch) update action. Expected outcomes —
+    skipped-dirty, already running (panel-do exit 75, EX_TEMPFAIL) — come
+    back as ok:false with the skip message, not a 5xx: the UI renders them,
+    they are not server faults. (The timer's unit maps 75 → clean exit via
+    SuccessExitStatus; the reason stays in its journal.)"""
+    try:
+        proc = _sudo_panel_do(name, [], timeout)
+    except subprocess.TimeoutExpired as e:
+        _audit(user, name, [], "timeout")
+        raise HTTPException(504, f"{name} timed out") from e
+    except OSError as e:
+        _audit(user, name, [], "spawn-error")
+        raise HTTPException(500, f"sudo failed: {e}") from e
+    err = _err_detail(proc) if proc.returncode else ""
+    _audit(user, name, [], proc.returncode, err)
+    return {
+        "ok": proc.returncode == 0,
+        "exit_code": proc.returncode,
+        "stdout": proc.stdout[-4000:],
+        "stderr": proc.stderr[-4000:],
+    }
+
+
+class UpdateRunBody(BaseModel):
+    # force = the panel's "run anyway" (the clone has uncommitted changes):
+    # panel-do's update-run-force (same gates, no dirty-skip).
+    force: bool = False
+
+
+@app.post("/api/update")
+def update_run(body: UpdateRunBody, _admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
+    # Returns in seconds: the panel-do action launches the update script
+    # DETACHED (it re-execs itself in a new session — the update's step 6
+    # restarts this very service, so the trigger cannot be in its tree).
+    name = "update-run-force" if body.force else "update-run"
+    return _update_action(name, _admin, 120.0)
+
+
+@app.post("/api/update/rollback")
+def update_rollback(_admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
+    return _update_action("update-rollback", _admin, 120.0)
+
+
+@app.get("/api/update")
+def update_status(_admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
+    # The dashboard's control-plane poll: the last update's before→after,
+    # classified here (the presentation layer — panel-do emits raw facts).
+    data = _update_fetch("update-report")
+    images = _parse_compose_images(_read_text_or_empty("/opt/panel/docker-compose.yml"))
+    for row in data.get("services", []):
+        row["change"] = _classify_update_row(row, images)
+    return data
+
+
+@app.get("/api/update/preview")
+def update_preview(_admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
+    data = _update_fetch("update-preview")
+    data["changes"] = _preview_changes(data)
+    # `files` is the raw line files panel-do read from the clone (the diff
+    # input just consumed, ~20 KB) — not dashboard data. Stripping it keeps
+    # the payload from riding every poll to a phone on metered data.
+    data.pop("files", None)
+    return data
+
+
 # ─────────────────────────── LLM fallback router ─────────────────────────────
 # llm.pietrasik.top → this service (router in traefik/dynamic/llm.yml). Routes
 # OpenAI-style /v1/* to the FIRST instance that's up in the admin-configured

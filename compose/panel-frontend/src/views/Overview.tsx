@@ -18,7 +18,7 @@ import { api } from '../api'
 import { usePoll } from '../usePoll'
 import { useHistory, seriesOf, tail } from '../history'
 import type { Sample } from '../history'
-import type { ContainerInfo, Disk, Gpu, LLMSettings, Metrics, Sensor } from '../types'
+import type { ActionResult, ContainerInfo, Disk, Gpu, LLMSettings, Metrics, Sensor, UpdatePreview, UpdateReport } from '../types'
 import {
   axis,
   bitsPerSec,
@@ -31,6 +31,7 @@ import {
   spread,
   tone as toneOf,
   trend,
+  updateTs,
   uptime,
 } from '../fmt'
 import type { Tone } from '../fmt'
@@ -125,6 +126,65 @@ export default function Overview({ intervalMs }: { intervalMs: number }) {
   const { data, error, last } = usePoll(() => api<Metrics>('/metrics'), intervalMs)
   const hist = useHistory(data)
   const now = useNow(500)
+  // Auto-update: the report is the control-plane poll (state file + live
+  // images — cheap, and the in-progress banner tails the run log through it),
+  // the preview is what the NEXT update would apply (local git + file facts).
+  // Neither is essential — a failure costs a banner/card, never the metrics.
+  // Respect the user's data budget (Settings → refresh interval): the update
+  // polls never run FASTER than the chosen interval. The 10 s / 30 s floors
+  // only apply at the fast desktop default — on a phone set to minutes- or
+  // hours (metered data) the update views refresh at that cadence too, i.e.
+  // effectively on load; the in-progress log tail then shows a snapshot, not
+  // a live feed. Button actions refresh immediately regardless (below).
+  const upd = usePoll(() => api<UpdateReport>('/update'), Math.max(10_000, intervalMs))
+  const prev = usePoll(() => api<UpdatePreview>('/update/preview'), Math.max(30_000, intervalMs))
+  const [updBusy, setUpdBusy] = useState(false)
+
+  const runUpdate = async (force: boolean) => {
+    const majors = (prev.data?.changes ?? []).filter((c) => c.change === 'major')
+    const dirty = (prev.data?.dirty ?? []).length > 0
+    const gitError = prev.data?.git_error ?? null
+    const msg =
+      'run the stack update now?\n\n' +
+      (prev.data == null || prev.error != null
+        ? // The preview poll failed (or never succeeded) — don't claim a
+          // clean preview the API could not confirm; the action re-checks
+          // the clone itself (dirty skips, unreadable status refuses).
+          'the pending-changes preview could not be read just now — the update still re-checks the clone (a dirty one skips, an unreadable status refuses)\n\n'
+        : majors.length > 0
+          ? `MAJOR changes pending:\n${majors.map((m) => `  ${m.kind} ${m.name}: ${m.old} → ${m.new}`).join('\n')}\n\n`
+          : 'no MAJOR line changes detected\n') +
+      (force && dirty ? 'the server clone has uncommitted changes — they will be applied too.\n\n' : '') +
+      (force && gitError != null
+        ? 'the server clone’s git status is UNREADABLE — the auto-update refuses it; this applies the working tree as-is.\n\n'
+        : '') +
+      'The update is gated (health + doctor) and auto-rolls-back on failure.'
+    if (!window.confirm(msg)) return
+    setUpdBusy(true)
+    try {
+      const r = await api<ActionResult>('/update', { method: 'POST', body: JSON.stringify({ force }) })
+      if (!r.ok) window.alert(r.stderr || r.stdout)
+      await upd.refresh()
+    } catch (e) {
+      window.alert(String(e))
+    } finally {
+      setUpdBusy(false)
+    }
+  }
+
+  const rollbackUpdate = async () => {
+    if (!window.confirm('roll the stack back to the pre-update snapshot?')) return
+    setUpdBusy(true)
+    try {
+      const r = await api<ActionResult>('/update/rollback', { method: 'POST' })
+      if (!r.ok) window.alert(r.stderr || r.stdout)
+      await upd.refresh()
+    } catch (e) {
+      window.alert(String(e))
+    } finally {
+      setUpdBusy(false)
+    }
+  }
 
   const windowN = Math.max(30, Math.min(300, Math.round(300_000 / intervalMs)))
   const intervalS = intervalMs / 1000
@@ -146,6 +206,7 @@ export default function Overview({ intervalMs }: { intervalMs: number }) {
     <div className={`ov${stale ? ' stale' : ''}`}>
       {error && <div className="banner err">metrics: {error} — showing the last good sample</div>}
       {!error && data == null && <div className="banner">reading /sys and /proc…</div>}
+      <UpdateBanners report={upd.data} preview={prev.data} busy={updBusy} onRun={runUpdate} onRollback={rollbackUpdate} />
 
       <div className="ov-bar">
         <h2 className="host">{data?.host?.hostname ?? 'host'}</h2>
@@ -204,8 +265,247 @@ export default function Overview({ intervalMs }: { intervalMs: number }) {
           spanLabel={spanLabel}
         />
         <FleetCard intervalMs={intervalMs} />
+        <UpdatesCard report={upd.data} busy={updBusy} onRun={runUpdate} onRollback={rollbackUpdate} />
       </div>
     </div>
+  )
+}
+
+// ─────────────────────────────── updates ─────────────────────────────
+// The auto-update's notification surface:
+//   banner (transient) — in progress · update available (MAJOR highlighted) ·
+//                        failed + rolled back
+//   UpdatesCard (always) — the last update's before→after with badges
+// All state comes from /api/update + /api/update/preview (panel-do actions).
+// The long work is detached inside the update script — its step 6 restarts
+// panel-api, so the banner survives the blip and re-polls on the other side.
+
+const changeBadge: Record<string, string> = {
+  major: 'badge err',
+  removed: 'badge warn',
+  changed: 'badge warn',
+  minor: 'badge',
+  moved: 'badge',
+  rebuilt: 'badge',
+  unchanged: 'badge',
+}
+
+function UpdateBanners({
+  report,
+  preview,
+  busy,
+  onRun,
+  onRollback,
+}: {
+  report: UpdateReport | null
+  preview: UpdatePreview | null
+  busy: boolean
+  onRun: (force: boolean) => void
+  onRollback: () => void
+}) {
+  const status = report?.state?.status
+  if (status === 'in-progress') {
+    return (
+      <div className="banner">
+        <b>update in progress</b> — started {updateTs(report?.state?.snapshot)} · gated (health +
+        doctor), auto-rolls-back on failure · the API may blip while panel-api itself updates
+        {report?.log_tail && <pre className="out">{report.log_tail}</pre>}
+      </div>
+    )
+  }
+  if (status === 'rolled-back' || status === 'partially-rolled-back') {
+    return (
+      <div className="banner err">
+        <b>
+          the last update {status === 'rolled-back' ? 'failed and was rolled back' : 'failed — rollback was only PARTIAL'}
+        </b>{' '}
+        {updateTs(report?.state?.snapshot)}{' '}
+        <button onClick={onRollback} disabled={busy}>
+          re-run rollback
+        </button>{' '}
+        <button onClick={() => onRun(true)} disabled={busy}>
+          re-run update
+        </button>
+        {report?.log_tail && <pre className="out">{report.log_tail}</pre>}
+      </div>
+    )
+  }
+  const commits = preview?.commits ?? []
+  const lineChanges = (preview?.changes ?? []).filter((c) => c.change !== 'unchanged')
+  const dirty = (preview?.dirty ?? []).length > 0
+  const gitError = preview?.git_error ?? null
+  if (preview && (commits.length > 0 || lineChanges.length > 0 || dirty || gitError != null)) {
+    const majors = lineChanges.filter((c) => c.change === 'major')
+    // commit_count is the FULL pending count — the commits list is capped at
+    // the last 30 for display.
+    const commitCount = Math.max(preview.commit_count ?? 0, commits.length)
+    const hasChanges = commits.length > 0 || lineChanges.length > 0 || dirty
+    return (
+      <div className="banner warn">
+        <b>{hasChanges ? 'update available' : 'clone problem'}</b>
+        {commits.length > 0 && (
+          <span>
+            {' '}— {commitCount} pending commit{commitCount > 1 ? 's' : ''} on the server clone
+          </span>
+        )}
+        {lineChanges.length > 0 && (
+          <span> · {lineChanges.map((c) => `${c.name} ${c.old} → ${c.new}`).join(', ')}</span>
+        )}
+        {dirty && <span> · uncommitted changes in the clone</span>}
+        {gitError != null && (
+          <span title={gitError}>
+            {' '}· <b className="t-crit">clone git status unreadable</b> — the auto-update refuses an
+            unverifiable clone
+          </span>
+        )}
+        {majors.length > 0 && (
+          <span className="badge err" title={majors.map((m) => `${m.kind} ${m.name}: ${m.old} → ${m.new}`).join('\n')}>
+            MAJOR ×{majors.length}
+          </span>
+        )}
+        {' '}
+        <button
+          onClick={() => onRun(false)}
+          disabled={busy || dirty || gitError != null}
+          title={
+            dirty
+              ? 'the clone has uncommitted changes — commit them, or use “run anyway”'
+              : gitError != null
+                ? 'git status is unreadable — the action will refuse; “run anyway” applies the working tree as-is, deliberately'
+                : undefined
+          }
+        >
+          {dirty ? 'run (clone dirty)' : gitError != null ? 'run (status unreadable)' : 'run now'}
+        </button>
+        {(dirty || gitError != null) && (
+          <button
+            onClick={() => onRun(true)}
+            disabled={busy}
+            title="applies the working tree as-is (the daily auto-update skips a dirty clone and refuses an unreadable one)"
+          >
+            run anyway
+          </button>
+        )}
+      </div>
+    )
+  }
+  return null
+}
+
+function UpdatesCard({
+  report,
+  busy,
+  onRun,
+  onRollback,
+}: {
+  report: UpdateReport | null
+  busy: boolean
+  onRun: (force: boolean) => void
+  onRollback: () => void
+}) {
+  const [open, setOpen] = useState(() => {
+    try {
+      return localStorage.getItem('panel.ov.updates') === '1'
+    } catch {
+      return false
+    }
+  })
+  useEffect(() => {
+    try {
+      localStorage.setItem('panel.ov.updates', open ? '1' : '0')
+    } catch {
+      /* storage unavailable */
+    }
+  }, [open])
+
+  const status = report?.state?.status
+  const rows = report?.services ?? []
+  const changed = rows.filter((r) => r.change !== 'unchanged')
+  const majors = rows.filter((r) => r.change === 'major')
+  const inProgress = status === 'in-progress'
+
+  return (
+    <section className="panelish">
+      <header>
+        <h3 onClick={() => setOpen(!open)} style={{ cursor: 'pointer' }} title="last update's before→after — click to expand">
+          updates {open ? '▾' : '▸'}
+        </h3>
+        <span className="note">
+          {status == null && 'no update run yet'}
+          {inProgress && <b className="t-warn">in progress…</b>}
+          {status === 'updated' && <b className="t-ok">{updateTs(report?.state?.snapshot)}</b>}
+          {(status === 'rolled-back' || status === 'partially-rolled-back') && (
+            <b className="t-crit">{status}</b>
+          )}
+          {majors.length > 0 && <span className="badge err">MAJOR ×{majors.length}</span>}
+        </span>
+      </header>
+      {open && (
+        <div className="sub">
+          <p className="note">
+            {report?.state?.repo_root ? (
+              <>
+                deployed {report.state.repo_head ? <code>{report.state.repo_head.slice(0, 7)}</code> : 'from the server clone'} ·{' '}
+                <code>{report.state.repo_root}</code> — the auto-update re-runs <code>make update</code> from it (gated,
+                auto-rollback; it never git-pulls)
+              </>
+            ) : (
+              <>
+                no update state yet — run <code>make update</code> once; the auto-update (daily timer + the button
+                below) then re-runs it, gated, with auto-rollback
+              </>
+            )}
+          </p>
+          {rows.length > 0 && (
+            <table>
+              <thead>
+                <tr>
+                  <th>service</th>
+                  <th>before</th>
+                  <th>after</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {changed.map((r) => (
+                  <tr key={r.service}>
+                    <td>{r.service}</td>
+                    <td className="dim">{r.pre_version || r.pre_tags.split(' ')[0] || '—'}</td>
+                    <td className="dim">{r.post_version || (r.post_image ? 'new image' : 'no container')}</td>
+                    <td>
+                      <span className={changeBadge[r.change] ?? 'badge'}>{r.change === 'major' ? 'MAJOR' : r.change}</span>
+                    </td>
+                  </tr>
+                ))}
+                {changed.length === 0 && (
+                  <tr>
+                    <td colSpan={4} className="dim">
+                      nothing changed in the last update
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          )}
+          {report?.log_tail && (
+            <details>
+              <summary className="note">run log</summary>
+              <pre className="out">{report.log_tail}</pre>
+            </details>
+          )}
+          <div className="btns">
+            {!inProgress && (
+              <button onClick={() => onRun(false)} disabled={busy}>
+                run update
+              </button>
+            )}
+            <button onClick={onRollback} disabled={busy || status == null}>
+              rollback last
+            </button>
+          </div>
+        </div>
+      )}
+    </section>
   )
 }
 

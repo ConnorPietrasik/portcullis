@@ -330,6 +330,67 @@ Mechanics in `setup/08-update.sh` (shared helpers in `setup/common.sh`):
   tags a pull is an upgrade, so image movement only happens through `make update` (gated). A Day-2 re-run of it applies config
   ungated and warns.
 
+## Auto-updates
+
+`make update` is manual by default. The auto-update re-runs the **same** command (same doctor precondition, snapshot, gates,
+auto-rollback) on a schedule and from the panel, so nothing that has a line to float goes stale:
+
+```bash
+make autoupdate   # installs panel-autoupdate.{service,timer} — DISABLED by default
+```
+
+Then enable from the panel (Settings → auto-update → enable) or `systemctl enable --now panel-autoupdate.timer`. The timer
+fires 2 min after the LAST boot (so a box that was off for days updates on its next boot, not a day after) and daily
+(+10 min jitter), and each
+tick is:
+
+```
+panel-do update-run  →  setup/08-update.sh --detach   (the exact same make update, in its own session)
+```
+
+- **What it keeps fresh** — everything in the **lines** table above: floating container images (traefik/authelia/nginx
+  patch+minor security releases; the full `latest` movement of radiance + searxng), panel-web's build bases, npm deps within
+  `package.json`'s ranges, pip deps within `requirements.txt`'s ranges, plus any committed-but-unapplied change in the server
+  clone (and a re-anchor after a targeted rollback).
+- **What it does NOT do**: no `git pull` — the clone only moves when *you* edit it (when you're at the computer you can run a
+  manual update anyway). No majors — those are deliberate edits, and the panel flags a major in red when one lands (e.g.
+  `authelia 4 → 5`, `node base 22 → 24`). No host OS packages. `panel-do` / `panel-ddns` still update only via a repo edit +
+  their make target.
+- **Registration**: every `make update` records `repo_root` (+ `repo_head` when the checkout is a git repo) in
+  `/opt/panel/.update-state`; the auto-update runs from the **last clone you ran `make update` from**. Moved the clone? Run a
+  manual `make update` from the new location once to re-register it.
+- **Dirty clone = skip**: uncommitted changes in the clone make a tick skip (the panel shows why). A skipped tick —
+  or one that fires while an update is already running — exits 75 (EX_TEMPFAIL) and counts as a **success** for the
+  timer (`SuccessExitStatus=` in the unit), so `journalctl -u panel-autoupdate` shows panel-do's SKIPPED line, not a
+  failed unit. A git checkout whose status **cannot be read** (a corrupt index —
+  e.g. power loss or an interrupted git write) makes the tick **fail**, not skip — fail
+  closed: an unverifiable working tree is never applied unattended — the
+  panel's Overview banner flags it ("clone git status unreadable"). (A leftover
+  `.git/index.lock` alone is handled by the skip path above.) The
+  panel's *run anyway*
+  button (and a manual `make update`) apply the working tree as-is — that is the deliberate path for in-progress edits.
+- **Dashboard notifications** (Overview): a blue banner while an update runs (with the live run-log tail — panel-api restarts
+  mid-update, so the API blips for a few seconds; the banner survives it), an amber *update available* banner listing the
+  pending commits / line changes with a red **MAJOR** badge when a line's major version moves, a red banner when an update
+  fails and rolls back (plus *re-run rollback* / *re-run update* buttons), and a collapsed *updates* card with the last
+  update's before→after rows.
+- **Observability**: the run log is `/opt/panel/.update-run.log` (rotated to `.old` past 1 MB); the timer's own journal:
+  `journalctl -u panel-autoupdate`; `make doctor` checks the state file, a stuck in-progress run, a stale lock, and — when
+  the timer is enabled — the clone's auto-exec safety (the same checks the action makes).
+- **First deploy of this feature**: `git pull` in the server clone (08/09 gain the committed exec bit + `--detach`),
+  `make panel-do` (the new actions + the update-report smoke test — first, so the panel's update endpoints exist as
+  soon as the new UI ships), `make update` (records `repo_root`, installs the new panel-api + UI), `make autoupdate`
+  (the timer, disabled), and enable it from the panel.
+
+| Symptom | Diagnosis / fix |
+|---|---|
+| panel: "no update state yet" / tick fails "no update state" | `make update` has never run from a clone on this host — run it once |
+| auto-run skipped: "uncommitted changes in the clone" | commit (or discard) the clone's changes — or the panel's *run anyway* |
+| tick fails: "clone … is a git checkout but git status failed" | the clone's index is unreadable/corrupt (power loss or an interrupted git write) — inspect/fix the clone (worst case: re-clone + re-copy `.env`/`users_database.yml`), then re-run; *run anyway* applies the working tree as-is, deliberately |
+| action fails: "update state holds an invalid repo_root" | the state file was hand-edited — `sudo rm /opt/panel/.update-state`, then `make update` |
+| doctor: "update stuck in-progress" | the update process died mid-run — `sudo tail /opt/panel/.update-run.log`, `pgrep -af '08-update.sh\|09-rollback.sh'`, kill the leftover, then `make rollback` |
+| doctor: clone "fails panel-do's auto-exec check" | the clone, its `setup/`, or a directory ABOVE the clone became group/other-writable (or is owned by `panel`) — `chmod go-w` it; `08/09-update.sh` not executable, panel-owned, or missing the bash shebang → re-pull the repo (exec bit + shebang are committed) |
+
 ## Add an app
 
 Two edits in this repo, then `make update`. Traefik is file-provider only — it never reads docker labels, so every app needs a route

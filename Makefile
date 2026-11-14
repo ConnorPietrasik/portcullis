@@ -1,4 +1,4 @@
-.PHONY: preflight secrets deploy api panel-do ddns promote stack status logs verify doctor update rollback
+.PHONY: preflight secrets deploy api panel-do ddns promote stack status logs verify doctor update rollback autoupdate
 
 preflight:
 	bash setup/00-preflight.sh
@@ -53,6 +53,12 @@ update:
 ## images; everything else stays in place.
 rollback:
 	bash setup/09-rollback.sh $(WHAT)
+
+## autoupdate: install the daily auto-update timer (DISABLED by default — the
+## gated make-update via panel-do; enable from the panel's Settings or with
+## systemctl enable --now panel-autoupdate.timer). Idempotent.
+autoupdate:
+	bash setup/11-autoupdate.sh
 
 ## local sanity checks (no server needed): shell syntax + python syntax
 verify:

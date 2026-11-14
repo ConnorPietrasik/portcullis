@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
-/** Poll `fn` every `intervalMs`; keeps `fn` fresh via a ref (no stale closures). */
+/**
+ * Poll `fn` every `intervalMs`; keeps `fn` fresh via a ref (no stale closures).
+ *
+ * Pauses while the tab is hidden (phone lock, another tab, a minimized
+ * window) — the data-budget control: nothing polls while it can't be seen.
+ * Becoming visible triggers an immediate refresh, so the view is current the
+ * moment you return: "once per load" becomes "once per (re)appearance".
+ */
 export function usePoll<T>(fn: () => Promise<T>, intervalMs: number) {
   const fnRef = useRef(fn)
   fnRef.current = fn
@@ -32,9 +39,27 @@ export function usePoll<T>(fn: () => Promise<T>, intervalMs: number) {
   }, [])
 
   useEffect(() => {
-    void refresh()
-    const t = window.setInterval(() => void refresh(), Math.max(250, intervalMs))
-    return () => window.clearInterval(t)
+    let t: number | undefined
+    const stop = () => {
+      if (t !== undefined) {
+        window.clearInterval(t)
+        t = undefined
+      }
+    }
+    const start = () => {
+      stop() // guard against double-start (visible→visible events)
+      void refresh()
+      t = window.setInterval(() => void refresh(), Math.max(250, intervalMs))
+    }
+    // A tab restored already-hidden (mobile tab restore) polls nothing until
+    // it is actually shown — its first refresh comes from the visibility event.
+    if (!document.hidden) start()
+    const onVis = () => (document.hidden ? stop() : start())
+    document.addEventListener('visibilitychange', onVis)
+    return () => {
+      stop()
+      document.removeEventListener('visibilitychange', onVis)
+    }
   }, [intervalMs, refresh])
 
   return { data, error, last, refresh, adopt }
