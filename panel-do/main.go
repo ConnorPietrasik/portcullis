@@ -222,9 +222,12 @@ var llmServiceRe = regexp.MustCompile(`^llm-[a-z0-9][a-z0-9-]{0,62}$`)
 
 // llmFleet lists the deployed stack's LLM fleet instances (services named
 // llm-*) and the number of cards each one needs — the GPU pool's static
-// half. cards comes from the llm.cards label (explicit, keep == --tp),
-// falling back to the --tp flag in the instance's command (tensor
-// parallelism = card count), then 1. JSON array on stdout; read-only, no args.
+// half. cards comes from the llm.cards label ALONE (== tp in the instance's
+// radiance config): radiance 2.x takes its settings from a YAML file, so the
+// pre-2.x --tp flag the old fallback read is gone from the command — a
+// missing or invalid label is an error, not a one-card guess (doctor
+// cross-checks the label against the config at update time). JSON array on
+// stdout; read-only, no args.
 func llmFleet(ctx context.Context, args []string, logf func(string, ...any)) error {
 	out, err := runCmd(ctx, "/usr/bin/docker", "compose", "--project-directory", "/opt/panel",
 		"-f", "/opt/panel/docker-compose.yml", "config", "--format", "json")
@@ -233,11 +236,7 @@ func llmFleet(ctx context.Context, args []string, logf func(string, ...any)) err
 	}
 	var cfg struct {
 		Services map[string]struct {
-			// command is emitted as a string OR a token list depending on the
-			// compose version — accept both (same drift-tolerance as labels
-			// in composeLabel). Raw here; tokenized in tensorParallel.
-			Command json.RawMessage `json:"command"`
-			Labels  json.RawMessage `json:"labels"`
+			Labels json.RawMessage `json:"labels"`
 		} `json:"services"`
 	}
 	if err := json.Unmarshal([]byte(out), &cfg); err != nil {
@@ -257,14 +256,13 @@ func llmFleet(ctx context.Context, args []string, logf func(string, ...any)) err
 		if display == "" || display == "true" {
 			display = name
 		}
-		cards := 0
-		if v := composeLabel(s.Labels, "llm.cards"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n > 0 {
-				cards = n
-			}
-		}
-		if cards == 0 {
-			cards = tensorParallel(commandTokens(s.Command))
+		// The label is the ONLY source of the card need (radiance 2.x has no
+		// --tp left in the command to fall back to) — a missing or invalid
+		// one errors the whole fleet listing rather than grab one card for a
+		// four-card instance.
+		cards, err := strconv.Atoi(composeLabel(s.Labels, "llm.cards"))
+		if err != nil || cards <= 0 {
+			return fmt.Errorf("llm-fleet: %s has no positive llm.cards label — add it to the compose block (== tp in its radiance config)", name)
 		}
 		res = append(res, inst{name, display, cards})
 	}
@@ -275,37 +273,6 @@ func llmFleet(ctx context.Context, args []string, logf func(string, ...any)) err
 	}
 	fmt.Println(string(enc))
 	return nil
-}
-
-// commandTokens turns a compose `command` (string or token-list, per version)
-// into a token slice; nil when absent.
-func commandTokens(raw json.RawMessage) []string {
-	if len(raw) == 0 || string(raw) == "null" {
-		return nil
-	}
-	var tokens []string
-	if err := json.Unmarshal(raw, &tokens); err == nil {
-		return tokens
-	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err == nil {
-		return strings.Fields(s)
-	}
-	return nil
-}
-
-// tensorParallel reads the --tp value out of a compose command (a token list); 1
-// when the flag is absent (a single card).
-func tensorParallel(cmd []string) int {
-	for i := 0; i+1 < len(cmd); i++ {
-		if cmd[i] == "--tp" {
-			if n, err := strconv.Atoi(cmd[i+1]); err == nil && n > 0 {
-				return n
-			}
-			return 1
-		}
-	}
-	return 1
 }
 
 // llmLive reports the LIVE GPU holds of the fleet: for every llm-* container

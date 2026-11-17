@@ -121,9 +121,12 @@ fi
 # ── fleet routes ───────────────────────────────────────────────────────────────
 # A fleet instance is reachable only through its router pair in
 # traefik/dynamic/llm.yml: router <name> (rule Host(<sub>.pietrasik.top)) +
-# service <name> (url http://<name>:8000). Those four name references come
-# from a hand-copied block, and one wrong one leaves the container up but the
-# subdomain dead — silently. Both trees are checked: the repo's (make update
+# service <name> (url http://<name>:8000), and it runs only through its
+# radiance config (compose/llm-configs/<name>.yaml — radiance 2.x takes no
+# command-line flags, only --config). Those name references come from a
+# hand-copied block, and one wrong one leaves the container up but the
+# subdomain dead — silently — or the block red at panel-do llm-fleet.
+# Both trees are checked: the repo's (make update
 # refuses to run while this is red — doctor is its precondition) and the
 # deployed one (what actually routes). The llm-* prefix IS the instance
 # marker: the orphan check below assumes any llm-* router pairs with a
@@ -133,8 +136,11 @@ fi
 # reports as stale on purpose (rename it). fleet-open's Host() list is
 # checked separately: it must name every instance host (end of
 # fleet_routes).
+# The llm.cards label is the GPU pool's ONLY source of the instance's card
+# need (radiance 2.x: no --tp left in the command to fall back to) — a
+# missing label is checked here, not left to panel-do's runtime error.
 fleet_routes() { # <compose.yml> <llm.yml> <label>
-  local comp="$1" routes="$2" label="$3" svc sub orph
+  local comp="$1" routes="$2" label="$3" svc sub orph cards cfg tp
   local -a svcs
   mapfile -t svcs < <(grep -oE '^  llm-[a-z0-9][a-z0-9-]*:' "$comp" | sed 's/^  //; s/:$//' | sort -u)
   for svc in "${svcs[@]}"; do
@@ -150,6 +156,34 @@ fleet_routes() { # <compose.yml> <llm.yml> <label>
       hint "the subdomain would 503 — add the service block (loadBalancer → servers → url)"
     else
       ok "$label: $svc ↔ ${sub}.pietrasik.top (router + Host + url)"
+    fi
+    # The block's own lines: from its key to the next top-level service.
+    local block
+    block="$(awk -v start="  ${svc}:" 'index($0, start) == 1 {f=1; next} f && /^  [a-z0-9]/ {f=0} f' "$comp")"
+    # llm.cards — the pool's card-need source (panel-do llm-fleet errors
+    # without it, taking the whole GPUs view red with it).
+    cards="$(printf '%s\n' "$block" | grep -oE 'llm\.cards=[0-9]+' | head -n1 | cut -d= -f2)"
+    if ! [[ "${cards:-0}" =~ ^[1-9][0-9]*$ ]]; then
+      bad "$label: $svc (compose) has no positive llm.cards label (the GPU pool's card need)"
+      hint "add '- llm.cards=N' to the block — N == tp in compose/llm-configs/${svc}.yaml (radiance 2.x has no --tp to fall back to)"
+    fi
+    # The radiance config (2.x's ONLY settings surface) — mounted per block,
+    # named after the service; its tp must equal the label.
+    cfg="$(printf '%s\n' "$block" | grep -oE '\./llm-configs/[a-z0-9._-]+\.yaml' | head -n1)"
+    if [[ -z "$cfg" ]]; then
+      bad "$label: $svc (compose) mounts no radiance config (2.x runs on --config only)"
+      hint "add '- ./llm-configs/${svc}.yaml:/etc/radiance/radiance.yaml:ro' to the block's volumes"
+    elif [[ ! -f "$(dirname "$comp")/$cfg" ]]; then
+      bad "$label: $svc (compose) mounts $cfg, which does not exist"
+      hint "create compose/llm-configs/${svc}.yaml (copy a sibling; rename its model entry as needed)"
+    else
+      tp="$(grep -oE '^[[:space:]]*tp:[[:space:]]*[0-9]+' "$(dirname "$comp")/$cfg" | head -n1 | grep -oE '[0-9]+')"
+      if [[ -z "$tp" ]]; then
+        bad "$label: $cfg has no tp: key (the engine defaults to 1 — the card pin will not match)"
+      elif [[ -n "$cards" && "$tp" != "$cards" ]]; then
+        bad "$label: $svc — llm.cards=${cards} but $cfg says tp: ${tp} (the pool grabs a different count than the engine shards)"
+        hint "make them agree (the label == the config's tp)"
+      fi
     fi
   done
   while IFS= read -r orph; do

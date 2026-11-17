@@ -1,0 +1,41 @@
+# llm-27b-2 — radiance 2.x takes its settings from THIS file alone: the container's
+# command is `radiance --config /etc/radiance/radiance.yaml` (x-llm-base) — no flags.
+# A key is the pre-2.x flag minus its dashes, at its level (upstream
+# docs/MULTIMODEL.md §4; the full reference: `radiance --help`):
+#   server:  host / port / api-key(-env)
+#   memory:  gpu-headroom-mib
+#   models:  everything else, under one entry (the entry's name is the model id)
+#
+# The API key reaches the server through RADIANCE_API_KEY in the block's
+# environment (api-key-env) — it is never written into this file.
+#
+# Validate without serving:
+#   RADIANCE_API_KEY=<key> docker run --rm --entrypoint radiance \
+#     stilldeadcode/radiance:latest --config /dev/stdin --check < this-file
+#
+# NOTE: a config edit syncs to /opt/panel on `make update` but recreates
+# NOTHING (the mount path is unchanged) — radiance reads it once at start;
+# restart the instance from the panel's GPUs view to apply it.
+
+# bf16 KV (no kv-cache-dtype: the fp8 cache diverges on long contexts). VRAM holds
+# ~612k tokens; the host tier keeps evicted context for re-prefill: 40 GiB = 655k
+# tokens, so 6 x 200k realistic sessions (1.2M) stay resident-or-retained. Box has
+# 251 GiB RAM. (This math assumed bf16 KV; kv-cache-dtype: i8 would double it.)
+server:
+  host: 0.0.0.0
+  port: 8000
+  api-key-env: RADIANCE_API_KEY
+memory:
+  gpu-headroom-mib: 96
+models:
+  qwen3.8-27b:
+    model: /models/qwen3.8-27b-iq6r-s-v4.rad
+    tp: 2                        # == the block's llm.cards (doctor cross-checks)
+    max-num-seqs: 6
+    max-model-len: 250000
+    prefix-cache-mib: 40960      # the host tier — 0 (the default) turns it OFF
+    checkpoint-policy: tip-only  # kept from the pre-2.x line: bounds the snapshot
+                                 # store's pinned RAM (geometric-backoff keeps ~10
+                                 # per seq at this context)
+    num-speculative-tokens: 3
+    max-num-batched-tokens: 2048

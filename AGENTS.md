@@ -27,7 +27,7 @@ when you change the behavior they explain.
 | path | what |
 |---|---|
 | `setup/` | idempotent bash, numeric run order; `11-autoupdate.sh` installs the auto-update timer (disabled by default)
-| `compose/` | edge stack → `/opt/panel`: `docker-compose.yml` (traefik, authelia, panel-web, portfolio, `llm-*` fleet via the `x-llm-base` anchor), `traefik/dynamic/*.yml` (routes — file provider, hot-reloaded), `authelia/configuration.yml` (+ `users_database.yml.example`), `panel-frontend/` (React+TS+Vite UI, multi-stage Dockerfile), `portfolio/` |
+| `compose/` | edge stack → `/opt/panel`: `docker-compose.yml` (traefik, authelia, panel-web, portfolio, `llm-*` fleet via the `x-llm-base` anchor), `llm-configs/` (per-instance radiance 2.x settings YAML — the server runs on `--config` only, no flags), `traefik/dynamic/*.yml` (routes — file provider, hot-reloaded), `authelia/configuration.yml` (+ `users_database.yml.example`), `panel-frontend/` (React+TS+Vite UI, multi-stage Dockerfile), `portfolio/` |
 | `panel-api/` | FastAPI host service → `/opt/panel-api`, user `panel`, binds `172.17.0.1:8010` (docker0 gateway): `main.py` (metrics, containers, actions, LLM fallback router), `llm_gpus.py` (GPU pool: ledger/override/allocation), `llm_autostart.py` (boot oneshot), `panel-api.service` + `llm-autostart.service` |
 | `panel-do/` | Go whitelist dispatcher → `/usr/local/libexec/panel-do` — the ONLY privileged path (`sudo -n panel-do`) |
 | `ddns/` | stdlib-only Python + systemd timer/service → NameSilo apex A record |
@@ -89,11 +89,13 @@ change, not a refactor. The "why" for each is in `docs/ARCHITECTURE.md`.
 - **New privileged action**: one Go function + one registry entry in the
   `ACTIONS` section of `panel-do/main.go` → `make panel-do`.
   RUNBOOK → "Add a privileged action".
-- **New LLM instance**: copy an `llm-*` compose block (keep `llm.cards` ==
-  `--tp`, distinct display label) + its router pair in
+- **New LLM instance**: copy an `llm-*` compose block + its radiance config
+  in `compose/llm-configs/` (keep `llm.cards` == the config's `tp`, distinct
+  display label) + its router pair in
   `traefik/dynamic/llm.yml` + an `|| Host(...)` clause in the `fleet-open` rule —
-  five name references total; `make doctor` flags any that drift (it also flags the
-  v2-style multi-value `Host(a, b)` that Traefik v3 drops silently). →
+  six name references total; `make doctor` flags any that drift (it also flags the
+  v2-style multi-value `Host(a, b)` that Traefik v3 drops silently, and
+  cross-checks `llm.cards` against the config's `tp`). →
   `make update`. RUNBOOK → "LLM fleet".
 - **After editing a route**: client machines pin names with
   `tools/panel-hosts.sh` (the server re-pins itself as part of `make update`).

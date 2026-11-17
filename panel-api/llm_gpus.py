@@ -3,7 +3,9 @@
 Operator view: docs/RUNBOOK.md → "LLM fleet" → "GPU pool".
 
 - Each fleet instance (compose service ``llm-*``) needs a fixed number of
-  cards (its ``llm.cards`` label, else ``--tp`` in its command). The pool is
+  cards (its ``llm.cards`` label — radiance 2.x takes no flags, so the label
+  is the pool's only source; panel-do ``llm-fleet`` errors without it). The
+  pool is
   the host's whole card set (panel-api counts it from /sys). Pool indices
   are ROCR indices — what ROCR_VISIBLE_DEVICES counts in — NOT sysfs drm
   card numbers: on this host a non-GPU drm device takes card0, so the six
@@ -232,7 +234,8 @@ def holding_of(live: list[dict[str, Any]], service: str) -> list[int]:
 
 
 def cards_needed(defs: list[dict[str, Any]], service: str) -> Optional[int]:
-    """The instance's card count (llm.cards label, else --tp, else 1); None
+    """The instance's card count (its llm.cards label — required; the ``or 1``
+    is belt-and-braces, panel-do llm-fleet errors on a missing label); None
     when the service isn't a fleet instance in the deployed compose."""
     for d in defs:
         if d.get("name") == service:
@@ -293,7 +296,7 @@ def allocate(
         gpus = parse_cards(spec)
         if len(gpus) != n:
             raise ValueError(
-                f"{service} needs exactly {n} card(s) (its --tp), got {len(gpus)}: {_cards_str(gpus)}"
+                f"{service} needs exactly {n} card(s) (its llm.cards), got {len(gpus)}: {_cards_str(gpus)}"
             )
         if any(c >= cards_total for c in gpus):
             bad = max(c for c in gpus if c >= cards_total)
@@ -401,7 +404,7 @@ def autostart_warnings(ledger: dict[str, Any]) -> list[str]:
 
 def assignment_warnings(defs: list[dict[str, Any]], ledger: dict[str, Any]) -> list[str]:
     """Human-readable warnings for SAVED sets whose count no longer matches
-    the instance's card need (its llm.cards / --tp) — e.g. after a flag edit
+    the instance's card need (its llm.cards) — e.g. after a config edit
     without a re-assign. A GPU-aware start self-heals (plan_start re-grabs
     the right count and records it), but a hand-run compose would pin the
     old count and the engine would fail to load. Never fatal — reassign
@@ -423,6 +426,6 @@ def assignment_warnings(defs: list[dict[str, Any]], ledger: dict[str, Any]) -> l
         if len(saved) != need:
             out.append(
                 f"{name}: saved set {_cards_str(sorted(saved))} has {len(saved)} card(s) "
-                f"but the instance needs {need} (llm.cards / --tp) — reassign (auto) or fix the flag"
+                f"but the instance needs {need} (its llm.cards) — reassign (auto) or fix the label/config"
             )
     return out

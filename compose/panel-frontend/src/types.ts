@@ -156,7 +156,7 @@ export interface GpuPoolCard {
 export interface LlmGpuInstance {
   name: string
   display: string
-  /** cards this instance needs (llm.cards label, else --tp) */
+  /** cards this instance needs (its llm.cards label — the only source; radiance 2.x has no --tp) */
   cards_needed: number
   /** the ledger's assignment (intent) — null when never assigned */
   assigned: number[] | null

@@ -449,7 +449,7 @@ re-pins itself automatically as part of `make update` (see Updates).
 Machine APIs, not browser apps: no Authelia — the gate is the server's own API key (`Authorization: Bearer`) behind the wildcard cert
 + `llm-rate`; clients use `base_url=https://<name>.pietrasik.top/v1` + key, exactly like OpenAI.
 
-**An instance = a service block + a router pair**, deployed by `make update`: `llm-<name>` in `compose/docker-compose.yml` (merges
+**An instance = a service block + a radiance config + a router pair**, deployed by `make update`: `llm-<name>` in `compose/docker-compose.yml` (merges
 `x-llm-base`) ↔ `Host(`<name>.pietrasik.top`)` → `http://llm-<name>:8000` in `traefik/dynamic/llm.yml`. One subdomain per instance so
 agents pin the right server; the wildcard CNAME + cert make that zero DNS work. Port is always 8000 (own IP per container). The
 display name is the `panel.manage` label — **no commas** in it (`docker ps` encodes labels comma-joined and the Services view parses
@@ -458,8 +458,27 @@ for a new instance carries both labels with it.
 
 **Cards:** assigned at run time from the panel's **GPUs view** (a pool with auto-grab — see **GPU pool** below).
 The block's `ROCR_VISIBLE_DEVICES` is the FALLBACK default a hand-run compose
-would use, and the `llm.cards` label (== `--tp`) is how many cards the instance needs. Everything else in
+would use, and the `llm.cards` label (== the `tp` in the instance's radiance config) is how many
+cards the instance needs — REQUIRED: radiance 2.x takes no flags, so the label is the pool's only
+card-need source (doctor cross-checks it against the config; missing, the GPUs view errors instead
+of silently grabbing one card). Everything else in
 `x-llm-base` is identical for all instances.
+
+**Radiance config (2.x):** radiance 2.x takes NO command-line flags — the container's command is
+`radiance --config /etc/radiance/radiance.yaml` (in `x-llm-base`), and every setting is a YAML key in
+`compose/llm-configs/<instance>.yaml`, mounted per block (a block's `volumes` list REPLACES the
+anchor's — YAML `<<:` is shallow — so each block re-lists the `/models` mount). A key is the pre-2.x
+flag minus its dashes, at its level: `server:` holds `host` / `port` / `api-key(-env)`, `memory:` holds
+`gpu-headroom-mib`, the rest (`model`, `tp`, `max-num-seqs`, `max-model-len`, `prefix-cache-mib`,
+`checkpoint-policy`, ...) sit under the one entry in `models:` (upstream `docs/MULTIMODEL.md` §4;
+key reference: `radiance --help`). The API key reaches the server through `RADIANCE_API_KEY` in the
+block's environment (`api-key-env` in the file) — never written into the file itself. Validate a config
+without serving: `RADIANCE_API_KEY=<key> docker run --rm --entrypoint radiance
+stilldeadcode/radiance:latest --config /dev/stdin --check < compose/llm-configs/<instance>.yaml`.
+A config edit syncs with `make update` but recreates NOTHING (the mount path is unchanged) — radiance
+reads it once at start, so restart the instance from the GPUs view to apply it. Model containers:
+2.x REFUSES block-FP8 / MXFP4 / M2XFP4 / ParoQuant weights at startup (by the first such weight's
+name) — a refused model takes its int8/bf16 container (upstream README → Models).
 
 **`restart: "no"` on purpose:** after a reboot nothing LLM comes back by itself, EXCEPT the set you mark
 **boot** in the GPUs view (the boot-autostart list — applied by `llm-autostart.service`, see **GPU pool** below).
@@ -476,21 +495,25 @@ instances, or the revive pins the base-file fallback cards and shows up as drift
 After that the panel manages it as usual.
 
 **Add an instance** (including a second copy of a model — `llm-27b-1` next to `llm-27b`): copy the block
-(name, model, `llm.cards`, flags) + the router pair — four name references must all match (service key,
-router key, `Host(...)`, service `url`) + an `|| Host(`<name>.pietrasik.top`)` clause in the
+(name, `ROCR_VISIBLE_DEVICES` fallback, `llm.cards`), its config in `compose/llm-configs/`
+(named after the service — doctor checks the mount and the `tp` / `llm.cards` agreement), + the router
+pair — five name references must all match (service key, config mount, router key, `Host(...)`,
+service `url`) + an `|| Host(`<name>.pietrasik.top`)` clause in the
 `fleet-open` rule so the dashboard link works (Traefik v3's `Host()` takes ONE host — the v2
 comma-list form is a parse error it drops silently, doctor flags it); `make doctor` flags any of
-the five that don't (`fleet-open` routes to
+the six that don't (`fleet-open` routes to
 panel-api, not an instance, so it sits outside the instance-pairing checks — in llm.yml the
 `llm-*` prefix marks instance routers and `fleet-*` names shared ones — but its host list
 is verified against the compose services). Give the twins distinct display labels
 (append the instance name) so the Services view tells them apart. Then `git commit`, `make update`
 (deploys + pulls it, leaves it down) and start it — panel GPUs view → *start* (or the Services
 view → *defined, no container* → *create + start*, which for llm-* services goes through the same GPU-aware
-path). First load ~1 min on this hardware, shown in the panel. The flags in the committed blocks are this
-host's own tuning — the blocks are the truth, do not reconcile them against upstream. To trial a NEW model
-first: `git clone --depth 1` upstream, run its `deploy/compose/<model>.yaml` ad hoc (one at a time), delete
-the clone — its flags belong to the trial, not to a fleet block.
+path). First load ~1 min on this hardware (the 113 GiB flashnext container is longer — if it ever
+trips the update gate's 600s budget, raise that block's healthcheck `start_period` and
+`UPDATE_HEALTH_TIMEOUT` rather than re-running into the rollback), shown in the panel. The keys in the
+committed configs are this host's own tuning — the configs are the truth, do not reconcile them against
+upstream. To trial a NEW model first: `git clone --depth 1` upstream, run its `deploy/compose/<model>.yaml`
+ad hoc (one at a time), delete the clone — its keys belong to the trial, not to a fleet config.
 
 **Key:** one shared `LLM_API_KEY` for all instances (a key authorizes LLM use, not one instance). Rotate = edit `.env` +
 `make update` (radiance reads it at startup).
@@ -515,7 +538,9 @@ counts, cache, tok/s, ttft) are the chattiest thing on the box and carry nothing
 keeps errors + ROCm warnings. Raise one instance to `info` (or `debug`, `-v`) when debugging it. json-file rotation caps each
 instance at ~30 MB regardless (`x-logging`).
 
-**Updates:** a config-only update recreates nothing. When an update DOES recreate an instance (radiance moved on `latest`, block
+**Updates:** a config-only update recreates nothing — a radiance-config edit included (the mount path
+is unchanged; restart the instance from the GPUs view to apply it, see **Radiance config** above).
+When an update DOES recreate an instance (radiance moved on `latest`, block
 edited), its model reload (~1 min) sits inside the 5m healthcheck start_period, and the default 600s budget
 (`UPDATE_HEALTH_TIMEOUT`) covers both the update gate and the rollback re-gate — they share it — raise it only for a much slower
 model. A new build that is *healthy but behavior-breaking* is different — the gates can't see it: `make rollback WHAT=radiance`
@@ -555,7 +580,7 @@ registry carries `edge-ips` (catches the stale binary).
 The panel's **GPUs** tab is the control surface: a tile per card (free / held by whom, temp, VRAM,
 utilisation) and one row per fleet instance with its **assigned** set (the ledger's intent), its
 **holding** set (the live truth — drift between the two means a failed apply or a hand-run compose),
-start/stop, an **auto** button (grab the lowest free cards, sized by the instance's `--tp` / `llm.cards`),
+start/stop, an **auto** button (grab the lowest free cards, sized by the instance's `llm.cards` label),
 a **pick…** row for exact card sets, and a **boot** checkbox.
 
 - **State:** the LEDGER `/opt/panel-api/llm-gpu.json` (panel-owned 0600) holds `allocations`
@@ -569,12 +594,12 @@ a **pick…** row for exact card sets, and a **boot** checkbox.
   ledger: a stopped instance holds nothing, and `assigned`/`holding` are shown separately.
 - **Assigning cards (re)creates the container** — GPU env only exists at create time — so "set cards"
   and "run on them" are one operation (brief downtime + model reload on a running instance). Conflicts
-  (a card held by another RUNNING instance, wrong count for `--tp`, out-of-range index) are refused
+  (a card held by another RUNNING instance, wrong count for the instance's `llm.cards`, out-of-range index) are refused
   with the reason; the instance's own current cards are allowed (a move or a no-op recreate).
 - **Count drift is warned, not silently run:** a saved set whose count no longer matches the instance's
-  `llm.cards` / `--tp` (e.g. after a flag edit without a re-assign) shows in the panel's warnings — a
+  `llm.cards` (e.g. after a config edit without a re-assign) shows in the panel's warnings — a
   GPU-aware start self-heals by re-grabbing the right number of free cards, but a hand-run `up -d`
-  would pin the old count and the engine would fail to load. Reassign (auto) or fix the flag.
+  would pin the old count and the engine would fail to load. Reassign (auto) or fix the label/config.
 - **Starts are GPU-aware everywhere**: the GPUs view's *start*, and the Services view's *start* /
   *create + start* for llm-* services, all go through `POST /api/llm/gpus/start` — the saved set when
   it is free, else the lowest free set (recorded in the ledger). A raw `docker start` is deliberately
@@ -920,7 +945,7 @@ either is missing; on CachyOS both are distro defaults, so this is usually a no-
 | `/api/*` → 502 only in the browser (host curls fine) | missing UFW 8010 rule for the edge subnet (RUNBOOK → UFW), or the traefik service URL in `traefik/dynamic/panel.yml` drifted from `172.17.0.1:8010` |
 | `/api/actions` → 500 | panel-do not installed or sudoers missing → `make panel-do` |
 | Services view empty | containers lack the `panel.manage` label |
-| GPUs view errors (`panel-do llm-* failed`) | panel-do too old for the GPU pool actions → `make panel-do`; `make doctor` checks for `llm-apply` in the registry |
+| GPUs view errors (`panel-do llm-* failed`) | panel-do too old for the GPU pool actions → `make panel-do`; `make doctor` checks for `llm-apply` in the registry — also: a `llm-*` block missing its `llm.cards` label (radiance 2.x: the label is the pool's only card-need source) errors the whole view → add the label (== the config's `tp`); doctor checks it |
 | container action → 500 | panel-do too old for the container actions → `make panel-do`; details in `sudo journalctl -u panel-api -n 50` |
 | `up -d` → "network edge declared as external, but could not be found" | the `edge` network was deleted — it's created only by `make deploy` / `make stack`, never by compose (`external: true`). Cause: the edge containers were stopped (or removed) and unused networks pruned — `docker system prune` does both in one run (that's what the panel's *old* `prune-docker` action ran). The current `prune-docker` never touches networks. Fix: `sudo docker network create edge`, then `sudo docker compose --project-directory /opt/panel up -d` (or re-run `make deploy`); `make doctor` checks for this |
 | all hosts 404 + traefik container healthy | a dynamic route file failed to parse — an unknown/invalid key makes the file provider send NO config at all. On a hot reload (the common case — the update landing the file on a running traefik) the LAST GOOD config persists (the feature simply doesn't land; everything else routes) and traefik logs "Error occurred during watcher callback"; on a traefik RESTART with the bad file on disk EVERY file-provider route (panel, llm, portfolio, authelia) 404s with traefik itself healthy — full edge outage. `sudo docker compose --project-directory /opt/panel logs traefik 2>&1 | grep -iE "watcher callback|building configuration"` ("building configuration" only appears on a first load / restart) — fix or remove the offending file at the repo (the single source of truth) and `make update`, or `sudo rm` it from `/opt/panel/traefik/dynamic/` to let the watcher reload |

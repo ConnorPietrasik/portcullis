@@ -1678,7 +1678,8 @@ def llm_settings_put(body: LLMSettingsBody, _admin: Optional[str] = Depends(requ
 # ─────────────────────────── LLM GPU pool ────────────────────────────────────
 # The GPU view (panel tab "GPUs"): which cards each fleet instance runs on,
 # a pool with free/held per card, auto-grab (lowest free set, sized by the
-# instance's --tp / llm.cards), and the boot-autostart list.
+# instance's llm.cards label — radiance 2.x has no --tp left to read), and
+# the boot-autostart list.
 #
 # State split: the LEDGER (llm-gpus.py / llm-gpu.json)
 # is intent — panel-api + the boot oneshot write it, under the flock in

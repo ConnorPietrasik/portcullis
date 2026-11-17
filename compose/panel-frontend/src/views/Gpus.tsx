@@ -122,7 +122,7 @@ export default function Gpus({ intervalMs }: { intervalMs: number }) {
         </h3>
         <p className="muted">
           Cards are assigned per instance below: <code>auto</code> grabs the lowest free set (sized
-          by the instance's <code>--tp</code>), <code>pick</code> names exact cards. The pin is{' '}
+          by the instance's <code>llm.cards</code> label), <code>pick</code> names exact cards. The pin is{' '}
           <code>ROCR_VISIBLE_DEVICES</code> at container start — an assignment (re)creates the
           container, and the set sticks across stops, updates and reboots.
         </p>
@@ -328,7 +328,7 @@ export default function Gpus({ intervalMs }: { intervalMs: number }) {
           <b>boot</b> = comes up automatically after a reboot (llm-autostart.service, in list
           order; if two saved sets overlap, the later one is moved to other free cards — see the
           warnings above). <b>add a second instance of a model</b> (e.g. llm-27b-1 on cards 2,3):
-          copy the compose block + the router pair in this repo (<code>make doctor</code> checks all four name references match), <code>make update</code>, then assign cards here — see docs/RUNBOOK.md → LLM fleet.
+          copy the compose block, its radiance config, + the router pair in this repo (<code>make doctor</code> checks all six name references match), <code>make update</code>, then assign cards here — see docs/RUNBOOK.md → LLM fleet.
         </p>
       </div>
     </div>
