@@ -313,6 +313,24 @@ function UpdateBanners({
       </div>
     )
   }
+  if (status === 'failed') {
+    // Aborted at a pre-snapshot gate (preflight/doctor): the stack is exactly
+    // as it was — nothing was applied, so there is nothing to roll back.
+    // The log tail holds the gate's failure.
+    return (
+      <div className="banner err">
+        <b>
+          the last update failed before it changed anything
+        </b>{' '}
+        {updateTs(report?.state?.snapshot)}{' '}
+        <span title="nothing was applied — there is no snapshot to roll back to">· nothing was applied, nothing to roll back</span>{' '}
+        <button onClick={() => onRun(false)} disabled={busy}>
+          re-run update
+        </button>
+        {report?.log_tail && <pre className="out">{report.log_tail}</pre>}
+      </div>
+    )
+  }
   if (status === 'rolled-back' || status === 'partially-rolled-back') {
     return (
       <div className="banner err">
@@ -434,6 +452,11 @@ function UpdatesCard({
           {status == null && 'no update run yet'}
           {inProgress && <b className="t-warn">in progress…</b>}
           {status === 'updated' && <b className="t-ok">{updateTs(report?.state?.snapshot)}</b>}
+          {status === 'failed' && (
+            <b className="t-crit" title="aborted at a pre-snapshot gate (preflight/doctor) — nothing was applied, nothing to roll back">
+              failed
+            </b>
+          )}
           {(status === 'rolled-back' || status === 'partially-rolled-back') && (
             <b className="t-crit">{status}</b>
           )}
@@ -499,7 +522,7 @@ function UpdatesCard({
                 run update
               </button>
             )}
-            <button onClick={onRollback} disabled={busy || status == null}>
+            <button onClick={onRollback} disabled={busy || status == null || status === 'failed'} title={status === 'failed' ? 'nothing was applied — there is no snapshot to roll back to' : undefined}>
               rollback last
             </button>
           </div>

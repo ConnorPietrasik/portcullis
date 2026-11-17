@@ -43,31 +43,44 @@ need python3
 load_env
 
 sudo -v
+update_acquire_lock
+# Record the attempt BEFORE any gate (under the lock): from here on the panel
+# shows "update in progress" + the run-log tail, and a run that dies at a
+# pre-snapshot gate is left `failed` by the gate's die — visible, never
+# invisible. snapshot_stack rewrites the state with the full snapshot once it
+# has actually captured one.
+update_begin_run
 # Preflight: the repo's compose must render with the repo's .env BEFORE any
-# state is touched. A required var a new block needs but .env lacks (e.g. a
+# change is applied. A required var a new block needs but .env lacks (e.g. a
 # ${LLM_API_KEY:?...} in a freshly pulled llm-* block) would otherwise
 # surface at step 4 — AFTER the snapshot, the npm bump, and the config sync
 # of step 3 already replaced the deployed configs: /opt/panel left
-# half-synced (new compose, old .env). Read-only; aborts before the lock, the
-# snapshot GC, and the doctor. `make doctor` runs the same render check.
+# half-synced (new compose, old .env). Read-only; aborts before the doctor,
+# the snapshot, and the GC — the run is left `failed` in the state file.
+# `make doctor` runs the same render check.
 if ! preflight_out="$(sudo docker compose --env-file "$REPO_ROOT/.env" \
     -f "$REPO_ROOT/compose/docker-compose.yml" config -q 2>&1)"; then
-  die "preflight: repo compose does not render with the repo .env — nothing was touched
+  update_set_status failed
+  die "preflight: repo compose does not render with the repo .env — nothing was touched (state: failed)
 $preflight_out
 add the missing key(s) to .env (see .env.example), then re-run: make update"
 fi
-update_acquire_lock
-update_gc_old_snapshots
 
 if [[ "${UPDATE_DOCTOR:-1}" != "0" ]]; then
   info "precondition: doctor must be green BEFORE updating (a pre-existing failure would auto-revert the whole update)"
   if ! bash "$REPO_ROOT/setup/07-doctor.sh"; then
-    die "doctor is not green — the failures above are pre-existing (this run touched nothing); fix them, then re-run: make update"
+    update_set_status failed
+    die "doctor is not green — the failures above are pre-existing (this run touched nothing — state: failed); fix them, then re-run: make update"
   fi
 fi
 
 info "1/7 snapshotting the running stack (rollback anchor: images + configs + panel-api + npm files)"
 snapshot_stack
+# GC runs AFTER the snapshot is recorded: it protects the live rollback tags
+# read from the state file's services, and the attempt record (update_begin_run)
+# has no services yet — pruning before the snapshot could delete the LIVE
+# snapshot's tags once they age past ROLLBACK_RETAIN_DAYS.
+update_gc_old_snapshots
 # The pre-update running set — feeds $targets (the gate's expectation list)
 # in step 5 and the "removed from compose" note in step 7.
 snap_services="$(python3 -c 'import json,sys

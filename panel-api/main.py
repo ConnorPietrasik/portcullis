@@ -910,9 +910,11 @@ def run_action(name: str, body: ActionBody, _admin: Optional[str] = Depends(requ
 # The long work is detached INSIDE the update script (its step 6 restarts
 # THIS service — the trigger must not be in its process tree), so every call
 # here returns in seconds. The update state file (/opt/panel/.update-state,
-# root-written) is the control plane: every `make update` registers
-# repo_root (+ repo_head) and the pre-update snapshot, and update-report joins
-# that snapshot against the running stack.
+# root-written) is the control plane: every run flips it to in-progress under
+# the lock BEFORE any gate (a pre-snapshot failure is left `failed` — nothing
+# applied, nothing to roll back), the snapshot step records repo_root
+# (+ repo_head) and the pre-update images, and update-report joins that
+# snapshot against the running stack.
 
 
 def _first_int(s: Optional[str]) -> Optional[int]:

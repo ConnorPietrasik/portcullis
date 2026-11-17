@@ -84,10 +84,15 @@ $avail"
   info "Targeted rollback to snapshot $ts: images of ${keep% } only — configs, panel-api, npm files, and every other service stay in place"
   sudo -v
   update_acquire_lock
+  # Visible from here (panel: in progress; doctor's lock probe: live run).
+  # The success path below overwrites with partially-rolled-back; a failure
+  # leaves in-progress = unknown stack state, same as update_rollback_or_die's
+  # partial branch — the next make update / make rollback rewrites it.
+  update_set_status in-progress
   # Subshell: apply_snapshot's die (e.g. a rollback image was pruned) must not
   # abort before the message below — record the failure instead.
   ( apply_snapshot "$STACK_STATE_FILE" "${UPDATE_HEALTH_TIMEOUT:-600}" $keep ) \
-    || die "targeted rollback FAILED — the snapshot is intact, fix the problem and re-run: make rollback WHAT=$target
+    || die "targeted rollback FAILED — the snapshot is intact (state stays in-progress), fix the problem and re-run: make rollback WHAT=$target
   make logs     # the failing service's logs are the place to start"
   update_set_status partially-rolled-back
   info "targeted rollback complete — check the behavior, then: make doctor"
@@ -98,6 +103,9 @@ dir="$(update_snapshot_dir "$ts")"
 info "Rolling back to snapshot $ts ($n container service(s) + configs + panel-api + npm files, if snapshotted)"
 sudo -v
 update_acquire_lock
+# Visible from here — see the targeted path above. A failed full rollback
+# leaves in-progress (unknown state) instead of the stale pre-rollback status.
+update_set_status in-progress
 failed=()
 # Configs first: the image recreate below must read the PRE-UPDATE compose
 # file + .env (the restored ones).
@@ -108,8 +116,10 @@ rollback_stack_configs "$dir" || failed+=("configs")
 rollback_panel_api "$dir" || failed+=("panel-api")
 rollback_npm "$dir" || failed+=("npm files")
 if (( ${#failed[@]} > 0 )); then
+  # State stays in-progress (set above): the stack's state is UNKNOWN here —
+  # not `failed` (nothing was applied) and not rolled-back (it wasn't).
   die "rollback was PARTIAL — not reverted: ${failed[*]}
-The remaining snapshots are intact (snapshot dir: $dir, state file: $STACK_STATE_FILE):
+State is in-progress (unknown): the remaining snapshots are intact (snapshot dir: $dir, state file: $STACK_STATE_FILE):
 fix the problem and re-run: make rollback
   make logs     # the failing service's logs are the place to start"
 fi

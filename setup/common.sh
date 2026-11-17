@@ -346,8 +346,13 @@ acme_promote() { # <target-dir> — flip staging→prod. Idempotent; wipes the A
 # re-tagged, config tree, exact panel-api copy, npm files) → npm bump + sync
 # + pull → rebuild + converge → gate (post-update services healthy +
 # panel-api serving + full doctor) → automatic rollback of all of it on
-# failure. `make rollback` (09-rollback.sh) applies the rollback on demand;
-# the state file always holds the *pre-update* snapshot. Details:
+# failure. `make rollback` (09-rollback.sh) applies the rollback on demand.
+# The state file's lifecycle: a run flips it to in-progress under the lock
+# (update_begin_run / update_set_status in-progress) BEFORE any gate, so the
+# panel shows the run from the moment it starts; a snapshot then rewrites it
+# with the full pre-update record, and the run ends updated / failed / rolled
+# back. `failed` = aborted at a pre-snapshot gate (preflight/doctor) — the
+# stack is exactly as it was, so there is nothing to roll back. Details:
 # docs/RUNBOOK.md → Updates.
 
 STACK_STATE_FILE=/opt/panel/.update-state
@@ -422,14 +427,14 @@ update_acquire_lock() {
     || die "cannot create lock file $STACK_LOCK_FILE"
   exec 9>>"$STACK_LOCK_FILE" || die "cannot open lock file $STACK_LOCK_FILE"
   flock -n 9 || die "another update/rollback is already running (lock: $STACK_LOCK_FILE — wait for it, or kill the other run)"
-  # 08 runs doctor WHILE holding this lock — and its PRE-doctor runs BEFORE
-  # the snapshot flips status to in-progress — so doctor's stale-lock probe
-  # (07) must not flag the run's own lock as a leftover. The marker is
-  # exported AFTER the flock (marker set ⇒ this tree holds the lock) and into
-  # THIS process tree only: a standalone `make doctor` (or the next run)
-  # never sees it, and still gets flagged. 09 shares this path (marker set,
-  # never needed — 09 runs no doctor in its own tree; the `make doctor` it
-  # tells the operator to run afterwards is a fresh tree that never sees it).
+  # 08 and 09 flip the state's status to in-progress IMMEDIATELY after this
+  # flock (08: update_begin_run, 09: update_set_status in-progress) — so
+  # doctor's stale-lock probe (07) sees in-progress for the whole locked
+  # interval, including 08's pre-doctor. The marker still covers the
+  # milliseconds between the flock and the state write; it is exported AFTER
+  # the flock (marker set ⇒ this tree holds the lock) and into THIS process
+  # tree only: a standalone `make doctor` (or the next run) never sees it,
+  # and a leftover that died before its status write still gets flagged.
   export PANEL_UPDATE_INSIDE=1
 }
 
@@ -483,7 +488,11 @@ sudo_warm() { # re-warm the sudo timestamp so long operations don't prompt mid-r
   sudo -n true 2>/dev/null || sudo -v 2>/dev/null || true
 }
 
-update_set_status() { # <status: in-progress|updated|rolled-back|partially-rolled-back> — on the live state file
+update_set_status() { # <status: in-progress|updated|failed|rolled-back|partially-rolled-back> — on the live state file
+  # failed is TERMINAL and clean: the run aborted at a pre-snapshot gate
+  # (preflight/doctor), the stack is exactly as it was, nothing to roll back.
+  # in-progress after a PARTIAL auto-rollback means the opposite — unknown
+  # stack state, manual action (see update_rollback_or_die).
   local tmp
   tmp="$(mktemp)"
   python3 -c '
@@ -492,6 +501,36 @@ d = json.load(open(sys.argv[1]))
 d["status"] = sys.argv[2]
 json.dump(d, open(sys.argv[3], "w"), indent=2)
 ' "$STACK_STATE_FILE" "$1" "$tmp"
+  sudo install -m 644 "$tmp" "$STACK_STATE_FILE"
+  rm -f "$tmp"
+}
+
+# The attempt's record — written under the lock, BEFORE any gate runs, so the
+# run is visible in the panel (status in-progress + the run-log tail) from the
+# moment it holds the lock: a run that then dies at a pre-snapshot gate is
+# left `failed` by the gate's die instead of vanishing behind the previous
+# run's status. Minimal on purpose — NO `services`: the pre-update image set
+# is captured and re-tagged by snapshot_stack, which REWRITES this file with
+# the full snapshot. repo_root/repo_head are registered here already: panel-do
+# update-run and doctor read them from the state, and this file is the control
+# plane between the scripts and the dashboard.
+update_begin_run() {
+  local ts tmp repo_head
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  repo_head=""
+  if command -v git >/dev/null 2>&1; then
+    # -c safe.directory: the auto run executes this as ROOT in the admin-owned
+    # clone (scrubbed env, no SUDO_UID) — see snapshot_stack's identical read.
+    repo_head="$(git -c safe.directory="$REPO_ROOT" -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)"
+  fi
+  tmp="$(mktemp)"
+  python3 -c '
+import json, sys
+d = {"snapshot": sys.argv[1], "status": "in-progress", "repo_root": sys.argv[3]}
+if sys.argv[4]:
+    d["repo_head"] = sys.argv[4]
+json.dump(d, open(sys.argv[2], "w"), indent=2)
+' "$ts" "$tmp" "$REPO_ROOT" "$repo_head"
   sudo install -m 644 "$tmp" "$STACK_STATE_FILE"
   rm -f "$tmp"
 }

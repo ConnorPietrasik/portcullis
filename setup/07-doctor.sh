@@ -1062,6 +1062,14 @@ except Exception:
     elif [[ ${stuck:-0} -gt 0 ]]; then
       ok "update in progress (${stuck}s in) — the gates + auto-rollback finish it"
     fi
+    # A pre-snapshot failure (preflight/doctor gate) is a CLEAN terminal
+    # status: the stack is exactly as it was — no stuck flag, nothing to
+    # roll back. Warn here (non-fatal) so a pre-existing gate failure is
+    # visible BEFORE the next update spends its minutes re-hitting it.
+    if grep -q '"status": "failed"' "$USTATE" 2>/dev/null; then
+      warn "last update failed at a pre-snapshot gate (state: failed — nothing was applied)"
+      hint "the run log holds the gate failure: sudo tail /opt/panel/.update-run.log — fix it, then re-run: make update"
+    fi
   else
     bad "update state file is corrupt"
     hint "sudo rm /opt/panel/.update-state and re-run: make update (it re-snapshots)"
@@ -1069,11 +1077,11 @@ except Exception:
   # A held lock with no in-progress status means a leftover process keeps the
   # fd open (flock releases on process exit). The probe only runs on the real
   # file — a fallback open (e.g. /dev/null) would make flock fail and
-  # false-positive. ONE exception: this doctor is a gate of the run ITSELF
-  # (PANEL_UPDATE_INSIDE — exported by update_acquire_lock): 08 locks BEFORE
-  # its pre-doctor, and the snapshot that flips status to in-progress runs
-  # AFTER it, so its own held lock is expected and must not red-light the very
-  # update it is gating. (The flock, not this probe, is the exclusion.)
+  # false-positive. 08/09 flip the status to in-progress immediately after
+  # their flock, so the ONE remaining exception is the PANEL_UPDATE_INSIDE
+  # marker (exported by update_acquire_lock): it covers the milliseconds
+  # between the flock and the state write when this doctor runs as the run's
+  # own pre-doctor gate. (The flock, not this probe, is the exclusion.)
   if [[ -f /opt/panel/.update.lock ]] && exec 8</opt/panel/.update.lock 2>/dev/null; then
     if ! flock -n 8 2>/dev/null; then
       exec 8>&-

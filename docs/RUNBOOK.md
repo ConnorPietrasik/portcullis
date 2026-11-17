@@ -279,7 +279,8 @@ happens through a deliberate edit of that component's line:
 Mechanics in `setup/08-update.sh` (shared helpers in `setup/common.sh`):
 
 - **Preflight** = `docker compose config -q` renders the repo's compose against the repo's `.env` before
-  anything is touched (a var a new block needs but `.env` lacks aborts the run pre-snapshot/pre-sync;
+  anything is touched (a var a new block needs but `.env` lacks aborts the run pre-snapshot/pre-sync, leaving it
+  recorded as `failed` in the state file;
   `make deploy` gates on it too, and `make doctor` checks both trees).
 - **Snapshot** = `/opt/panel/.update-snapshot-<ts>` (state in `/opt/panel/.update-state`): the exact *image IDs* of what is running
   (tags move, IDs don't), re-tagged `portcullis-rollback/<svc>:<ts>`; **the deployed config tree** (`/opt/panel`: docker-compose.yml,
@@ -312,7 +313,9 @@ Mechanics in `setup/08-update.sh` (shared helpers in `setup/common.sh`):
 - **Gate** = every service that should be *running after the update* healthy (the pre-update set plus what this update *added* —
   compose healthchecks, `UPDATE_HEALTH_TIMEOUT=600`s; a deliberately stopped or removed service can't fail it), then a full
   `make doctor` pass (`UPDATE_DOCTOR=0` to skip both). Doctor is also a *precondition*: the update aborts before touching anything
-  if `make doctor` is not green — a pre-existing doctor failure would otherwise auto-revert every update.
+  if `make doctor` is not green — a pre-existing doctor failure would otherwise auto-revert every update. A pre-snapshot abort
+  (preflight or doctor) leaves the run recorded as `failed` in the state file: the panel shows a red banner, nothing was
+  applied, and there is nothing to roll back.
 - **Rollback** = restore the pre-update config tree first (so the recreate reads the pre-update compose + `.env`), then recreate the
   snapshot's images via a temporary compose override (`--remove-orphans` drops containers for services the update added), restore the
   exact panel-api copy, restore the npm files — all from **local** snapshots, so it works on a dead connection. A gate failure
@@ -324,8 +327,10 @@ Mechanics in `setup/08-update.sh` (shared helpers in `setup/common.sh`):
   boots against the *already-migrated* DB. Older 4.x images read the newer schema fine in practice, but if a migration ever breaks a
   rolled-back image, the DB — not the image — is what you restore: back up `/opt/panel/authelia/` before an update you don't fully
   trust.
-- After a *successful* update the state file still holds the pre-update snapshot, so one `make rollback` undoes the last update; the
-  next `make update` replaces it. Snapshots (rollback tags + dirs, including the ~100 MB panel-api venv copy) are GC'd after 14 days.
+- The state file's `status` tracks the run end-to-end: `in-progress` from the moment the run takes the lock (so the panel's
+  banner flips immediately — even a run that dies at a pre-snapshot gate is seen, left `failed`), `updated` on success, and
+  `rolled-back` / `partially-rolled-back` after a rollback. After a *successful* update the state file still holds the pre-update snapshot, so one `make rollback` undoes the last update; the
+  next `make update` replaces it. Snapshots (rollback tags + dirs, including the ~100 MB panel-api venv copy) are GC'd after 14 days (only after the new snapshot is recorded, so the live tags are protected).
 - `make deploy` is the **first-boot** path (network, secrets, ACME staging→prod, first build). It does **not** pull — with floating
   tags a pull is an upgrade, so image movement only happens through `make update` (gated). A Day-2 re-run of it applies config
   ungated and warns.
@@ -372,9 +377,12 @@ panel-do update-run  →  setup/08-update.sh --detach   (the exact same make upd
 - **Dashboard notifications** (Overview): a blue banner while an update runs (with the live run-log tail — panel-api restarts
   mid-update, so the API blips for a few seconds; the banner survives it), an amber *update available* banner listing the
   pending commits / line changes with a red **MAJOR** badge when a line's major version moves, a red banner when an update
-  fails and rolls back (plus *re-run rollback* / *re-run update* buttons), and a collapsed *updates* card with the last
+  fails and rolls back (plus *re-run rollback* / *re-run update* buttons), a red banner when an update fails at a
+  pre-snapshot gate (nothing was applied — nothing to roll back — *re-run update* button), and a collapsed *updates* card with the last
   update's before→after rows.
-- **Observability**: the run log is `/opt/panel/.update-run.log` (rotated to `.old` past 1 MB); the timer's own journal:
+- **Observability**: the run log is `/opt/panel/.update-run.log` (rotated to `.old` past 1 MB); the state file's status is
+  `sudo jq .status /opt/panel/.update-state` (`in-progress` for the whole locked run, `failed` when a pre-snapshot gate aborts it
+  — the run log holds the reason); the timer's own journal:
   `journalctl -u panel-autoupdate`; `make doctor` checks the state file, a stuck in-progress run, a stale lock, and — when
   the timer is enabled — the clone's auto-exec safety (the same checks the action makes).
 - **First deploy of this feature**: `git pull` in the server clone (08/09 gain the committed exec bit + `--detach`),
@@ -390,6 +398,7 @@ panel-do update-run  →  setup/08-update.sh --detach   (the exact same make upd
 | tick fails: "clone … is a git checkout but git status failed" | the clone's index is unreadable/corrupt (power loss or an interrupted git write) — inspect/fix the clone (worst case: re-clone + re-copy `.env`/`users_database.yml`), then re-run; *run anyway* applies the working tree as-is, deliberately |
 | action fails: "update state holds an invalid repo_root" | the state file was hand-edited — `sudo rm /opt/panel/.update-state`, then `make update` |
 | doctor: "update stuck in-progress" | the update process died mid-run — `sudo tail /opt/panel/.update-run.log`, `pgrep -af '08-update.sh\|09-rollback.sh'`, kill the leftover, then `make rollback` |
+| panel: "the last update failed before it changed anything" (state: failed) | a pre-snapshot gate failed (preflight or doctor — nothing was applied, nothing to roll back) — the run log holds the gate's output: `sudo tail /opt/panel/.update-run.log`; fix it, then re-run (the panel's *re-run update* or `make update`) |
 | doctor: "update lock held with no in-progress update" | a leftover from an interrupted run is still alive and holds the lock — flock is released only on process exit, so a held lock proves the holder never died; `sudo fuser -v /opt/panel/.update.lock` names it; kill it if stale, then `make doctor` |
 | doctor: clone "fails panel-do's auto-exec check" | the clone, its `setup/`, or a directory ABOVE the clone became group/other-writable (or is owned by `panel`) — `chmod go-w` it; `08/09-update.sh` not executable, panel-owned, or missing the bash shebang → re-pull the repo (exec bit + shebang are committed) |
 
