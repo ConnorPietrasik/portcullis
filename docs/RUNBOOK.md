@@ -386,6 +386,7 @@ panel-do update-run  →  setup/08-update.sh --detach   (the exact same make upd
 |---|---|
 | panel: "no update state yet" / tick fails "no update state" | `make update` has never run from a clone on this host — run it once |
 | auto-run skipped: "uncommitted changes in the clone" | commit (or discard) the clone's changes — or the panel's *run anyway* |
+| timer ticks (clean journal, no SKIPPED line) but no update ever lands | the installed unit lost `KillMode=process` — the default `control-group` kill SIGTERMs the detached update when the oneshot completes (`setsid` protects against terminal HUP, not cgroup teardown) — `make doctor` red-lights it; fix: git pull, `make autoupdate`, then force a tick (panel toggle off→on, or `systemctl restart panel-autoupdate.timer`) |
 | tick fails: "clone … is a git checkout but git status failed" | the clone's index is unreadable/corrupt (power loss or an interrupted git write) — inspect/fix the clone (worst case: re-clone + re-copy `.env`/`users_database.yml`), then re-run; *run anyway* applies the working tree as-is, deliberately |
 | action fails: "update state holds an invalid repo_root" | the state file was hand-edited — `sudo rm /opt/panel/.update-state`, then `make update` |
 | doctor: "update stuck in-progress" | the update process died mid-run — `sudo tail /opt/panel/.update-run.log`, `pgrep -af '08-update.sh\|09-rollback.sh'`, kill the leftover, then `make rollback` |

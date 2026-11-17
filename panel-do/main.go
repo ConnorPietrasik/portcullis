@@ -604,7 +604,13 @@ func composeLabel(raw json.RawMessage, key string) string {
 //     panel-initiated runs) mid-run and takes tens of minutes, so
 //     update-run / update-run-force / update-rollback launch the script with
 //     --detach (update_maybe_detach in common.sh: re-exec in a new session,
-//     log to /opt/panel/.update-run.log) and return within seconds.
+//     log to /opt/panel/.update-run.log) and return within seconds. The
+//     detached child outlives the oneshot ONLY because
+//     panel-autoupdate.service sets KillMode=process: the default
+//     control-group kill would SIGTERM it on unit completion (a new session
+//     is no protection — the kill is by cgroup membership), and every tick
+//     would be a clean success that applies nothing. The two are coupled;
+//     doctor red-lights an installed unit that lost the knob.
 //   - the clone to run from is the one that last recorded itself: every
 //     `make update` writes repo_root into the state file, and every auto-exec
 //     re-validates it below (a swappable clone = root code execution on the

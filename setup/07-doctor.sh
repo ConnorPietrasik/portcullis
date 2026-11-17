@@ -1056,6 +1056,15 @@ except Exception:
     fi
   fi
   if systemctl is-enabled --quiet panel-autoupdate.timer 2>/dev/null; then
+    # The oneshot's cgroup teardown (default KillMode=control-group) would
+    # SIGTERM the detached update seconds after launch: every tick a clean,
+    # fast success that applies nothing (setsid makes a new session, but the
+    # kill is by cgroup membership). The repo's unit ships KillMode=process —
+    # red-light an installed copy that lost it (stale install, hand edit).
+    if ! systemctl cat panel-autoupdate.service 2>/dev/null | grep -q '^KillMode=process'; then
+      bad "installed panel-autoupdate.service lacks KillMode=process (the default cgroup kill SIGTERMs the detached update on every tick)"
+      hint "re-run: make autoupdate (after a git pull that has the fixed unit) — it reinstalls the unit and leaves the timer enabled; force a tick after: systemctl restart panel-autoupdate.timer"
+    fi
     repo="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("repo_root",""))' "$USTATE" 2>/dev/null)"
     if [[ -z $repo ]]; then
       bad "auto-update timer enabled but no repo_root registered in the state"

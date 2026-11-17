@@ -13,6 +13,19 @@ Type=oneshot
 # and returns within seconds, so this oneshot finishes fast even though the
 # update itself runs for minutes — including the step that restarts panel-api.
 ExecStart=/usr/local/libexec/panel-do update-run
+# The detached update OUTLIVES this unit by design — and the default
+# KillMode=control-group would silently prevent it: on unit completion the
+# cgroup teardown SIGTERMs every REMAINING member, i.e. seconds after the
+# launch. setsid gives no protection — it makes a new SESSION, but systemd
+# kills by cgroup membership, and the child never left this cgroup. Symptom
+# when the knob is missing: every tick is a clean, fast unit success, the
+# journal is green, and no update ever lands. KillMode=process scopes the
+# kill to the main process (panel-do, already exited), so the detached run
+# survives; its cgroup is only freed when the update itself exits. Note a
+# `systemctl stop` of this trigger does NOT stop a running update — the
+# update's own lifecycle is its lock + snapshot + auto-rollback, not this
+# unit's.
+KillMode=process
 TimeoutStartSec=10min
 # A skipped tick (dirty clone, or an update already running) exits 75
 # (EX_TEMPFAIL): an expected decline, not a fault — treat it as a clean exit
