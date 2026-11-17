@@ -28,8 +28,9 @@ server:
 memory:
   gpu-headroom-mib: 96
 models:
-  qwen3.8-27b:
+  Qwen3.8-27B:
     model: /models/qwen3.8-27b-iq6r-s-v4.rad
+    aliases: [default]           # model-less requests land here
     tp: 2                        # == the block's llm.cards (doctor cross-checks)
     max-num-seqs: 6
     max-model-len: 250000

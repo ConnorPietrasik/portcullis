@@ -32,8 +32,9 @@ server:
 memory:
   gpu-headroom-mib: 96
 models:
-  flashnext:
+  Qwen3.8-Flash-Next:
     model: /models/qwen3.8-next-flash-iqr-v4.rad
+    aliases: [default]           # model-less requests land here
     tp: 4                        # == the block's llm.cards (doctor cross-checks)
     max-num-seqs: 8
     max-model-len: 250000        # the pre-2.x value; upstream's rows run 200000
