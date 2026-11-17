@@ -74,6 +74,13 @@ change, not a refactor. The "why" for each is in `docs/ARCHITECTURE.md`.
    clone (state file's `repo_root`) before every exec — mode/owner/shebang,
    walking the whole directory chain up to `/` (a writable ancestor dir =
    replaceable clone); don't `chown` the clone to root.
+9. **Every root-exec'd script passes `checkManagedScript`** — both the
+   auto-update clone scripts (`setup/08|09-*.sh`) AND the servitor deploy
+   scripts (`/opt/servitor-repo/deploy/sync|doctor.sh`, the `servitor-sync` /
+   `-doctor` panel actions): file + its dir + every ancestor to `/` not
+   group/other-writable, not `panel`-owned, exec bit, bash shebang. A
+   hardcoded-but-unvalidated script path is a replaceable root script; a
+   writable checkout is a security incident, not a perms quirk.
 
 ## Workflows (repo edit → sync → RUNBOOK section for the details)
 
@@ -97,6 +104,13 @@ change, not a refactor. The "why" for each is in `docs/ARCHITECTURE.md`.
   v2-style multi-value `Host(a, b)` that Traefik v3 drops silently, and
   cross-checks `llm.cards` against the config's `tp`). →
   `make update`. RUNBOOK → "LLM fleet".
+- **Servitor VM (day-2)**: four `servitor-*` panel actions (status/vm-
+  restart/sync/doctor); the route (`traefik/dynamic/servitor.yml`, raw VM IP
+  upstream — invariant 2: still a file, no docker.sock) and the actions live
+  in THIS repo; the scripts live in the separate `/opt/servitor-repo`
+  checkout. Version bumps + image swaps are SSH-side (`deploy/update.sh` in
+  that repo — long, self-gated, deliberately not a panel action). → RUNBOOK →
+  "Servitor (agent VM)"; `make doctor` has a tri-state section for it.
 - **After editing a route**: client machines pin names with
   `tools/panel-hosts.sh` (the server re-pins itself as part of `make update`).
 

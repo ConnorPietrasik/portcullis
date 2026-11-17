@@ -71,6 +71,10 @@ expect_exit 65 llm-apply notaninstance            # not an llm-* service name
 expect_exit 65 llm-apply '../../etc/passwd'       # path injection
 expect_exit 65 llm-apply -foo                     # flag injection
 expect_exit 65 llm-stop notaninstance             # not an llm-* service name
+# servitor actions take no args (the checkout paths are constants, not
+# arguments — a stray token would only ever reach validation, never exec):
+expect_exit 65 servitor-sync extraarg             # arity
+expect_exit 65 servitor-doctor extraarg           # arity
 
 if sudo -u panel sudo -n /usr/local/libexec/panel-do list-services | python3 -c 'import json,sys
 d = json.load(sys.stdin)

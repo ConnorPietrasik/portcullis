@@ -906,6 +906,120 @@ curl -s -H "Authorization: Bearer $K" \
   mount + the volume.
 - **From a configured pi machine**: `web_search({ query: "traefik healthz", provider: "searxng" })`
   — the real client against the real endpoint.
+## Servitor (agent VM)
+
+The [servitor](https://github.com/ConnorPietrasik/servitor) project — a home
+assistant that runs pi (a coding agent) in a libvirt VM on the edge segment —
+is hosted on this server. The VM is a **raw IP upstream in one traefik route**,
+not a container: the file provider reaches it at `SERVITOR_VM_IP:8787`, the
+auth chain (`auth-chain@file`) is its only gate (the app authenticates nobody),
+and the VM's own nftables admits 8787 from the edge subnet only + 22 from the
+LAN subnet only. Invariant 2 holds: the route is a file, no docker.sock
+anywhere. Day-2 control is four panel-do actions (`servitor-status`,
+`servitor-vm-restart`, `servitor-sync`, `servitor-doctor`); the scripts they
+run live in the servitor repo's host checkout at **`/opt/servitor-repo`**
+(a separate repo — keep that path, the actions are pinned to it).
+
+`make doctor` has a tri-state section for it (absent = skip, no libvirt /
+no domain / stale binary = fail, VM stopped or endpoint dead = warn —
+planned downtime must not red-light every update). It also verifies the one
+host firewall line below.
+
+### One-time install (short version)
+
+The servitor repo's `deploy/portcullis/INSTALL.md` is the step-by-step
+reference (image build vs fast path, the domain template, the failure-mode
+table distilled from the dev box). The host-side shape, in order:
+
+```bash
+# 1. Host packages (none of this exists on a fresh box)
+sudo pacman -S --needed libvirt qemu nodejs npm git e2fsprogs
+sudo systemctl enable --now libvirtd
+
+# 2. Servitor checkout + the single-purpose deploy key (NOT your SSH key).
+# The key lives in ROOT's home: panel-do's scrubbed env has no $HOME, so the
+# actions pass this exact path; sync.sh's ${HOME} fallback can never work
+# under panel-do.
+sudo git clone git@github.com:ConnorPietrasik/servitor.git /opt/servitor-repo
+sudo mkdir -p /root/.srv && sudo chmod 700 /root/.srv
+sudo ssh-keygen -t ed25519 -N '' -f /root/.srv/deploy_key   # pub half gets baked into the image
+
+# 3. Servitor .env (the VM's contract: keys, subnets, VM IP, versions)
+sudo cp /opt/servitor-repo/.env.example /opt/servitor-repo/.env
+sudo chmod 600 /opt/servitor-repo/.env
+#    — set OMNISSIAH_API_KEY (= the fleet's LLM_API_KEY), EXA_API_KEY,
+#      SERVITOR_EDGE_SUBNET (from: sudo docker network inspect edge -f
+#      '{{range .IPAM.Config}}{{.Subnet}}{{end}}'), SERVITOR_OPS_SUBNET
+#      (your LAN subnet), SERVITOR_VM_IP (unused address in the edge subnet;
+#      gateway is the subnet's .1 by build convention) and SERVITOR_BIND
+#      (= SERVITOR_VM_IP). The template already carries the quoted
+#      SERVITOR_DNS_UPSTREAM default — multi-word values must stay QUOTED
+#      (sync.sh sources the file); the rest may stay at defaults.
+
+# 4. Guest image (sudo make guest — unshare -m needs it — or the fast path,
+#    INSTALL.md §4 + Appendix A)
+cd /opt/servitor-repo
+sudo make guest   # = sudo unshare -m deploy/guest/build.sh --env .env --deploy-key /root/.srv/deploy_key.pub
+
+# 5. State disk (ext4, LABEL=servitor-state — the image's fstab contract)
+sudo mkdir -p /opt/servitor-disk
+sudo qemu-img create -f raw /opt/servitor-disk/servitor-state.raw 200G
+sudo mkfs.ext4 -q -L servitor-state /opt/servitor-disk/servitor-state.raw
+
+# 6. Domain + start (template: deploy/guest/servitor-domain.xml; substitutions
+#    in its header; the image has no bootloader — libvirt boots it via
+#    <kernel>/<initrd> exactly like the test harness)
+sudo virsh define <substituted-template> && sudo virsh start servitor
+sudo virsh console servitor   # watch the first boot; Ctrl-] to leave
+
+# 7. Guest egress — the ONE host firewall change servitor needs. The VM is
+#    not a docker container: docker's FORWARD rules never see its traffic,
+#    so the host's ufw FORWARD policy (default deny routed) applies and this
+#    line is the whole story (the dev-box lesson: the NAT masquerade alone
+#    is not enough). `make doctor` checks it.
+EDGE_SUBNET=$(sudo docker network inspect edge -f '{{(index .IPAM.Config 0).Subnet}}')
+sudo ufw route allow from "$EDGE_SUBNET" comment 'servitor VM egress'
+
+# 8. First sync = provisioning (keys + extension + config + doctor)
+cd /opt/servitor-repo && sudo deploy/sync.sh
+#    (as root: .env + deploy key are root-owned and root's $HOME is where
+#    the scripts find both by default) — success marker:
+#    "sync: OK — shape deployed, doctor GREEN"
+
+# 9. Edge merge (this repo): copy the servitor route from the servitor repo's
+#    deploy/portcullis/traefik-dynamic/servitor.yml into compose/traefik/
+#    dynamic/, substituting the VM ingress IP + port (8787). Commit it in
+#    this clone (the deploy prunes deployed route files absent from the repo
+#    — hand-placed files don't survive an update). The panel-do actions and
+#    the doctor section are already in this repo.
+sudo -u "$SUDO_USER" make panel-do   # only if this clone pre-dates the servitor actions
+make update                          # gated: sync + recreate + doctor gate
+
+# 10. Verify: https://servitor.pietrasik.top (2FA → chat UI → one live
+#     prompt), panel → servitor-status (vm running + healthz ok),
+#     servitor-doctor (GREEN). Client machines: tools/panel-hosts.sh picks
+#     the new name up automatically (it reads the routes).
+```
+
+### Day-2
+
+| task | how |
+|---|---|
+| VM state / app liveness | panel → `servitor-status` (virsh state + /healthz probe) |
+| planned reboot | panel → `servitor-vm-restart` (ACPI reboot; the app's boot reconciliation handles the unclean path — restart, never destroy) |
+| edit prompts/skills/lib | edit `agent-config/` / `lib/` in `/opt/servitor-repo`, panel → `servitor-sync` (never blocks a run — an active run gets the update-waiting flag and exit 0; the app's tick applies at the next idle moment) |
+| deploy gate | panel → `servitor-doctor` (guest certification + firewall probes + one live prompt + one live search) |
+| version bump (pi / extension) | `deploy/update.sh` in the host checkout (SSH — long, network-bound, its own conformance gates + auto-rollback; deliberately NOT a panel action) |
+| rotate keys | host `.env` → servitor `deploy/sync.sh` (re-injects the key slice into the guest's 0600 env file) + restart; the portcullis stack's copy of the key floats with its own `make update` as usual |
+
+The four actions exec `virsh` and the checkout's `deploy/sync.sh` /
+`deploy/doctor.sh` as root — so those scripts (their directory, and every
+ancestor up to `/`) must not be group/other-writable and must not be owned
+by `panel` (`checkManagedScript`, the same anti-swap standard as the
+auto-update clone). If the checkout is ever relocated, move it under a
+non-writable tree — a group/other-writable directory anywhere in the chain
+is a replaceable root script.
+
 ## Add a privileged action
 
 One Go function in the ACTIONS section of `panel-do/main.go` + one registry entry, then `make panel-do`. The UI picks it up from
@@ -943,6 +1057,10 @@ either is missing; on CachyOS both are distro defaults, so this is usually a no-
   Traefik runs the file provider precisely so it needs none.
 - [ ] `/opt/panel/authelia/db.sqlite3` mode 600 (TOTP seeds — authelia creates it 0644 at first boot; `make deploy`/`make update`
   re-tighten it, `make doctor` checks it).
+- [ ] Servitor (when installed): the VM's firewall is guest-enforced (nftables — 8787 from the edge subnet only, 22 from the
+  LAN subnet only); the host never opens 8787, and its only firewall change is the one `ufw route allow from <edge subnet>`
+  egress line (doctor checks it). The `/opt/servitor-repo` checkout stays root/admin-owned and not group/other-writable
+  anywhere in its directory chain (panel-do's `checkManagedScript` refuses to exec its scripts otherwise).
 
 ## Troubleshooting
 
@@ -957,6 +1075,10 @@ either is missing; on CachyOS both are distro defaults, so this is usually a no-
 | GPUs view errors (`panel-do llm-* failed`) | panel-do too old for the GPU pool actions → `make panel-do`; `make doctor` checks for `llm-apply` in the registry — also: a `llm-*` block missing its `llm.cards` label (radiance 2.x: the label is the pool's only card-need source) errors the whole view → add the label (== the config's `tp`); doctor checks it |
 | container action → 500 | panel-do too old for the container actions → `make panel-do`; details in `sudo journalctl -u panel-api -n 50` |
 | `up -d` → "network edge declared as external, but could not be found" | the `edge` network was deleted — it's created only by `make deploy` / `make stack`, never by compose (`external: true`). Cause: the edge containers were stopped (or removed) and unused networks pruned — `docker system prune` does both in one run (that's what the panel's *old* `prune-docker` action ran). The current `prune-docker` never touches networks. Fix: `sudo docker network create edge`, then `sudo docker compose --project-directory /opt/panel up -d` (or re-run `make deploy`); `make doctor` checks for this |
+| `servitor.pietrasik.top` → 502 | the route's upstream is a raw VM IP: VM down (panel `servitor-status` → `sudo virsh start servitor`), app down (`sudo virsh console servitor`, `systemctl status servitor` inside), or the route's IP drifted from `SERVITOR_VM_IP` (fix the route, `make update`) — doctor's servitor section covers all three |
+| panel's `servitor-*` actions missing or 500 | stale panel-do binary → `make panel-do` (doctor fails it explicitly: `registry missing servitor-status`) |
+| `servitor-sync` times out in the panel | the action's budget (10 min) IS a stop: at the deadline panel-do kills the script (runCmd's ctx deadline — only in-flight scp/ssh grandchildren may linger); the script is idempotent and resumable, so re-run `servitor-sync`, or check how far it got in `sudo journalctl -u panel-api -n 50`; a run active on the VM makes sync exit 0 fast (update-waiting) instead |
+| `servitor-sync`/`-doctor` → "group/other-writable" or "owned by the panel user" | the `/opt/servitor-repo` checkout (or a directory above it) lost its modes/owner — `chmod go-w` it (or the offending ancestor); never `chown panel` the checkout (RUNBOOK → Servitor, day-2 note) |
 | all hosts 404 + traefik container healthy | a dynamic route file failed to parse — an unknown/invalid key makes the file provider send NO config at all. On a hot reload (the common case — the update landing the file on a running traefik) the LAST GOOD config persists (the feature simply doesn't land; everything else routes) and traefik logs "Error occurred during watcher callback"; on a traefik RESTART with the bad file on disk EVERY file-provider route (panel, llm, portfolio, authelia) 404s with traefik itself healthy — full edge outage. `sudo docker compose --project-directory /opt/panel logs traefik 2>&1 | grep -iE "watcher callback|building configuration"` ("building configuration" only appears on a first load / restart) — fix or remove the offending file at the repo (the single source of truth) and `make update`, or `sudo rm` it from `/opt/panel/traefik/dynamic/` to let the watcher reload |
 | update gate: `llm-* (exited)`, and the update started the WHOLE fleet | a stopped fleet container was pruned (raw `docker container prune` / `docker system prune`), so the update read the missing container as a new service and started every instance at once — invalid when they share cards. The auto-rollback leaves the fleet containers in place, so a re-run of `make update` classifies them as deliberately stopped again (deploys the new configs, pulls the images, starts nothing fleet). With the current guard, a pruned (or brand-new) `restart: "no"` service is never auto-started — the update names it and leaves it down. Bring it back from the panel: Services view → *defined, no container* → *create + start*. Don't raw-prune containers on this box — use the panel's `prune-docker` action (images + build cache only) |
 | domain resolves to an old IP | panel-ddns failing → `journalctl -u panel-ddns`; then `sudo systemctl start panel-ddns` (missing/stale records are fixed in place) |

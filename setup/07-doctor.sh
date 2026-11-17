@@ -921,6 +921,114 @@ else
   skip "not installed"; hint "make panel-do (RUNBOOK Phase 3)"
 fi
 
+# ── servitor (agent VM) ──────────────────────────────────────────────────────
+# The servitor VM is a separate project this server hosts on the edge segment
+# (RUNBOOK → "Servitor (agent VM)"): a libvirt domain on the edge bridge, one
+# file-provider route to its ingress IP, four panel-do actions. Tri-state like
+# searxng: the repo-side doctor is the precondition of the update that adds
+# the route, so feature-absent = SKIP, never FAIL. Defined-but-broken splits
+# by what the operator can legitimately do:
+#   - VM stopped            → WARN (planned downtime is a first-class state;
+#                             the route 502s until it is up again)
+#   - no libvirt / no domain → FAIL (the deploy is incomplete, nothing works)
+#   - stale panel-do binary  → FAIL (the panel's servitor buttons are dead)
+#   - no egress rule         → FAIL (one ufw line; without it the VM has no
+#                             public DNS and its search/model calls die)
+section "servitor (agent VM)"
+servitor_defined=0
+grep -rqs "servitor\.pietrasik\.top" "$REPO_ROOT/compose/traefik/dynamic/" 2>/dev/null && servitor_defined=1
+grep -rqs "servitor\.pietrasik\.top" /opt/panel/traefik/dynamic/ 2>/dev/null && servitor_defined=1
+if (( ! servitor_defined )); then
+  skip "no servitor route in the repo or deployed tree (not installed)"
+else
+  if ! command -v virsh >/dev/null 2>&1; then
+    bad "servitor route defined but libvirt (virsh) is not installed"
+    hint "RUNBOOK → Servitor (host packages) — the VM cannot exist without it"
+  else
+    # Capture stderr too: "no domain" and "libvirtd down" both print
+    # NOTHING to stdout, and the operator needs to know which it is
+    # (define the domain vs. start the daemon) — a merged "no domain"
+    # message for a stopped libvirtd sends them editing the wrong thing.
+    state="$(sudo virsh domstate servitor 2>&1 || true)"
+    case "$state" in
+      running) ok "VM running" ;;
+      "shut off"|paused|blocked|noshutdown|pmsuspended|crashed)
+        warn "VM not running ($state) — servitor.pietrasik.top will 502 until it is up"
+        hint "planned downtime is fine; otherwise: sudo virsh start servitor (RUNBOOK → Servitor)" ;;
+      *not\ found*|"")
+        # virsh's no-domain error, or no state and no recognized error:
+        # treat as not defined (the remediation is the same). A
+        # ${state:-missing} here would make this branch unreachable and
+        # downgrade the missing domain to a warn.
+        bad "no 'servitor' domain defined"
+        hint "RUNBOOK → Servitor (state disk + virsh define + virsh start)" ;;
+      *)
+        # Any other output is a virsh/daemon error, not a VM state.
+        if grep -qiE 'connect|hypervisor' <<<"$state"; then
+          bad "cannot reach libvirtd — could not query the 'servitor' domain"
+          hint "sudo systemctl status libvirtd (RUNBOOK → Servitor, host packages)"
+        else
+          warn "could not read the VM state (virsh said: ${state//$'\n'/; })"
+        fi
+        ;;
+    esac
+    if [[ "$state" == "running" ]]; then
+      # The route end-to-end, the way the operator's browser will see it:
+      # unauthenticated → Authelia redirect (30x) or 200 = healthy. The
+      # upstream is a raw VM IP — nothing else in the route set is — so a
+      # dead endpoint means VM/app down or route IP drift, not a container
+      # issue. WARN, not FAIL: a deliberately powered-down VM is a first-
+      # class state, and red-lighting every make update while it is off
+      # would punish the operator for the panel's own reboot button.
+      serv_code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 https://servitor.pietrasik.top 2>/dev/null || true)"
+      if [[ "$serv_code" =~ ^30 || "$serv_code" == 200 ]]; then
+        ok "servitor.pietrasik.top → $serv_code (route + VM + app answering; 30x = the Authelia gate)"
+      else
+        warn "servitor.pietrasik.top → ${serv_code:-000} (want 30x/200)"
+        hint "panel servitor-status (vm + healthz), sudo virsh console servitor, and the route's upstream IP vs the VM's actual IP (RUNBOOK → Servitor)"
+      fi
+    fi
+    # Egress (host-side, independent of VM state): the VM is NOT a docker
+    # container — docker's FORWARD rules never see its traffic, so the
+    # host's ufw FORWARD policy (default deny routed) applies and the
+    # explicit route rule is the whole story (the laptop lesson: the NAT
+    # masquerade alone is not enough).
+    edge_subnet="$(sudo docker network inspect edge -f '{{(index .IPAM.Config 0).Subnet}}' 2>/dev/null || true)"
+    if [[ -n "$edge_subnet" ]]; then
+      serv_ufw_status="$(sudo ufw status 2>/dev/null || true)"
+      if ! grep -q "Status: active" <<<"$serv_ufw_status"; then
+        # The firewall section below fails separately when ufw is not
+        # active — there is simply nothing to verify here.
+        warn "ufw not active — could not verify the guest egress rule"
+      else
+        # No `ufw status route` — status takes only verbose|numbered and
+        # rejects anything else (non-zero exit, no rule output). Route
+        # rules render as the ALLOW FWD lines of plain `ufw status`, and
+        # we grep only those: the same subnet legitimately appears in the
+        # panel-api ingress rule (allow from $edge_subnet to 172.17.0.1
+        # port 8010), so a whole-output grep would false-positive on it.
+        route_rules="$(grep -F 'ALLOW FWD' <<<"$serv_ufw_status" || true)"
+        if grep -qF "$edge_subnet" <<<"$route_rules"; then
+          ok "guest egress rule present (ufw route allow from $edge_subnet)"
+        else
+          bad "no ufw route rule for the edge subnet — the VM's public egress (DNS, search, npm) is dropped"
+          hint "sudo ufw route allow from $edge_subnet (RUNBOOK → Servitor)"
+        fi
+      fi
+    else
+      warn "edge subnet unreadable — could not verify the guest egress rule"
+    fi
+  fi
+  # A stale panel-do binary makes the panel's servitor buttons 500 — the same
+  # hard presence check as edge-ips / llm-apply / start-service above.
+  if sudo -u panel sudo -n /usr/local/libexec/panel-do --list 2>/dev/null | grep -q '"name":"servitor-status"'; then
+    ok "servitor-* actions present in the panel-do registry"
+  else
+    bad "panel-do registry missing servitor-status — the panel's servitor actions are dead"
+    hint "binary is stale — make panel-do (rebuilds + reinstalls it)"
+  fi
+fi
+
 # ── panel-ddns ───────────────────────────────────────────────────────────────
 section "panel-ddns (dynamic IP)"
 if systemctl is-active --quiet panel-ddns.timer 2>/dev/null; then

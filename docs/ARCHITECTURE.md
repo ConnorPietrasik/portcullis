@@ -126,3 +126,32 @@ same class as the accepted `/open` hole. No Authelia rule: the UI rides the `*.p
 (private-by-default), the API host never meets Authelia. Rate-limit/identity is the socket address — XFF is untrusted by
 construction (the host never trusts client-supplied `X-Forwarded-*`), so the limit is a per-client-IP flood brake and the
 key is the identity.
+
+**Servitor: a VM behind the edge, not a container.** The servitor project hosts a
+coding agent (pi) that must run arbitrary user-supplied and model-generated code
+with a live network position and real credentials — prompt injection is the
+dominant threat, so the isolation is a machine boundary, not a policy one: a
+libvirt/KVM domain on the portcullis edge bridge (24 vCPU, 30 GB balloon ceiling,
+~200 GB state disk, no GPU), with per-session slot uids, overlay workdirs, and a
+default-deny guest nftables inside. Portcullis's role is deliberately thin —
+three things, all inside its existing invariants: (1) **one file-provider route**
+to the VM's ingress IP:8787; the app authenticates nobody, so reachability IS
+the control — the edge auth chain (Authelia 2FA) is the only gate, and the VM's
+own firewall admits the port from the edge subnet only, which is why the route
+may name a raw IP: an attacker would already have to be on the edge segment. (2)
+**Four panel-do actions** (`servitor-status/-vm-restart/-sync/-doctor`) —
+`virsh` plus the servitor repo's host-side `deploy/sync.sh`/`deploy/doctor.sh`,
+executed as root from a second checkout (`/opt/servitor-repo`) under the same
+anti-swap standard as the auto-update clone (`checkManagedScript`: script +
+directory chain to `/`, not group/other-writable, not panel-owned, bash
+shebang). A hardcoded unvalidated script path was the original design and is
+exactly the replaceable-root-script hole that standard exists to close. (3) **one
+ufw line** — `route allow from <edge subnet>`: the VM is not a docker container,
+so docker's FORWARD rules never see its traffic and the host's default-deny
+routed policy applies to its egress; without the line the VM has no public DNS
+and its model/search calls die. What portcullis does NOT do: run any servitor
+process, hold its secrets (the key slice lives in the guest's 0600 env file,
+injected by its own sync pipeline), or open 8787 on the host (nothing on the
+host listens on it — the only host-side consumer is panel-do's 5 s healthz
+probe). VM downtime is a first-class state: doctor warns (route 502s) but never
+red-lights the update gate for a deliberately powered-down VM.

@@ -6,7 +6,9 @@
 //   - Unknown action => exit 64. No passthrough, ever.
 //   - Args validated centrally (arity + patterns) BEFORE Run is called.
 //   - No shell anywhere; exec only via runCmd with absolute paths.
-//   - Short-lived process: no listeners, no goroutines, no network.
+//   - Short-lived process: no listeners, no goroutines, no network — one
+//     documented exception: the bounded servitor healthz probe
+//     (probeServitorHealth).
 
 package main
 
@@ -196,8 +198,9 @@ func main() {
 //      direct exec.Command, never string-built command lines.
 //   2. Args arrive pre-validated as OPAQUE TOKENS (no '/', no '-', no '..').
 //      Never treat an arg as a file path.
-//   3. No os.Getenv, no network, no goroutines, no os.Exit, no panic.
-//      Return errors.
+//   3. No os.Getenv, no network (one documented exception: the bounded
+//      servitor healthz probe — probeServitorHealth), no goroutines, no
+//      os.Exit, no panic. Return errors.
 //   4. Separators like "--" belong hardcoded inside runCmd calls, never as args.
 //   5. An EXPECTED decline (dirty clone, an update already running) returns
 //      skipResult, not a plain error: main() maps it to exit 75 (EX_TEMPFAIL)
@@ -679,17 +682,24 @@ func firstLine(p string) (string, error) {
 	return strings.TrimRight(l, "\r\n"), nil
 }
 
-// checkUpdateScript validates <repo>/setup/<name> as a script root may
-// auto-exec: regular executable file with the repo's bash shebang, and the
-// file, its setup/ directory, and every ancestor directory up to / not
-// group/other-writable and not owned by the panel user — the same standard
-// as this binary's self-check. A group/other-writable DIRECTORY anywhere in
-// the chain would let a local user delete-and-replace the file (a writable
-// setup/) or the clone directory itself (a writable ancestor), regardless of
-// the file's own mode — and every check below would pass on the stand-in —
-// so the WHOLE chain is checked, not just the leaf directories.
-func checkUpdateScript(repo, name string) (string, error) {
-	script := filepath.Join(repo, "setup", name)
+// checkManagedScript validates <root>/<rel> as a script root may exec:
+// regular executable file with the repo's bash shebang, and the file, its
+// directory, and every ancestor directory up to / not group/other-writable
+// and not owned by the panel user — the same standard as this binary's
+// self-check. A group/other-writable DIRECTORY anywhere in the chain would
+// let a local user delete-and-replace the file (a writable script dir) or
+// the checkout directory itself (a writable ancestor), regardless of the
+// file's own mode — and every check below would pass on the stand-in — so
+// the WHOLE chain is checked, not just the leaf directories.
+//
+// The callers are the two places this binary execs a script out of an
+// admin-editable checkout: the auto-update clone (root = the state's
+// repo_root, rel = setup/08|09-*.sh) and the servitor deploy scripts
+// (root = /opt/servitor-repo, rel = deploy/sync|doctor.sh). In both, a
+// swapped script is root code execution — the check, not the ownership,
+// is the control.
+func checkManagedScript(root, rel string) (string, error) {
+	script := filepath.Join(root, rel)
 	panelUID, panelErr := panelUserID()
 	okOwner := func(inf os.FileInfo, label string) error {
 		if panelErr == nil {
@@ -708,14 +718,14 @@ func checkUpdateScript(repo, name string) (string, error) {
 			return fmt.Errorf("%s is not a directory", d)
 		}
 		if inf.Mode()&0o022 != 0 {
-			return fmt.Errorf("%s is group/other-writable — the clone must live somewhere only you (and root) can write", d)
+			return fmt.Errorf("%s is group/other-writable — the checkout must live somewhere only you (and root) can write", d)
 		}
 		return okOwner(inf, d)
 	}
-	// The ancestor walk starts at the repo and ends at / (Dir("/")=="/" is
-	// the fixed point): a writable directory ABOVE the clone lets a local
-	// user rm-and-replace the clone dir itself, so it is checked too.
-	for d := repo; ; d = filepath.Dir(d) {
+	// The ancestor walk starts at the checkout root and ends at / (Dir("/")=="/"
+	// is the fixed point): a writable directory ABOVE the checkout lets a
+	// local user rm-and-replace the checkout dir itself, so it is checked too.
+	for d := root; ; d = filepath.Dir(d) {
 		if err := checkDir(d); err != nil {
 			return "", err
 		}
@@ -749,9 +759,15 @@ func checkUpdateScript(repo, name string) (string, error) {
 		return "", fmt.Errorf("%s: %v", script, err)
 	}
 	if line != "#!/usr/bin/env bash" {
-		return "", fmt.Errorf("%s has no bash shebang (first line %q) — not the repo's update script", script, line)
+		return "", fmt.Errorf("%s has no bash shebang (first line %q) — not a managed bash script", script, line)
 	}
 	return script, nil
+}
+
+// checkUpdateScript — the auto-update path: <repo>/setup/<name> of the
+// registered clone, under the full managed-script standard above.
+func checkUpdateScript(repo, name string) (string, error) {
+	return checkManagedScript(repo, filepath.Join("setup", name))
 }
 
 // updateClonePath — the registered server clone (the state's repo_root): the
@@ -1116,6 +1132,180 @@ func autoupdateToggle(ctx context.Context, args []string, logf func(string, ...a
 	return nil
 }
 
+// ── servitor (agent VM) ──────────────────────────────────────────────────────
+//
+// The servitor VM is a separate project (its own repo, checked out on the
+// host at /opt/servitor-repo) that portcullis hosts on the edge segment:
+// a libvirt domain on the edge bridge, reached by a plain file-provider
+// route (traefik/dynamic/servitor.yml — invariant 2 holds: the route is a
+// file, no docker.sock). The app authenticates nobody; the edge auth chain
+// is its only gate, and the VM's own nftables admits its port from the edge
+// subnet only.
+//
+// The four actions below are thin wrappers over virsh + the servitor repo's
+// host-side deploy scripts. The scripts exec as ROOT out of an admin-editable
+// checkout, so they pass the SAME anti-swap standard as the auto-update
+// clone scripts (checkManagedScript: file + directory chain to /, owner,
+// shebang) — a writable checkout is a swapped root script, nothing less.
+// RUNBOOK → "Servitor (agent VM)".
+
+const (
+	servitorRepoPath  = "/opt/servitor-repo"
+	servitorVMName    = "servitor"
+	servitorDeployKey = "/root/.srv/deploy_key"
+)
+
+// servitorIPRe / servitorPortRe — the healthz probe target must be a plain
+// IPv4 + port. The values come from the servitor checkout's .env (below),
+// not from any argument, but they are still validated before use: a
+// malformed value must degrade the probe, not become a URL.
+var servitorIPRe = regexp.MustCompile(`^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$`)
+var servitorPortRe = regexp.MustCompile(`^\d{1,5}$`)
+
+// servitorEnvKV reads ONE key from the servitor checkout's .env (the same
+// contract file deploy/sync.sh consumes). It never sources the file and
+// returns only the one value: the rest of it holds secrets (the API keys)
+// this action must not touch, and quoted multi-word values (SERVITOR_DNS_
+// UPSTREAM) must not be misparsed.
+func servitorEnvKV(key string) (string, error) {
+	data, err := os.ReadFile(servitorRepoPath + "/.env")
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, key+"=") {
+			continue
+		}
+		v := strings.TrimSpace(strings.TrimPrefix(line, key+"="))
+		return strings.Trim(v, `"'`), nil
+	}
+	return "", fmt.Errorf("%s not set in %s/.env", key, servitorRepoPath)
+}
+
+// probeServitorHealth — best-effort liveness probe from the host at the VM
+// ingress address: the target is the ONE pair of values the servitor
+// checkout's .env declares (SERVITOR_BIND/SERVITOR_PORT — the same contract
+// the sync pipeline and the doctor's open-probe use). A deliberate exception
+// to the "no network" rule, bounded on both ends: a 5 s one-shot curl to a
+// fixed, fully-validated target that no caller input can influence. The
+// vm-up-but-app-down state is the one the dashboard otherwise cannot see.
+// Every probe failure degrades to a string, never an error: status is a
+// viewer, not a gate.
+func probeServitorHealth(ctx context.Context) string {
+	bind, err1 := servitorEnvKV("SERVITOR_BIND")
+	port, err2 := servitorEnvKV("SERVITOR_PORT")
+	if err1 != nil || err2 != nil {
+		return "(no probe: .env incomplete)"
+	}
+	if m := servitorIPRe.FindStringSubmatch(bind); m == nil {
+		return "(no probe: SERVITOR_BIND is not a plain IPv4)"
+	} else {
+		for _, oct := range m[1:5] {
+			if n, _ := strconv.Atoi(oct); n > 255 {
+				return "(no probe: SERVITOR_BIND is not a plain IPv4)"
+			}
+		}
+	}
+	if !servitorPortRe.MatchString(port) {
+		return "(no probe: SERVITOR_PORT is not a number)"
+	}
+	if n, _ := strconv.Atoi(port); n < 1 || n > 65535 {
+		return "(no probe: SERVITOR_PORT out of range)"
+	}
+	out, err := runCmd(ctx, "/usr/bin/curl", "-s", "-m", "5", "http://"+bind+":"+port+"/healthz")
+	if err != nil {
+		if t := strings.TrimSpace(out); t != "" {
+			return "(unreachable: " + t + ")"
+		}
+		return "(unreachable)"
+	}
+	return strings.TrimSpace(out)
+}
+
+// servitorStatus — VM domain state + the best-effort /healthz probe. No
+// args; read-only. Prints a short human-readable summary (the panel's
+// Actions view renders the action's stdout).
+func servitorStatus(ctx context.Context, args []string, logf func(string, ...any)) error {
+	state, err := runCmd(ctx, "/usr/bin/virsh", "domstate", servitorVMName)
+	if err != nil {
+		return fmt.Errorf("virsh domstate %s: %v: %s", servitorVMName, err, strings.TrimSpace(state))
+	}
+	state = strings.TrimSpace(state)
+	health := probeServitorHealth(ctx)
+	logf("servitor status: vm=%s healthz=%s", state, health)
+	fmt.Printf("vm: %s\nhealthz: %s\n", state, health)
+	return nil
+}
+
+// servitorVMRestart — planned reboot. The app survives: session files and
+// mounts persist on the state disk; boot reconciliation kills crash-orphans
+// and marks interrupted sessions; pickup respawns (the servitor repo's
+// design, not portcullis's). virsh reboot (ACPI) is used, never destroy.
+func servitorVMRestart(ctx context.Context, args []string, logf func(string, ...any)) error {
+	out, err := runCmd(ctx, "/usr/bin/virsh", "reboot", servitorVMName)
+	if err != nil {
+		return fmt.Errorf("virsh reboot %s: %v: %s", servitorVMName, err, strings.TrimSpace(out))
+	}
+	logf("servitor VM reboot requested")
+	return nil
+}
+
+// servitorScriptTail — the shared exec tail for sync/doctor: on success the
+// script's stdout IS the result (sync's success marker, the doctor's GREEN
+// line) — print its last 4 KB to stdout (the panel surfaces the action's
+// stdout) and log the full output to journald; on failure the same output
+// rides the error (panel-api surfaces it in the response).
+func servitorScriptTail(what, script, out string, err error, logf func(string, ...any)) error {
+	out = strings.TrimSpace(out)
+	if len(out) > 4096 {
+		out = "…" + out[len(out)-4096:]
+	}
+	if err != nil {
+		logf("servitor-%s failed (%v):\n%s", what, err, out)
+		return fmt.Errorf("servitor-%s: %v\n%s", what, err, out)
+	}
+	logf("servitor-%s ok:\n%s", what, out)
+	fmt.Println(out)
+	return nil
+}
+
+// servitorSync — push the host checkout into the VM (config/lib/app + the
+// key slice). The script NEVER blocks a run — with a run active
+// it stages everything, sets the update-waiting flag, and exits 0; the
+// app's tick applies restart+doctor at the first idle moment. It therefore
+// can run for a long while (staging wait ≤150 s + service wait + the
+// doctor's live prompt): 600 s keeps it inside the panel-api's 660 s HTTP
+// cap with headroom. On an action timeout the ctx deadline KILLS the
+// script at the deadline (runCmd: direct child dies, in-flight scp/ssh
+// grandchildren may linger) — safe because the script is idempotent and
+// resumable: re-run it (RUNBOOK → Servitor, troubleshooting).
+//
+// The deploy key is passed explicitly: runCmd's scrubbed env has no HOME,
+// so the script's ${HOME:-/root} default is only a backstop — /root/.srv
+// is the canonical root-side home (RUNBOOK → Servitor).
+func servitorSync(ctx context.Context, args []string, logf func(string, ...any)) error {
+	script, err := checkManagedScript(servitorRepoPath, filepath.Join("deploy", "sync.sh"))
+	if err != nil {
+		return err
+	}
+	out, err := runCmd(ctx, script, "--deploy-key", servitorDeployKey)
+	return servitorScriptTail("sync", script, out, err, logf)
+}
+
+// servitorDoctor — the servitor deploy gate (guest certification + the
+// host-side firewall probes + one live prompt + one live search). Read-
+// only with respect to the VM (it never changes state), so no confirm —
+// but it spends one model turn, hence its own 300 s budget.
+func servitorDoctor(ctx context.Context, args []string, logf func(string, ...any)) error {
+	script, err := checkManagedScript(servitorRepoPath, filepath.Join("deploy", "doctor.sh"))
+	if err != nil {
+		return err
+	}
+	out, err := runCmd(ctx, script, "--deploy-key", servitorDeployKey)
+	return servitorScriptTail("doctor", script, out, err, logf)
+}
+
 var registry = map[string]Action{
 	"restart-service": {
 		Summary: "Restart a systemd service",
@@ -1249,5 +1439,33 @@ var registry = map[string]Action{
 		Timeout: 30 * time.Second,
 		Confirm: true,
 		Run:     autoupdateToggle,
+	},
+	"servitor-status": {
+		Summary: "Servitor VM state + guest /healthz probe (read-only)",
+		Args:    nil,
+		Timeout: 30 * time.Second,
+		Confirm: false,
+		Run:     servitorStatus,
+	},
+	"servitor-vm-restart": {
+		Summary: "Reboot the servitor VM (planned; boot reconciliation handles the unclean path)",
+		Args:    nil,
+		Timeout: 60 * time.Second,
+		Confirm: true,
+		Run:     servitorVMRestart,
+	},
+	"servitor-sync": {
+		Summary: "Push the host checkout (config/lib/app + key slice) into the servitor VM; never blocks a run",
+		Args:    nil,
+		Timeout: 600 * time.Second,
+		Confirm: true,
+		Run:     servitorSync,
+	},
+	"servitor-doctor": {
+		Summary: "Run the servitor deploy doctor (guest certification + firewall probes + live prompt)",
+		Args:    nil,
+		Timeout: 300 * time.Second,
+		Confirm: false,
+		Run:     servitorDoctor,
 	},
 }
