@@ -305,10 +305,34 @@ function UpdateBanners({
 }) {
   const status = report?.state?.status
   if (status === 'in-progress') {
+    // A live run never carries state.failure (the run's own state rewrites
+    // drop it) — so in-progress WITH a failure is a DEAD run whose automatic
+    // rollback was only PARTIAL: unknown stack state, the log tail below ends
+    // with the rollback's message, and re-running the rollback is the
+    // sanctioned remedy (the snapshots are intact).
+    const failure = report?.state?.failure
     return (
-      <div className="banner">
-        <b>update in progress</b> — started {updateTs(report?.state?.snapshot)} · gated (health +
-        doctor), auto-rolls-back on failure · the API may blip while panel-api itself updates
+      <div className={failure ? 'banner err' : 'banner'}>
+        <b>
+          {failure
+            ? 'update failed mid-run — the automatic rollback was only PARTIAL (unknown stack state)'
+            : 'update in progress'}
+        </b>{' '}
+        {failure?.gate && <span>— {failure.gate}</span>}{" "}
+        {updateTs(report?.state?.snapshot)}{" "}
+        {failure ? (
+          <>
+            <button onClick={onRollback} disabled={busy}>
+              re-run rollback
+            </button>{" "}
+            <button onClick={() => onRun(false)} disabled={busy}>
+              re-run update
+            </button>
+          </>
+        ) : (
+          <span>· gated (health + doctor), auto-rolls-back on failure · the API may blip while panel-api itself updates</span>
+        )}
+        {failure?.detail && <pre className="out">{failure.detail}</pre>}
         {report?.log_tail && <pre className="out">{report.log_tail}</pre>}
       </div>
     )
@@ -316,27 +340,40 @@ function UpdateBanners({
   if (status === 'failed') {
     // Aborted at a pre-snapshot gate (preflight/doctor): the stack is exactly
     // as it was — nothing was applied, so there is nothing to roll back.
-    // The log tail holds the gate's failure.
+    // state.failure.detail holds the gate's FAILING lines (recorded by the
+    // gate in the state file): the run-log tail of a doctor failure is
+    // mostly PASSes AFTER the failing check, so it is shown only as the
+    // fallback for state files written before the failure field existed.
+    const failure = report?.state?.failure
     return (
       <div className="banner err">
         <b>
           the last update failed before it changed anything
         </b>{' '}
+        {failure?.gate && <span>— {failure.gate}</span>}{" "}
         {updateTs(report?.state?.snapshot)}{' '}
         <span title="nothing was applied — there is no snapshot to roll back to">· nothing was applied, nothing to roll back</span>{' '}
         <button onClick={() => onRun(false)} disabled={busy}>
           re-run update
         </button>
-        {report?.log_tail && <pre className="out">{report.log_tail}</pre>}
+        {failure?.detail ? (
+          <pre className="out">{failure.detail}</pre>
+        ) : (
+          report?.log_tail && <pre className="out">{report.log_tail}</pre>
+        )}
       </div>
     )
   }
   if (status === 'rolled-back' || status === 'partially-rolled-back') {
+    // state.failure.detail (when present) = what failed the gate; the log
+    // tail below it = what the rollback did (reverted / partial).
+    const failure = report?.state?.failure
     return (
       <div className="banner err">
         <b>
           the last update {status === 'rolled-back' ? 'failed and was rolled back' : 'failed — rollback was only PARTIAL'}
         </b>{' '}
+        {failure?.gate && <span>— {failure.gate}</span>}{" "}
         {updateTs(report?.state?.snapshot)}{' '}
         <button onClick={onRollback} disabled={busy}>
           re-run rollback
@@ -344,6 +381,7 @@ function UpdateBanners({
         <button onClick={() => onRun(true)} disabled={busy}>
           re-run update
         </button>
+        {failure?.detail && <pre className="out">{failure.detail}</pre>}
         {report?.log_tail && <pre className="out">{report.log_tail}</pre>}
       </div>
     )
@@ -441,6 +479,9 @@ function UpdatesCard({
   const changed = rows.filter((r) => r.change !== 'unchanged')
   const majors = rows.filter((r) => r.change === 'major')
   const inProgress = status === 'in-progress'
+  // in-progress WITH a failure = a dead run whose auto-rollback was partial
+  // (a live run never carries the field — see UpdateBanners).
+  const partialRollback = inProgress && report?.state?.failure != null
 
   return (
     <section className="panelish">
@@ -450,7 +491,12 @@ function UpdatesCard({
         </h3>
         <span className="note">
           {status == null && 'no update run yet'}
-          {inProgress && <b className="t-warn">in progress…</b>}
+          {inProgress && !partialRollback && <b className="t-warn">in progress…</b>}
+          {partialRollback && (
+            <b className="t-crit" title="the automatic rollback was only partial — unknown stack state (re-run it from the banner)">
+              partial rollback
+            </b>
+          )}
           {status === 'updated' && <b className="t-ok">{updateTs(report?.state?.snapshot)}</b>}
           {status === 'failed' && (
             <b className="t-crit" title="aborted at a pre-snapshot gate (preflight/doctor) — nothing was applied, nothing to roll back">

@@ -477,7 +477,7 @@ searxng_env_check() { # <label> <compose-file>
   local label="$1" file="$2" k g keys allowed clean=1 is_guard
   keys="$(searxng_env_keys "$file")"
   allowed="$(printf '%s\n' "${SEARXNG_ENV_ALLOW[@]}" | LC_ALL=C sort -u)"
-  for k in $SEARXNG_ENV_GUARDS; do
+  for k in "${SEARXNG_ENV_GUARDS[@]}"; do
     if grep -qx "$k" <<<"$keys"; then
       bad "$label: guard key $k in the searxng env block — env > settings.yml, the deployed file is overridden (the secret path's premise is 'the env name is absent')"
       hint "remove $k from the compose environment: block — the named allow-list is the control (RUNBOOK → Web search)"
@@ -486,7 +486,7 @@ searxng_env_check() { # <label> <compose-file>
   done
   for k in $keys; do
     is_guard=0
-    for g in ${SEARXNG_ENV_GUARDS[@]}; do [[ "$k" == "$g" ]] && is_guard=1; done
+    for g in "${SEARXNG_ENV_GUARDS[@]}"; do [[ "$k" == "$g" ]] && is_guard=1; done
     if (( is_guard )); then continue; fi   # already reported
     if ! grep -qx "$k" <<<"$allowed"; then
       bad "$label: env member $k outside the searxng allow-list (${SEARXNG_ENV_ALLOW[*]})"
@@ -1152,8 +1152,14 @@ USTATE=/opt/panel/.update-state
 if [[ -f $USTATE ]]; then
   if python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$USTATE" 2>/dev/null; then
     ok "update state file parses"
-    # Stuck in-progress: the update process died without finishing (power
-    # loss, kill). Snapshot + log survive; the fix is manual.
+    # Stuck in-progress: either the update process died without finishing
+    # (power loss, kill — snapshot + log survive, the fix is manual), or the
+    # automatic rollback was only PARTIAL: a live run never carries the
+    # `failure` field (the run's own state rewrites drop it — common.sh), so
+    # in-progress WITH one is a DEAD run with unknown stack state. Flag it
+    # NOW, not after the 2h stuck threshold: the next `make update` must
+    # refuse to stack on unknown state. The remedy never deadlocks —
+    # 09-rollback.sh has no doctor precondition, and the snapshots are intact.
     stuck="$(python3 -c '
 import calendar, json, sys, time
 try:
@@ -1164,7 +1170,10 @@ try:
     print(max(0, int(time.time() - calendar.timegm(time.strptime(ts, "%Y%m%dT%H%M%S")))))
 except Exception:
     pass' "$USTATE" 2>/dev/null)"
-    if [[ -n ${stuck:-} && $stuck -gt 7200 ]]; then
+    if [[ -n ${stuck:-} ]] && grep -q '"failure":' "$USTATE" 2>/dev/null; then
+      bad "last update's automatic rollback was PARTIAL (state: in-progress + failure, ${stuck}s old)"
+      hint "the run is dead (a live run never carries failure): sudo jq .failure /opt/panel/.update-state for what failed — re-run the rollback: make rollback (the panel's banner offers it too; the snapshots are intact)"
+    elif [[ -n ${stuck:-} && $stuck -gt 7200 ]]; then
       bad "update stuck in-progress for ${stuck}s"
       hint "the update process died mid-run: sudo tail /opt/panel/.update-run.log, pgrep -af '08-update.sh|09-rollback.sh' — kill the leftover, then: make rollback (or re-run make update)"
     elif [[ ${stuck:-0} -gt 0 ]]; then
@@ -1176,7 +1185,7 @@ except Exception:
     # visible BEFORE the next update spends its minutes re-hitting it.
     if grep -q '"status": "failed"' "$USTATE" 2>/dev/null; then
       warn "last update failed at a pre-snapshot gate (state: failed — nothing was applied)"
-      hint "the run log holds the gate failure: sudo tail /opt/panel/.update-run.log — fix it, then re-run: make update"
+      hint "the failing checks: sudo jq -r '.failure.detail' /opt/panel/.update-state (full gate output: sudo tail /opt/panel/.update-run.log) — fix it, then re-run: make update"
     fi
   else
     bad "update state file is corrupt"

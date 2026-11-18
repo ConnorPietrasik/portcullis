@@ -1,2 +1,3 @@
+Add image / video gen stuff
 Make an actual portfolio site
 MAYBE - An Android app, so I can do everything from my phone without a browser? Would also fix the NAT hairpin thing since it could probably do explicit network stuff for itself.

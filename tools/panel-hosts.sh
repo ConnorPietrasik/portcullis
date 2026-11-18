@@ -39,7 +39,7 @@ set -euo pipefail
 C_G=$'\033[1;32m'; C_Y=$'\033[1;33m'; C_R=$'\033[1;31m'; C_0=$'\033[0m'
 info() { printf '%s==>%s %s\n' "$C_G" "$C_0" "$*"; }
 warn() { printf '%s==>%s %s\n' "$C_Y" "$C_0" "$*"; }
-die()  { printf '%s==>%s %s\n' "$C_R" "$*" >&2; exit 1; }
+die()  { printf '%s==>%s %s\n' "$C_R" "$C_0" "$*" >&2; exit 1; }
 
 BEGIN_MARK="# BEGIN panel-hosts (managed by tools/panel-hosts.sh — DO NOT EDIT)"
 END_MARK="# END panel-hosts"

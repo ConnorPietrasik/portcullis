@@ -60,6 +60,7 @@ update_begin_run
 # `make doctor` runs the same render check.
 if ! preflight_out="$(sudo docker compose --env-file "$REPO_ROOT/.env" \
     -f "$REPO_ROOT/compose/docker-compose.yml" config -q 2>&1)"; then
+  update_record_failure "preflight (repo compose render)" "$preflight_out"
   update_set_status failed
   die "preflight: repo compose does not render with the repo .env — nothing was touched (state: failed)
 $preflight_out
@@ -68,10 +69,17 @@ fi
 
 if [[ "${UPDATE_DOCTOR:-1}" != "0" ]]; then
   info "precondition: doctor must be green BEFORE updating (a pre-existing failure would auto-revert the whole update)"
-  if ! bash "$REPO_ROOT/setup/07-doctor.sh"; then
+  # tee (not plain capture): the detached run's log keeps streaming live, and
+  # the file feeds update_record_failure — the banner shows the FAILING
+  # checks (a bare tail of doctor's report is mostly PASSes after the failure).
+  doc_tmp="$(mktemp)"
+  if ! bash "$REPO_ROOT/setup/07-doctor.sh" 2>&1 | tee "$doc_tmp"; then
+    update_record_failure "doctor (precondition)" "$(cat "$doc_tmp")"
     update_set_status failed
+    rm -f "$doc_tmp"
     die "doctor is not green — the failures above are pre-existing (this run touched nothing — state: failed); fix them, then re-run: make update"
   fi
+  rm -f "$doc_tmp"
 fi
 
 info "1/7 snapshotting the running stack (rollback anchor: images + configs + panel-api + npm files)"
@@ -216,9 +224,14 @@ fi
 
 if [[ "${UPDATE_DOCTOR:-1}" != "0" ]]; then
   info "verifying: full doctor pass (every RUNBOOK check, including panel-api)"
-  if ! bash "$REPO_ROOT/setup/07-doctor.sh"; then
-    update_rollback_or_die "doctor gate"
+  # tee — the log keeps streaming live; the file feeds update_rollback_or_die,
+  # which records the FAILING checks in the state file's failure field (the
+  # banner shows them; the log tail is mostly passes after the failure).
+  doc_tmp="$(mktemp)"
+  if ! bash "$REPO_ROOT/setup/07-doctor.sh" 2>&1 | tee "$doc_tmp"; then
+    update_rollback_or_die "doctor (post-update)" "$(cat "$doc_tmp")"
   fi
+  rm -f "$doc_tmp"
 fi
 
 update_set_status updated

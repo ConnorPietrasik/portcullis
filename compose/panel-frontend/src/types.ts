@@ -212,6 +212,8 @@ export interface UpdateReport {
     status?: string
     repo_root?: string
     repo_head?: string
+    /** the last gate's failure (failed / rolled-back runs): the failing checks, recorded by the gate */
+    failure?: { gate: string; detail: string }
     services?: Record<string, { image_id: string; rollback_image: string; image_tags: string }>
   } | null
   /** the daily timer's state (null when the unit isn't installed) */

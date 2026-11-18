@@ -352,7 +352,15 @@ acme_promote() { # <target-dir> — flip staging→prod. Idempotent; wipes the A
 # panel shows the run from the moment it starts; a snapshot then rewrites it
 # with the full pre-update record, and the run ends updated / failed / rolled
 # back. `failed` = aborted at a pre-snapshot gate (preflight/doctor) — the
-# stack is exactly as it was, so there is nothing to roll back. Details:
+# stack is exactly as it was, so there is nothing to roll back. A failing
+# gate also records `failure` = {gate, detail} — the gate's FAILING lines
+# (update_record_failure) — which the dashboard's banner shows instead of the
+# run-log tail (a doctor report's tail is mostly passes); every auto-rollback
+# records at least the gate's name (its reason), so an in-progress state WITH
+# a failure is a DEAD run whose rollback was only partial (a live run never
+# carries the field — its own rewrites drop it), and the dashboard's banner
+# turns red on it. The next run's update_begin_run / snapshot_stack rewrites
+# drop it. Details:
 # docs/RUNBOOK.md → Updates.
 
 STACK_STATE_FILE=/opt/panel/.update-state
@@ -502,6 +510,72 @@ d["status"] = sys.argv[2]
 json.dump(d, open(sys.argv[3], "w"), indent=2)
 ' "$STACK_STATE_FILE" "$1" "$tmp"
   sudo install -m 644 "$tmp" "$STACK_STATE_FILE"
+  rm -f "$tmp"
+}
+
+# "What actually failed" from a gate's output — for the dashboard banner,
+# NOT the run log (which keeps everything). Two shapes:
+#   - a doctor-style report (PASS/FAIL/WARN lines + ↳ hints): keep only the
+#     FAIL lines, the ↳ hint line(s) that follow each one, and the summary.
+#     The TAIL of such a report is mostly PASSes AFTER the failing check —
+#     exactly what the banner used to show (the run log's last 40 lines):
+#     a wall of passes and one unnamed failure.
+#   - plain error output (a compose render error, a pull failure): the tail
+#     IS the error — keep the last 20 lines.
+# ANSI is stripped first (the banner is a <pre>, not a terminal), and a FAIL
+# line is ANCHORED to doctor's bad() format (leading "FAIL " after optional
+# spaces) — a substring match would false-positive on PASS/WARN messages that
+# merely mention FAIL ("…a cross-tree FAIL would red-light…").
+update_failure_lines() { # <output> → the important lines
+  local out line kept="" infail=0
+  out="$(printf '%s\n' "$1" | sed -e $'s/\x1b\\[[0-9;]*m//g')"
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^[[:space:]]*FAIL[[:space:]] ]]; then
+      infail=1; kept+="$line"$'\n'
+    elif [[ "$line" == *'↳'* ]]; then
+      if (( infail )); then kept+="$line"$'\n'; fi
+    elif [[ "$line" =~ [0-9][[:space:]]+pass,[[:space:]]+[0-9][[:space:]]+fail ]]; then
+      kept+="$line"$'\n'   # the doctor summary: N pass, M fail, …
+    else
+      infail=0
+    fi
+  done <<<"$out"
+  if [[ -n "$kept" ]]; then
+    printf '%s' "$kept"
+  else
+    tail -n 20 <<<"$out"
+  fi
+}
+
+# Record a gate's failure in the state file (the dashboard's control plane):
+# failure = {gate, detail}, detail = update_failure_lines(output) (empty when
+# the gate passes no output — the gate name alone still marks the run),
+# capped at 4 KiB (the banner is a <pre>, the state file is polled every
+# 10 s). The banner shows the FAILING checks instead of the run-log tail; a
+# later run drops the field (update_begin_run / snapshot_stack rewrite the
+# file fresh). Written under the lock, by the failing gate, before it dies.
+update_record_failure() { # <gate> <output>
+  local gate="$1" detail tmp
+  # Bash slice, not `| head -c`: with pipefail a SIGPIPE'd producer would
+  # abort the run that is already failing.
+  detail="$(update_failure_lines "$2")"
+  detail="${detail:0:4096}"
+  tmp="$(mktemp)"
+  # Best-effort: this only feeds the banner. If the state file is already
+  # corrupt (or the write fails), degrade to the log-tail fallback and let
+  # the gate's own die/rollback message run — a set -e abort here would hide
+  # it (the banner's log-tail fallback still shows the failure).
+  if python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["failure"] = {"gate": sys.argv[2], "detail": sys.argv[3]}
+json.dump(d, open(sys.argv[4], "w"), indent=2)
+' "$STACK_STATE_FILE" "$gate" "$detail" "$tmp" \
+    && sudo install -m 644 "$tmp" "$STACK_STATE_FILE"; then
+    :
+  else
+    warn "could not record the gate failure in $STACK_STATE_FILE — the banner will fall back to the run-log tail"
+  fi
   rm -f "$tmp"
 }
 
@@ -999,8 +1073,17 @@ rollback_npm() { # <snapshot-dir>
 
 # Auto-rollback + hard stop — used by 08-update.sh when a gate fails. Rolls
 # back everything the update touched, best-effort per component. Never returns.
-update_rollback_or_die() { # <reason>
-  local reason="$1" ts dir failed=()
+# ALWAYS records the gate (its reason) in the state file's failure field
+# BEFORE the rollback rewrites the status, so the banner shows what actually
+# failed, not the log tail — and when the rollback is itself PARTIAL (status
+# left in-progress) the failure stays behind, which is what turns the
+# dashboard's banner red on the dead run (see the lifecycle note above).
+# $2 (optional) = the failing gate's raw output (doctor's report): its
+# FAILING lines become the detail; without it the detail is empty and the
+# banner shows the gate name only.
+update_rollback_or_die() { # <reason> [gate-output]
+  local reason="$1" gate_out="${2:-}" ts dir failed=()
+  update_record_failure "$reason" "$gate_out"
   warn "gate failed: $reason"
   warn "rolling back to the pre-update snapshot (budget ${UPDATE_HEALTH_TIMEOUT:-600}s)"
   sudo -v

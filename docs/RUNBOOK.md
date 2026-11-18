@@ -378,12 +378,20 @@ panel-do update-run  →  setup/08-update.sh --detach   (the exact same make upd
   mid-update, so the API blips for a few seconds; the banner survives it), an amber *update available* banner listing the
   pending commits / line changes with a red **MAJOR** badge when a line's major version moves, a red banner when an update
   fails and rolls back (plus *re-run rollback* / *re-run update* buttons), a red banner when an update fails at a
-  pre-snapshot gate (nothing was applied — nothing to roll back — *re-run update* button), and a collapsed *updates* card with the last
-  update's before→after rows.
+  pre-snapshot gate (nothing was applied — nothing to roll back — *re-run update* button), a red banner when the
+  automatic rollback was only PARTIAL (unknown stack state — the state stays `in-progress`, and the presence of the
+  `failure` field is what turns the banner red; *re-run rollback* / *re-run update* buttons), and a collapsed *updates* card with the last
+  update's before→after rows. A failed / rolled-back / partial banner shows the gate's **failing checks** (doctor's FAIL
+  lines + their hints + the summary, recorded in the state file's `failure` field by the failing gate — the doctor gates
+  pass their full report; the health/panel-api gates record their name only) — the run-log tail of a doctor report
+  is mostly PASSes after the failing check, so it is the fallback only (or, on a rolled-back banner, the companion:
+  it shows what the rollback did).
 - **Observability**: the run log is `/opt/panel/.update-run.log` (rotated to `.old` past 1 MB); the state file's status is
   `sudo jq .status /opt/panel/.update-state` (`in-progress` for the whole locked run, `failed` when a pre-snapshot gate aborts it
-  — the run log holds the reason); the timer's own journal:
-  `journalctl -u panel-autoupdate`; `make doctor` checks the state file, a stuck in-progress run, a stale lock, and — when
+  — the gate's failing lines are in its `failure` field: `sudo jq .failure /opt/panel/.update-state`, the full gate output in the
+  run log); the timer's own journal:
+  `journalctl -u panel-autoupdate`; `make doctor` checks the state file, a dead partial-rollback run (in-progress + the
+  `failure` field — flagged now, not after the 2h stuck threshold), a stuck in-progress run, a stale lock, and — when
   the timer is enabled — the clone's auto-exec safety (the same checks the action makes).
 - **First deploy of this feature**: `git pull` in the server clone (08/09 gain the committed exec bit + `--detach`),
   `make panel-do` (the new actions + the update-report smoke test — first, so the panel's update endpoints exist as
@@ -397,8 +405,9 @@ panel-do update-run  →  setup/08-update.sh --detach   (the exact same make upd
 | timer ticks (clean journal, no SKIPPED line) but no update ever lands | the installed unit lost `KillMode=process` — the default `control-group` kill SIGTERMs the detached update when the oneshot completes (`setsid` protects against terminal HUP, not cgroup teardown) — `make doctor` red-lights it; fix: git pull, `make autoupdate`, then force a tick (panel toggle off→on, or `systemctl restart panel-autoupdate.timer`) |
 | tick fails: "clone … is a git checkout but git status failed" | the clone's index is unreadable/corrupt (power loss or an interrupted git write) — inspect/fix the clone (worst case: re-clone + re-copy `.env`/`users_database.yml`), then re-run; *run anyway* applies the working tree as-is, deliberately |
 | action fails: "update state holds an invalid repo_root" | the state file was hand-edited — `sudo rm /opt/panel/.update-state`, then `make update` |
-| doctor: "update stuck in-progress" | the update process died mid-run — `sudo tail /opt/panel/.update-run.log`, `pgrep -af '08-update.sh\|09-rollback.sh'`, kill the leftover, then `make rollback` |
-| panel: "the last update failed before it changed anything" (state: failed) | a pre-snapshot gate failed (preflight or doctor — nothing was applied, nothing to roll back) — the run log holds the gate's output: `sudo tail /opt/panel/.update-run.log`; fix it, then re-run (the panel's *re-run update* or `make update`) |
+| doctor: "last update's automatic rollback was PARTIAL" (state: in-progress + failure) | the run is DEAD — its automatic rollback was only partial, the stack's state is unknown — `sudo jq .failure /opt/panel/.update-state` (what failed), `sudo tail /opt/panel/.update-run.log` (what the rollback did); re-run the rollback: `make rollback` (the panel's banner offers it too) |
+| doctor: "update stuck in-progress" (no failure field) | the update process died mid-run — `sudo tail /opt/panel/.update-run.log`, `pgrep -af '08-update.sh\|09-rollback.sh'`, kill the leftover, then `make rollback` |
+| panel: "the last update failed before it changed anything" (state: failed) | a pre-snapshot gate failed (preflight or doctor — nothing was applied, nothing to roll back) — the failing checks are in the state file's `failure` field (the banner shows them): `sudo jq -r '.failure.detail' /opt/panel/.update-state`; the full gate output is in the run log: `sudo tail /opt/panel/.update-run.log`; fix it, then re-run (the panel's *re-run update* or `make update`) |
 | doctor: "update lock held with no in-progress update" | a leftover from an interrupted run is still alive and holds the lock — flock is released only on process exit, so a held lock proves the holder never died; `sudo fuser -v /opt/panel/.update.lock` names it; kill it if stale, then `make doctor` |
 | doctor: clone "fails panel-do's auto-exec check" | the clone, its `setup/`, or a directory ABOVE the clone became group/other-writable (or is owned by `panel`) — `chmod go-w` it; `08/09-update.sh` not executable, panel-owned, or missing the bash shebang → re-pull the repo (exec bit + shebang are committed) |
 
