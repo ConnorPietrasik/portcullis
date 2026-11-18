@@ -941,8 +941,9 @@ reference (image build vs fast path, the domain template, the failure-mode
 table distilled from the dev box). The host-side shape, in order:
 
 ```bash
-# 1. Host packages (none of this exists on a fresh box)
-sudo pacman -S --needed libvirt qemu nodejs npm git e2fsprogs
+# 1. Host packages (none of this exists on a fresh box; rsync/zstd/curl
+#    are the guest image build's needs, nodejs/npm also build the chat UI)
+sudo pacman -S --needed libvirt qemu nodejs npm git e2fsprogs rsync zstd curl
 sudo systemctl enable --now libvirtd
 
 # 2. Servitor checkout + the single-purpose deploy key (NOT your SSH key).
@@ -965,10 +966,11 @@ sudo chmod 600 /opt/servitor-repo/.env
 #      SERVITOR_DNS_UPSTREAM default — multi-word values must stay QUOTED
 #      (sync.sh sources the file); the rest may stay at defaults.
 
-# 4. Guest image (sudo make guest — unshare -m needs it — or the fast path,
-#    INSTALL.md §4 + Appendix A)
+# 4. Guest image (the Makefile target runs as the invoking user — the build
+#    needs root, so the sudo is on `make` — or the fast path, INSTALL.md
+#    §4 + Appendix A)
 cd /opt/servitor-repo
-sudo make guest   # = sudo unshare -m deploy/guest/build.sh --env .env --deploy-key /root/.srv/deploy_key.pub
+sudo make guest   # = unshare -m deploy/guest/build.sh --env .env --deploy-key /root/.srv/deploy_key.pub
 
 # 5. State disk (ext4, LABEL=servitor-state — the image's fstab contract)
 sudo mkdir -p /opt/servitor-disk
@@ -1018,7 +1020,7 @@ make update                          # gated: sync + recreate + doctor gate
 | planned reboot | panel → `servitor-vm-restart` (ACPI reboot; the app's boot reconciliation handles the unclean path — restart, never destroy) |
 | edit prompts/skills/lib | edit `agent-config/` / `lib/` in `/opt/servitor-repo`, panel → `servitor-sync` (never blocks a run — an active run gets the update-waiting flag and exit 0; the app's tick applies at the next idle moment) |
 | deploy gate | panel → `servitor-doctor` (guest certification + firewall probes + one live prompt + one live search) |
-| version bump (pi / extension) | `deploy/update.sh` in the host checkout (SSH — long, network-bound, its own conformance gates + auto-rollback; deliberately NOT a panel action) |
+| version bump (pi / extension) | `deploy/update.sh` in the host checkout (SSH — long, network-bound, its own conformance gates + auto-rollback; deliberately NOT a panel action). First run on a fresh server: the gate is host-side, so the checkout needs `sudo make venv` + the `slot1` user (servitor INSTALL.md §10) |
 | rotate keys | host `.env` → servitor `deploy/sync.sh` (re-injects the key slice into the guest's 0600 env file) + restart; the portcullis stack's copy of the key floats with its own `make update` as usual |
 
 The four actions exec `virsh` and the checkout's `deploy/sync.sh` /
