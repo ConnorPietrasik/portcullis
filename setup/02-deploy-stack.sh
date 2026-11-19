@@ -26,8 +26,8 @@ fi
 # Copy the repo's compose tree + secrets to $TARGET (shared with make update).
 stack_sync_configs "$TARGET"
 
-# LLM GPU pool override: the ledger's projection as a compose -f file
-# (ROCR_VISIBLE_DEVICES per llm-* instance). panel-api re-renders it on every
+# GPU pool override: the ledger's projection as a compose -f file
+# (ROCR_VISIBLE_DEVICES per gpu-* instance). panel-api re-renders it on every
 # assignment; COMPOSE_STACK (make deploy / update / rollback / panel-do)
 # always includes it — the `up -d` below renders through it too — so create
 # it BEFORE the first `up -d`: a missing file would break every compose
@@ -35,10 +35,10 @@ stack_sync_configs "$TARGET"
 # base-file fallback cards instead of their assigned sets. `make api` (03)
 # re-derives ownership (panel).
 sudo mkdir -p /opt/panel-api
-if [[ ! -f /opt/panel-api/llm-gpu-override.yml ]]; then
-  printf 'services: {}\n' | sudo tee /opt/panel-api/llm-gpu-override.yml >/dev/null
+if [[ ! -f /opt/panel-api/gpu-pool-override.yml ]]; then
+  printf 'services: {}\n' | sudo tee /opt/panel-api/gpu-pool-override.yml >/dev/null
 fi
-sudo chmod 644 /opt/panel-api/llm-gpu-override.yml
+sudo chmod 644 /opt/panel-api/gpu-pool-override.yml
 
 info "Building + starting stack (first run pulls images and compiles the frontend)"
 # Deliberately NO `pull` here: the edge images float on the major line, so a

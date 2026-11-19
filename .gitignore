@@ -23,9 +23,9 @@ __pycache__/
 .venv/
 # panel-api dev-mode LLM settings + GPU pool state (PANEL_DEV=1 writes them in the CWD)
 llm-settings.json
-llm-gpu.json
-llm-gpu-override.yml
-.llm-gpu.lock
+gpu-pool.json
+gpu-pool-override.yml
+.gpu-pool.lock
 
 # runtime artifacts that may appear if the repo lives on the server
 *.sqlite3

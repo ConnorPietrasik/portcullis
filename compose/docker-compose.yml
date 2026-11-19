@@ -30,14 +30,14 @@ x-healthcheck: &healthcheck-opts
   retries: 3
   start_period: 1m
 
-# LLM fleet boilerplate — merged into every llm-* block via `<<: *llm-base`.
+# GPU fleet boilerplate — merged into every gpu-* block via `<<: *gpu-base`.
 # What varies per instance: environment (ROCR_VISIBLE_DEVICES + key), volumes
 # (its radiance config file), labels. Everything else is identical for every
 # radiance server, so it lives once here.
-x-llm-base: &llm-base
+x-gpu-base: &gpu-base
   image: stilldeadcode/radiance:latest # the ONE image deliberately OUTSIDE the
   # declared-line policy — frequent builds are wanted. A build that passes the
-  # gates but breaks behavior: make rollback WHAT=radiance (RUNBOOK → LLM fleet)
+  # gates but breaks behavior: make rollback WHAT=radiance (RUNBOOK → GPU fleet)
   restart: "no" # the fleet must not resurrect itself after a reboot — you pick
   # the set from the panel (edge services stay unless-stopped)
   init: true # forwards SIGTERM; the engine finishes its step and releases the cards
@@ -60,7 +60,7 @@ x-llm-base: &llm-base
   # radiance 2.x takes NO command-line flags: one YAML file per instance
   # (radiance --config FILE; the key reference is `radiance --help`, upstream
   # docs/MULTIMODEL.md §4). Each block mounts its own
-  # compose/llm-configs/<instance>.yaml — and YAML <<: merges SHALLOW, so a
+  # compose/gpu-configs/<instance>.yaml — and YAML <<: merges SHALLOW, so a
   # block's volumes list REPLACES this one: every block re-lists the /models
   # mount below (the same trap as labels).
   command: ["--config", "/etc/radiance/radiance.yaml"]
@@ -78,7 +78,7 @@ x-llm-base: &llm-base
     test: ["CMD", "busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8000/health"]
     # 5m is the margin — shorter reads unhealthy mid-load and make update's
     # 600s gate auto-rolls-back while a reload is still loading (raise
-    # UPDATE_HEALTH_TIMEOUT only for a much slower model — RUNBOOK → LLM fleet)
+    # UPDATE_HEALTH_TIMEOUT only for a much slower model — RUNBOOK → GPU fleet)
   networks: [edge] # NO network_mode: host — on the bridge, port 8000 is
   # reachable only from traefik (no UFW rule, no LAN/WAN exposure), so the
   # server binds 0.0.0.0 instead of the playground's --host ::
@@ -154,26 +154,27 @@ services:
     labels: ["panel.manage=true", "panel.category=Web"] # shows in the panel's Services view
     networks: [edge]
 
-  # ── LLM fleet (Radiance) — start/stop instances from the panel ──────────────
-  # An instance = one block here + one router pair in traefik/dynamic/llm.yml:
-  # llm-<name> ↔ <name>.pietrasik.top. Port always 8000 (own IP per container).
+  # ── GPU fleet (Radiance) — start/stop instances from the panel ──────────────
+  # An instance = one block here + one router pair in traefik/dynamic/gpu.yml:
+  # gpu-<name> ↔ <name>.pietrasik.top. Port always 8000 (own IP per container).
   #
   # CARDS: the GPU view (panel tab "GPUs") assigns card sets per instance at
-  # run time — it pins ROCR_VISIBLE_DEVICES through /opt/panel-api/llm-gpu-
+  # run time — it pins ROCR_VISIBLE_DEVICES through /opt/panel-api/gpu-pool-
   # override.yml (every compose render includes it), so the pins below are
-  # FALLBACK DEFAULTS for a hand-run compose, not the running truth. llm.cards
+  # FALLBACK DEFAULTS for a hand-run compose, not the running truth. gpu.cards
   # is how many cards the instance NEEDS (keep == the tp in its radiance
   # config — doctor checks) — the pool's auto-
   # grab sizes off it. The display name (panel.manage) has no card set in it
   # (the set moves — and no commas: docker ps encodes labels comma-joined).
   # restart "no" so a reboot never resurrects the set you chose; the boot
   # autostart list (GPU view) is what comes back. Model files:
-  # /models/llm/*.rad (ro-mounted at /models). New instance (including a
-  # second copy of a model, e.g. llm-27b-1): copy the block + the router pair
-  # (RUNBOOK → LLM fleet; make doctor checks all five name references match),
+  # /models/llm/*.rad (ro-mounted at /models; dir name predates the llm-* →
+  # gpu-* rename and now holds every fleet model). New instance (including a
+  # second copy of a model, e.g. gpu-27b-1): copy the block + the router pair
+  # (RUNBOOK → GPU fleet; make doctor checks all six name references match),
   # make update, then assign cards in the GPU view.
-  llm-27b:
-    <<: *llm-base
+  gpu-27b:
+    <<: *gpu-base
     environment:
       ROCR_VISIBLE_DEVICES: "0,1" # fallback default (the GPU view's override wins): 2 cards — the
       # IQR-V4 vocabulary-weighted lm_head (output.k<B>) only shards at tp<=2 — class row counts
@@ -183,54 +184,54 @@ services:
       RADIANCE_LOG: "warn" # per-request INFO lines (tok/s, cache, ttft) are chatty — radiance docs §6.5
     volumes:
       # replaces the anchor's list (shallow <<): re-lists /models, adds this
-      # instance's radiance config (2.x takes no flags — RUNBOOK → LLM fleet)
+      # instance's radiance config (2.x takes no flags — RUNBOOK → GPU fleet)
       - /models/llm:/models:ro
-      - ./llm-configs/llm-27b.yaml:/etc/radiance/radiance.yaml:ro
+      - ./gpu-configs/gpu-27b.yaml:/etc/radiance/radiance.yaml:ro
     labels:
       - panel.manage=Qwen 27B IQ6R-S-V4 # Services view name (no card set — it moves)
-      - panel.category=LLM # NOT on x-llm-base: the per-block labels list replaces
+      - panel.category=LLM # NOT on x-gpu-base: the per-block labels list replaces
       # the anchor's on merge (shallow <<), so new instances carry it by copying the block
-      - llm.cards=2 # the pool's auto-grab size (== tp in llm-configs/llm-27b.yaml — doctor checks)
-  llm-27b-1:
-    <<: *llm-base
+      - gpu.cards=2 # the pool's auto-grab size (== tp in gpu-configs/gpu-27b.yaml — doctor checks)
+  gpu-27b-1:
+    <<: *gpu-base
     environment:
       ROCR_VISIBLE_DEVICES: "2,3"
       RADIANCE_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env}
       RADIANCE_LOG: "warn"
     volumes:
       - /models/llm:/models:ro # shallow <<: this list replaces the anchor's
-      - ./llm-configs/llm-27b-1.yaml:/etc/radiance/radiance.yaml:ro
+      - ./gpu-configs/gpu-27b-1.yaml:/etc/radiance/radiance.yaml:ro
     labels:
       - panel.manage=Qwen 27B IQ6R-S-V4 1
       - panel.category=LLM
-      - llm.cards=2 # == tp in llm-configs/llm-27b-1.yaml
-  llm-27b-2:
-    <<: *llm-base
+      - gpu.cards=2 # == tp in gpu-configs/gpu-27b-1.yaml
+  gpu-27b-2:
+    <<: *gpu-base
     environment:
       ROCR_VISIBLE_DEVICES: "4,5"
       RADIANCE_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env}
       RADIANCE_LOG: "warn"
     volumes:
       - /models/llm:/models:ro # shallow <<: this list replaces the anchor's
-      - ./llm-configs/llm-27b-2.yaml:/etc/radiance/radiance.yaml:ro
+      - ./gpu-configs/gpu-27b-2.yaml:/etc/radiance/radiance.yaml:ro
     labels:
       - panel.manage=Qwen 27B IQ6R-S-V4 2
       - panel.category=LLM
-      - llm.cards=2 # == tp in llm-configs/llm-27b-2.yaml
-  llm-flashnext:
-    <<: *llm-base
+      - gpu.cards=2 # == tp in gpu-configs/gpu-27b-2.yaml
+  gpu-flashnext:
+    <<: *gpu-base
     environment:
       ROCR_VISIBLE_DEVICES: "0,1,2,3" # fallback default (override wins): same four cards as
-      # llm-27b's — not at the same time
+      # gpu-27b's — not at the same time
       RADIANCE_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env}
       RADIANCE_LOG: "warn"
     volumes:
       - /models/llm:/models:ro # shallow <<: this list replaces the anchor's
-      - ./llm-configs/llm-flashnext.yaml:/etc/radiance/radiance.yaml:ro
+      - ./gpu-configs/gpu-flashnext.yaml:/etc/radiance/radiance.yaml:ro
     labels:
       - panel.manage=Qwen Flash-Next # Services view name (no card set — it moves)
       - panel.category=LLM
-      - llm.cards=4 # the pool's auto-grab size (== tp in llm-configs/llm-flashnext.yaml)
+      - gpu.cards=4 # the pool's auto-grab size (== tp in gpu-configs/gpu-flashnext.yaml)
 
   # ── SearXNG — web search for agents + private browser UI ──────────────────
   # Image floats on latest — declared OUTSIDE the declared-line policy (the
@@ -250,7 +251,7 @@ services:
   # doctor carries it).
   searxng:
     image: searxng/searxng:latest
-    # restart: unless-stopped — and do NOT merge x-llm-base (it carries
+    # restart: unless-stopped — and do NOT merge x-gpu-base (it carries
     # restart: "no", which the update's on-demand test treats as "leave
     # down"). searxng is always-on, not on-demand.
     restart: unless-stopped

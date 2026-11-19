@@ -1,6 +1,6 @@
-# llm-flashnext — radiance 2.x takes its settings from THIS file alone: the
+# gpu-flashnext — radiance 2.x takes its settings from THIS file alone: the
 # container's command is `radiance --config /etc/radiance/radiance.yaml`
-# (x-llm-base) — no flags. A key is the pre-2.x flag minus its dashes, at its
+# (x-gpu-base) — no flags. A key is the pre-2.x flag minus its dashes, at its
 # level (upstream docs/MULTIMODEL.md §4; the full reference: `radiance --help`):
 #   server:  host / port / api-key(-env)
 #   memory:  gpu-headroom-mib
@@ -35,14 +35,14 @@ models:
   Qwen3.8-Flash-Next:
     model: /models/qwen3.8-next-flash-iqr-v4.rad
     aliases: [default]           # model-less requests land here
-    tp: 4                        # == the block's llm.cards (doctor cross-checks)
+    tp: 4                        # == the block's gpu.cards (doctor cross-checks)
     max-num-seqs: 8
     max-model-len: 250000        # the pre-2.x value; upstream's rows run 200000
     placement: expert_tiered
     host-pool-mib: 49152         # 48 GiB pinned, 12 GiB a rank (the FP8 container
                                  # took 24576 — the IQR-V4 weights are bigger)
     prefix-cache-mib: 65536      # the host tier — 0 (the default) turns it OFF
-    checkpoint-policy: tip-only  # kept from the pre-2.x line (see llm-27b.yaml)
+    checkpoint-policy: tip-only  # kept from the pre-2.x line (see gpu-27b.yaml)
     num-speculative-tokens: 3    # the MTP draft head's operating point (default
                                  # auto resolves to it)
     max-num-batched-tokens: 2048

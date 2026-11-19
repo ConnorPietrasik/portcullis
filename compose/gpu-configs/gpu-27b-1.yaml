@@ -1,5 +1,5 @@
-# llm-27b-2 — radiance 2.x takes its settings from THIS file alone: the container's
-# command is `radiance --config /etc/radiance/radiance.yaml` (x-llm-base) — no flags.
+# gpu-27b-1 — radiance 2.x takes its settings from THIS file alone: the container's
+# command is `radiance --config /etc/radiance/radiance.yaml` (x-gpu-base) — no flags.
 # A key is the pre-2.x flag minus its dashes, at its level (upstream
 # docs/MULTIMODEL.md §4; the full reference: `radiance --help`):
 #   server:  host / port / api-key(-env)
@@ -31,7 +31,7 @@ models:
   Qwen3.8-27B:
     model: /models/qwen3.8-27b-iq6r-s-v4.rad
     aliases: [default]           # model-less requests land here
-    tp: 2                        # == the block's llm.cards (doctor cross-checks)
+    tp: 2                        # == the block's gpu.cards (doctor cross-checks)
     max-num-seqs: 6
     max-model-len: 250000
     prefix-cache-mib: 40960      # the host tier — 0 (the default) turns it OFF

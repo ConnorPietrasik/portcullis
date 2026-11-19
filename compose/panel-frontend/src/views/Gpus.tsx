@@ -61,7 +61,7 @@ function GpuTile({ index, holder, gpu }: { index: number; holder: string | null;
 }
 
 export default function Gpus({ intervalMs }: { intervalMs: number }) {
-  const pool = usePoll(() => api<GpuPool>('/llm/gpus'), intervalMs)
+  const pool = usePoll(() => api<GpuPool>('/gpus'), intervalMs)
   // hardware readings (temp/VRAM/util) ride the metrics poll at the same
   // cadence, joined on pool index = ROCR index (the space
   // ROCR_VISIBLE_DEVICES counts in). The API supplies it as rocr_index (the
@@ -122,7 +122,7 @@ export default function Gpus({ intervalMs }: { intervalMs: number }) {
         </h3>
         <p className="muted">
           Cards are assigned per instance below: <code>auto</code> grabs the lowest free set (sized
-          by the instance's <code>llm.cards</code> label), <code>pick</code> names exact cards. The pin is{' '}
+          by the instance's <code>gpu.cards</code> label), <code>pick</code> names exact cards. The pin is{' '}
           <code>ROCR_VISIBLE_DEVICES</code> at container start — an assignment (re)creates the
           container, and the set sticks across stops, updates and reboots.
         </p>
@@ -143,7 +143,7 @@ export default function Gpus({ intervalMs }: { intervalMs: number }) {
 
       <div className="card">
         <h3>
-          instances <span className="muted">— fleet (llm-*) from the deployed compose</span>
+          instances <span className="muted">— fleet (gpu-*) from the deployed compose</span>
         </h3>
         <table>
           <thead>
@@ -188,10 +188,10 @@ export default function Gpus({ intervalMs }: { intervalMs: number }) {
                         type="checkbox"
                         checked={inst.autostart}
                         disabled={busy !== null}
-                        title="start on boot (llm-autostart.service, in list order)"
+                        title="start on boot (gpu-autostart.service, in list order)"
                         onChange={(e) =>
                           act(`autostart:${inst.name}`, () =>
-                            api<GpuPool>('/llm/gpus/autostart', {
+                            api<GpuPool>('/gpus/autostart', {
                               method: 'POST',
                               body: JSON.stringify({ service: inst.name, enabled: e.target.checked }),
                             }))
@@ -206,7 +206,7 @@ export default function Gpus({ intervalMs }: { intervalMs: number }) {
                           onClick={() =>
                             act(`stop:${inst.name}`, async () => {
                               if (!window.confirm(`stop ${inst.display}?`)) return
-                              return api<GpuPool>('/llm/gpus/stop', {
+                              return api<GpuPool>('/gpus/stop', {
                                 method: 'POST',
                                 body: JSON.stringify({ service: inst.name }),
                               })
@@ -220,7 +220,7 @@ export default function Gpus({ intervalMs }: { intervalMs: number }) {
                           disabled={busy !== null}
                           onClick={() =>
                             act(`start:${inst.name}`, () =>
-                              api<GpuPool>('/llm/gpus/start', {
+                              api<GpuPool>('/gpus/start', {
                                 method: 'POST',
                                 body: JSON.stringify({ service: inst.name }),
                               }))
@@ -243,7 +243,7 @@ export default function Gpus({ intervalMs }: { intervalMs: number }) {
                               !window.confirm(`move ${inst.display} to the lowest free cards? (the model reloads)`)
                             )
                               return
-                            return api<GpuPool>('/llm/gpus/assign', {
+                            return api<GpuPool>('/gpus/assign', {
                               method: 'POST',
                               body: JSON.stringify({ service: inst.name, gpus: 'auto' }),
                             })
@@ -292,7 +292,7 @@ export default function Gpus({ intervalMs }: { intervalMs: number }) {
                             const name = inst.name
                             setPickerFor(null)
                             void act(`pick:${name}`, () =>
-                              api<GpuPool>('/llm/gpus/assign', {
+                              api<GpuPool>('/gpus/assign', {
                                 method: 'POST',
                                 body: JSON.stringify({ service: name, gpus }),
                               }))
@@ -318,17 +318,17 @@ export default function Gpus({ intervalMs }: { intervalMs: number }) {
             {data.instances.length === 0 && (
               <tr>
                 <td colSpan={6} className="muted">
-                  no llm-* services in the deployed compose
+                  no gpu-* services in the deployed compose
                 </td>
               </tr>
             )}
           </tbody>
         </table>
         <p className="muted">
-          <b>boot</b> = comes up automatically after a reboot (llm-autostart.service, in list
+          <b>boot</b> = comes up automatically after a reboot (gpu-autostart.service, in list
           order; if two saved sets overlap, the later one is moved to other free cards — see the
-          warnings above). <b>add a second instance of a model</b> (e.g. llm-27b-1 on cards 2,3):
-          copy the compose block, its radiance config, + the router pair in this repo (<code>make doctor</code> checks all six name references match), <code>make update</code>, then assign cards here — see docs/RUNBOOK.md → LLM fleet.
+          warnings above). <b>add a second instance of a model</b> (e.g. gpu-27b-1 on cards 2,3):
+          copy the compose block, its radiance config, + the router pair in this repo (<code>make doctor</code> checks all six name references match), <code>make update</code>, then assign cards here — see docs/RUNBOOK.md → GPU fleet.
         </p>
       </div>
     </div>

@@ -111,7 +111,7 @@ gain — the gate IS the auth). Whole-host is safe because the host has no state
 instance secret, and `/metrics` needs its own password — carried structurally by the two settings guards
 (`enable_metrics: true` so the stats surface exists, `open_metrics` empty so nothing opens Prometheus; and never setting
 `open_metrics` to the gate key — the doctor's keyed `/metrics`→404 probe makes that tripwire-able). The key is the fleet's
-`LLM_API_KEY` by owner decision: no search-only rotation (rotating it re-creates the `llm-*` containers), a leaked key
+`LLM_API_KEY` by owner decision: no search-only rotation (rotating it re-creates the `gpu-*` containers), a leaked key
 grants search too, and the reduced-env plumbing is zero. The instance secret rides the repo's sed machinery, NOT the
 image's env: SearXNG applies env > settings.yml (the `SCHEMA` in `searx/settings_defaults.py` carries `environ_name`
 overrides applied at every boot), so the deployed file's guards (`secret_key`, `base_url`, `limiter`, `public_instance`,

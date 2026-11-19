@@ -72,7 +72,7 @@ update_acquire_lock
 update_begin_run
 # Preflight: the repo's compose must render with the repo's .env BEFORE any
 # change is applied. A required var a new block needs but .env lacks (e.g. a
-# ${LLM_API_KEY:?...} in a freshly pulled llm-* block) would otherwise
+# ${LLM_API_KEY:?...} in a freshly pulled gpu-* block) would otherwise
 # surface at step 4 — AFTER the snapshot, the npm bump, and the config sync
 # of step 3 already replaced the deployed configs: /opt/panel left
 # half-synced (new compose, old .env). Read-only; aborts before the doctor,
@@ -176,7 +176,7 @@ stack_compose build --pull
 # The "no container before" test tells a NEW service from a deliberately
 # stopped one — but a pruned stopped container (raw `docker container prune`)
 # destroys that evidence and reads as NEW. On-demand services (restart: "no"
-# — the LLM fleet) therefore never auto-start from a missing container: the
+# — the GPU fleet) therefore never auto-start from a missing container: the
 # restart policy is the durable signal, and starting the whole fleet at once
 # is invalid, not just rude, when instances share cards (ROCR_VISIBLE_DEVICES).
 # They still get their image pulled (step 4) and their configs synced (step 3);
@@ -194,8 +194,8 @@ for s in $defined_services; do
   elif grep -qx -- "$s" <<<"$pre_containers"; then
     : # stopped with a container present — deliberately stopped, leave it down
   elif grep -qx -- "$s" <<<"$on_demand"; then
-    if [[ "$s" == llm-* ]]; then
-      # llm-* instances must NOT be revived by hand: a raw `up -d` (even with
+    if [[ "$s" == gpu-* ]]; then
+      # gpu-* instances must NOT be revived by hand: a raw `up -d` (even with
       # the override) skips the GPU-aware path — no ledger record, no conflict
       # check — and an unassigned instance would land on the base-file fallback
       # cards. The panel's GPUs view is the only sanctioned start.

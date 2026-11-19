@@ -12,8 +12,8 @@
 # is matched against each snapshot service by NAME (exact, or as a prefix) and
 # by the pre-update IMAGE name (substring):
 #   make rollback WHAT=radiance   every instance of that image
-#   make rollback WHAT=llm        the llm- prefix → the whole radiance fleet
-#   make rollback WHAT=llm-27b    that one instance
+#   make rollback WHAT=gpu        the gpu- prefix → the whole radiance fleet
+#   make rollback WHAT=gpu-27b    that one instance
 # That is the fix for an image update that passed the health + doctor gates
 # but changed BEHAVIOR (the gates only see health — a broken new `latest`
 # build is green to both). The next `make update` re-snapshots the reverted

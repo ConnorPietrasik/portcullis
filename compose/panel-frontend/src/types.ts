@@ -145,7 +145,7 @@ export interface LLMSettings {
   probe_interval_s: number
 }
 
-// ── GPU pool (panel tab "GPUs"; see panel-api/llm_gpus.py) ──────────────
+// ── GPU pool (panel tab "GPUs"; see panel-api/gpu_pool.py) ──────────────
 
 export interface GpuPoolCard {
   index: number
@@ -156,7 +156,7 @@ export interface GpuPoolCard {
 export interface LlmGpuInstance {
   name: string
   display: string
-  /** cards this instance needs (its llm.cards label — the only source; radiance 2.x has no --tp) */
+  /** cards this instance needs (its gpu.cards label — the only source; radiance 2.x has no --tp) */
   cards_needed: number
   /** the ledger's assignment (intent) — null when never assigned */
   assigned: number[] | null

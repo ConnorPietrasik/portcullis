@@ -66,11 +66,11 @@ expect_exit 65 restart-container '../../etc'      # path injection
 expect_exit 65 start-service '../../etc/passwd'   # path injection
 expect_exit 65 start-service -foo                 # flag injection
 expect_exit 65 start-service                      # arity
-expect_exit 65 llm-apply                          # arity
-expect_exit 65 llm-apply notaninstance            # not an llm-* service name
-expect_exit 65 llm-apply '../../etc/passwd'       # path injection
-expect_exit 65 llm-apply -foo                     # flag injection
-expect_exit 65 llm-stop notaninstance             # not an llm-* service name
+expect_exit 65 gpu-apply                          # arity
+expect_exit 65 gpu-apply notaninstance            # not a gpu-* service name
+expect_exit 65 gpu-apply '../../etc/passwd'       # path injection
+expect_exit 65 gpu-apply -foo                     # flag injection
+expect_exit 65 gpu-stop notaninstance             # not a gpu-* service name
 # servitor actions take no args (the checkout paths are constants, not
 # arguments — a stray token would only ever reach validation, never exec):
 expect_exit 65 servitor-sync extraarg             # arity
@@ -86,35 +86,35 @@ fi
 
 # GPU pool actions (panel's GPU view): the read-only ones must emit valid
 # JSON even with an empty fleet; the mutating ones are NOT exercised here
-# (llm-apply would (re)create a container) — their arg validation above is
+# (gpu-apply would (re)create a container) — their arg validation above is
 # the negative coverage.
-if sudo -u panel sudo -n /usr/local/libexec/panel-do llm-fleet | python3 -c 'import json,sys
+if sudo -u panel sudo -n /usr/local/libexec/panel-do gpu-fleet | python3 -c 'import json,sys
 d = json.load(sys.stdin)
 assert isinstance(d, list) and all(set(x) >= {"name", "display", "cards"} for x in d)'; then
-  info "  ok: llm-fleet emits a valid fleet JSON array"
+  info "  ok: gpu-fleet emits a valid fleet JSON array"
 else
-  die "  FAIL: llm-fleet did not emit a valid fleet JSON array"
+  die "  FAIL: gpu-fleet did not emit a valid fleet JSON array"
 fi
-if sudo -u panel sudo -n /usr/local/libexec/panel-do llm-live | python3 -c 'import json,sys
+if sudo -u panel sudo -n /usr/local/libexec/panel-do gpu-live | python3 -c 'import json,sys
 d = json.load(sys.stdin)
 assert isinstance(d, list) and all(set(x) >= {"service", "state", "gpus"} for x in d)'; then
-  info "  ok: llm-live emits a valid live-state JSON array"
+  info "  ok: gpu-live emits a valid live-state JSON array"
 else
-  die "  FAIL: llm-live did not emit a valid live-state JSON array"
+  die "  FAIL: gpu-live did not emit a valid live-state JSON array"
 fi
-# Positive cross-check: llm-live must name EXACTLY the llm-* containers the
+# Positive cross-check: gpu-live must name EXACTLY the gpu-* containers the
 # host has. The shape check above passes for [] — and a broken label filter
 # (the engine matches label VALUES exactly, no regex) yields [] while the
 # pool's conflict detection sits silently disabled. Both sides empty on a
 # fresh host = still passes.
 want_live="$(sudo docker ps -a --format '{{.Names}} {{.Label "com.docker.compose.service"}}' \
-  | awk '$2 ~ /^llm-[a-z0-9][a-z0-9-]*$/ {print $1}' | sort)"
-got_live="$(sudo -u panel sudo -n /usr/local/libexec/panel-do llm-live \
+  | awk '$2 ~ /^gpu-[a-z0-9][a-z0-9-]*$/ {print $1}' | sort)"
+got_live="$(sudo -u panel sudo -n /usr/local/libexec/panel-do gpu-live \
   | python3 -c 'import json,sys; print("\n".join(sorted(x["container"] for x in json.load(sys.stdin))))')"
 if [[ "$want_live" == "$got_live" ]]; then
-  info "  ok: llm-live sees the same llm-* containers as the host"
+  info "  ok: gpu-live sees the same gpu-* containers as the host"
 else
-  die "  FAIL: llm-live disagrees with the host — host has: [$(echo $want_live | tr '\n' ' ')] llm-live: [$(echo $got_live | tr '\n' ' ')]"
+  die "  FAIL: gpu-live disagrees with the host — host has: [$(echo $want_live | tr '\n' ' ')] gpu-live: [$(echo $got_live | tr '\n' ' ')]"
 fi
 
 # update-report must emit valid JSON even before the first update (no state

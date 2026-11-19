@@ -218,20 +218,21 @@ var unitNameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._@-]*\.service$`)
 var containerIDRe = regexp.MustCompile(`^[0-9a-f]{12}$`)
 var serviceNameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
 
-// llmServiceRe — an LLM fleet instance's compose service name (llm-27b,
-// llm-27b-1, …). Mirrors panel-api's LLM_NAME_RE, so the two sides can
-// never disagree about what a fleet instance is called.
-var llmServiceRe = regexp.MustCompile(`^llm-[a-z0-9][a-z0-9-]{0,62}$`)
+// gpuServiceRe — a fleet instance's compose service name (gpu-27b, gpu-27b-1,
+// …). Any model class the pool manages — chat LLMs, image/video generators.
+// Mirrors panel-api's GPU_NAME_RE, so the two sides can never disagree about
+// what a fleet instance is called.
+var gpuServiceRe = regexp.MustCompile(`^gpu-[a-z0-9][a-z0-9-]{0,62}$`)
 
-// llmFleet lists the deployed stack's LLM fleet instances (services named
-// llm-*) and the number of cards each one needs — the GPU pool's static
-// half. cards comes from the llm.cards label ALONE (== tp in the instance's
-// radiance config): radiance 2.x takes its settings from a YAML file, so the
-// pre-2.x --tp flag the old fallback read is gone from the command — a
-// missing or invalid label is an error, not a one-card guess (doctor
-// cross-checks the label against the config at update time). JSON array on
-// stdout; read-only, no args.
-func llmFleet(ctx context.Context, args []string, logf func(string, ...any)) error {
+// gpuFleet lists the deployed stack's fleet instances (services named gpu-*)
+// and the number of cards each one needs — the GPU pool's static half. cards
+// comes from the gpu.cards label ALONE (== tp in the instance's radiance
+// config): radiance 2.x takes its settings from a YAML file, so the pre-2.x
+// --tp flag the old fallback read is gone from the command — a missing or
+// invalid label is an error, not a one-card guess (doctor cross-checks the
+// label against the config at update time). JSON array on stdout; read-only,
+// no args.
+func gpuFleet(ctx context.Context, args []string, logf func(string, ...any)) error {
 	out, err := runCmd(ctx, "/usr/bin/docker", "compose", "--project-directory", "/opt/panel",
 		"-f", "/opt/panel/docker-compose.yml", "config", "--format", "json")
 	if err != nil {
@@ -252,7 +253,7 @@ func llmFleet(ctx context.Context, args []string, logf func(string, ...any)) err
 	}
 	res := []inst{}
 	for name, s := range cfg.Services {
-		if !llmServiceRe.MatchString(name) {
+		if !gpuServiceRe.MatchString(name) {
 			continue
 		}
 		display := composeLabel(s.Labels, "panel.manage")
@@ -263,34 +264,34 @@ func llmFleet(ctx context.Context, args []string, logf func(string, ...any)) err
 		// --tp left in the command to fall back to) — a missing or invalid
 		// one errors the whole fleet listing rather than grab one card for a
 		// four-card instance.
-		cards, err := strconv.Atoi(composeLabel(s.Labels, "llm.cards"))
+		cards, err := strconv.Atoi(composeLabel(s.Labels, "gpu.cards"))
 		if err != nil || cards <= 0 {
-			return fmt.Errorf("llm-fleet: %s has no positive llm.cards label — add it to the compose block (== tp in its radiance config)", name)
+			return fmt.Errorf("gpu-fleet: %s has no positive gpu.cards label — add it to the compose block (== tp in its radiance config)", name)
 		}
 		res = append(res, inst{name, display, cards})
 	}
 	sort.Slice(res, func(i, j int) bool { return res[i].Name < res[j].Name })
 	enc, err := json.Marshal(res)
 	if err != nil {
-		return fmt.Errorf("llm-fleet: marshal: %v", err)
+		return fmt.Errorf("gpu-fleet: marshal: %v", err)
 	}
 	fmt.Println(string(enc))
 	return nil
 }
 
-// llmLive reports the LIVE GPU holds of the fleet: for every llm-* container
+// gpuLive reports the LIVE GPU holds of the fleet: for every gpu-* container
 // (any state) the compose service, docker state, and the cards its
 // ROCR_VISIBLE_DEVICES pins it to (null when unset). The pool's held column
 // and every conflict check derive from this + the container state — a
 // stopped instance holds nothing. Read-only, no args.
 // NOTE: docker inspect's Config.Env also carries RADIANCE_API_KEY — never
 // log or forward the env list; extract ONLY the ROCR entry.
-func llmLive(ctx context.Context, args []string, logf func(string, ...any)) error {
+func gpuLive(ctx context.Context, args []string, logf func(string, ...any)) error {
 	// KEY-ONLY label filter: the engine matches label VALUES by exact string
 	// equality (regex is for name/id/status only — moby's MatchKVList), so a
-	// pattern like ^llm- matches nothing and the pool sees an empty world
+	// pattern like ^gpu- matches nothing and the pool sees an empty world
 	// (conflict detection silently off). Key-only matches every compose
-	// container; the llmServiceRe check after inspect keeps just the fleet.
+	// container; the gpuServiceRe check after inspect keeps just the fleet.
 	out, err := runCmd(ctx, "/usr/bin/docker", "ps", "-a",
 		"--filter", "label=com.docker.compose.service", "--format", "{{.ID}}")
 	if err != nil {
@@ -329,7 +330,7 @@ func llmLive(ctx context.Context, args []string, logf func(string, ...any)) erro
 	res := []inst{}
 	for _, c := range data {
 		svc := c.Config.Labels["com.docker.compose.service"]
-		if !llmServiceRe.MatchString(svc) {
+		if !gpuServiceRe.MatchString(svc) {
 			continue
 		}
 		var gpus []int
@@ -347,20 +348,20 @@ func llmLive(ctx context.Context, args []string, logf func(string, ...any)) erro
 	sort.Slice(res, func(i, j int) bool { return res[i].Container < res[j].Container })
 	enc, err := json.Marshal(res)
 	if err != nil {
-		return fmt.Errorf("llm-live: marshal: %v", err)
+		return fmt.Errorf("gpu-live: marshal: %v", err)
 	}
 	fmt.Println(string(enc))
 	return nil
 }
 
-// llmApply (re)creates + starts one fleet instance on the CURRENT GPU
-// override: panel-api has already written /opt/panel-api/llm-gpu-override.yml
+// gpuApply (re)creates + starts one fleet instance on the CURRENT GPU
+// override: panel-api has already written /opt/panel-api/gpu-pool-override.yml
 // (the ledger's set for this service) — this action only converges the
 // container onto it. `up -d` creates a missing container, recreates one
 // whose env drifted (the GPU change), and is a no-op when already converged.
-func llmApply(ctx context.Context, args []string, logf func(string, ...any)) error {
+func gpuApply(ctx context.Context, args []string, logf func(string, ...any)) error {
 	out, err := runCmd(ctx, "/usr/bin/docker", "compose", "--project-directory", "/opt/panel",
-		"-f", "/opt/panel/docker-compose.yml", "-f", "/opt/panel-api/llm-gpu-override.yml",
+		"-f", "/opt/panel/docker-compose.yml", "-f", "/opt/panel-api/gpu-pool-override.yml",
 		"up", "-d", "--", args[0])
 	if err != nil {
 		return fmt.Errorf("up -d %s: %v: %s", args[0], err, out)
@@ -369,12 +370,12 @@ func llmApply(ctx context.Context, args []string, logf func(string, ...any)) err
 	return nil
 }
 
-// llmStop stops one fleet instance's container (compose stop: the container
+// gpuStop stops one fleet instance's container (compose stop: the container
 // is KEPT — the panel starts it again — and its cards are released the
 // moment it exits).
-func llmStop(ctx context.Context, args []string, logf func(string, ...any)) error {
+func gpuStop(ctx context.Context, args []string, logf func(string, ...any)) error {
 	out, err := runCmd(ctx, "/usr/bin/docker", "compose", "--project-directory", "/opt/panel",
-		"-f", "/opt/panel/docker-compose.yml", "-f", "/opt/panel-api/llm-gpu-override.yml",
+		"-f", "/opt/panel/docker-compose.yml", "-f", "/opt/panel-api/gpu-pool-override.yml",
 		"stop", "--", args[0])
 	if err != nil {
 		return fmt.Errorf("stop %s: %v: %s", args[0], err, out)
@@ -475,14 +476,14 @@ func containerAction(verb string) RunFunc {
 // pre-validated as an opaque token; the project paths are hardcoded.
 //
 // The render includes the GPU pool override, like EVERY other invocation that
-// can create/recreate a fleet container (llm-apply, llm-stop, COMPOSE_STACK in
-// setup/common.sh): without it, reviving an llm-* instance would pin the
+// can create/recreate a fleet container (gpu-apply, gpu-stop, COMPOSE_STACK in
+// setup/common.sh): without it, reviving a gpu-* instance would pin the
 // base-file fallback cards instead of its assigned set. The file always exists
-// (make deploy/api seed it, panel-api re-renders it) — a no-op for non-llm-*
+// (make deploy/api seed it, panel-api re-renders it) — a no-op for non-gpu-*
 // services, whose names never appear in it.
 func startService(ctx context.Context, args []string, logf func(string, ...any)) error {
 	out, err := runCmd(ctx, "/usr/bin/docker", "compose", "--project-directory", "/opt/panel",
-		"-f", "/opt/panel/docker-compose.yml", "-f", "/opt/panel-api/llm-gpu-override.yml",
+		"-f", "/opt/panel/docker-compose.yml", "-f", "/opt/panel-api/gpu-pool-override.yml",
 		"up", "-d", "--", args[0])
 	if err != nil {
 		return fmt.Errorf("up -d %s: %v: %s", args[0], err, out)
@@ -1373,33 +1374,33 @@ var registry = map[string]Action{
 		Confirm: true,
 		Run:     containerAction("restart"),
 	},
-	"llm-fleet": {
-		Summary: "LLM fleet instances + cards needed (JSON on stdout)",
+	"gpu-fleet": {
+		Summary: "Fleet instances + cards needed (JSON on stdout)",
 		Args:    nil,
 		Timeout: 20 * time.Second,
 		Confirm: false,
-		Run:     llmFleet,
+		Run:     gpuFleet,
 	},
-	"llm-live": {
+	"gpu-live": {
 		Summary: "Live fleet containers: state + ROCR_VISIBLE_DEVICES holds (JSON on stdout)",
 		Args:    nil,
 		Timeout: 20 * time.Second,
 		Confirm: false,
-		Run:     llmLive,
+		Run:     gpuLive,
 	},
-	"llm-apply": {
-		Summary: "(Re)create + start an llm-* instance on the override's GPU set",
-		Args:    []*regexp.Regexp{llmServiceRe},
+	"gpu-apply": {
+		Summary: "(Re)create + start a gpu-* instance on the override's GPU set",
+		Args:    []*regexp.Regexp{gpuServiceRe},
 		Timeout: 5 * time.Minute, // detached start is seconds; 5m covers a missing-image pull
 		Confirm: true,
-		Run:     llmApply,
+		Run:     gpuApply,
 	},
-	"llm-stop": {
-		Summary: "Stop an llm-* instance (container kept, cards released)",
-		Args:    []*regexp.Regexp{llmServiceRe},
+	"gpu-stop": {
+		Summary: "Stop a gpu-* instance (container kept, cards released)",
+		Args:    []*regexp.Regexp{gpuServiceRe},
 		Timeout: 90 * time.Second,
 		Confirm: true,
-		Run:     llmStop,
+		Run:     gpuStop,
 	},
 	"update-run": {
 		Summary: "Launch the gated stack update (detached; skips when the clone has uncommitted changes)",

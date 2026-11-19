@@ -2,7 +2,8 @@
 
 A home-server admin panel: dashboard and whitelisted privileged actions —
 behind Traefik + Authelia 2FA, on a CachyOS (Arch) box at `pietrasik.top`.
-Also manages a Radiance LLM fleet (AMD AI PRO R9700 GPUs) and a NameSilo
+Also manages a Radiance GPU fleet (AMD AI PRO R9700 GPUs — chat LLMs today,
+image/video generators in the same pool) and a NameSilo
 DDNS timer for the dynamic public IP.
 
 One gated entrance to the host (Traefik), one privileged path through
@@ -27,8 +28,8 @@ when you change the behavior they explain.
 | path | what |
 |---|---|
 | `setup/` | idempotent bash, numeric run order; `11-autoupdate.sh` installs the auto-update timer (disabled by default)
-| `compose/` | edge stack → `/opt/panel`: `docker-compose.yml` (traefik, authelia, panel-web, portfolio, `llm-*` fleet via the `x-llm-base` anchor), `llm-configs/` (per-instance radiance 2.x settings YAML — the server runs on `--config` only, no flags), `traefik/dynamic/*.yml` (routes — file provider, hot-reloaded), `authelia/configuration.yml` (+ `users_database.yml.example`), `panel-frontend/` (React+TS+Vite UI, multi-stage Dockerfile), `portfolio/` |
-| `panel-api/` | FastAPI host service → `/opt/panel-api`, user `panel`, binds `172.17.0.1:8010` (docker0 gateway): `main.py` (metrics, containers, actions, LLM fallback router), `llm_gpus.py` (GPU pool: ledger/override/allocation), `llm_autostart.py` (boot oneshot), `panel-api.service` + `llm-autostart.service` |
+| `compose/` | edge stack → `/opt/panel`: `docker-compose.yml` (traefik, authelia, panel-web, portfolio, `gpu-*` fleet via the `x-gpu-base` anchor), `gpu-configs/` (per-instance radiance 2.x settings YAML — the server runs on `--config` only, no flags), `traefik/dynamic/*.yml` (routes — file provider, hot-reloaded), `authelia/configuration.yml` (+ `users_database.yml.example`), `panel-frontend/` (React+TS+Vite UI, multi-stage Dockerfile), `portfolio/` |
+| `panel-api/` | FastAPI host service → `/opt/panel-api`, user `panel`, binds `172.17.0.1:8010` (docker0 gateway): `main.py` (metrics, containers, actions, LLM fallback router), `gpu_pool.py` (GPU pool: ledger/override/allocation), `gpu_autostart.py` (boot oneshot), `panel-api.service` + `gpu-autostart.service` |
 | `panel-do/` | Go whitelist dispatcher → `/usr/local/libexec/panel-do` — the ONLY privileged path (`sudo -n panel-do`) |
 | `ddns/` | stdlib-only Python + systemd timer/service → NameSilo apex A record |
 | `tools/panel-hosts.sh` | client-side /etc/hosts pin of routed names (no-hairpin workaround) |
@@ -60,13 +61,16 @@ change, not a refactor. The "why" for each is in `docs/ARCHITECTURE.md`.
    and refuses anything docker compose/systemd would read differently.
 5. **`PANEL_DEV=1` is local development only.** The systemd unit never sets
    it; nothing else should.
-6. **LLM naming contract**: `llm-<name>` is 1:1 across traefik router,
-   compose service, and container. Shared/non-instance routers are `fleet-*`,
-   never `llm-*` (`make doctor`'s orphan check assumes that prefix).
-   `llmServiceRe` (panel-do) and `LLM_NAME_RE` (panel-api) must stay
-   identical.
-7. **Every compose render that can create/recreate an `llm-*` container must
-   include `-f /opt/panel-api/llm-gpu-override.yml`** (the GPU pool's pins) —
+6. **Fleet naming contract**: `gpu-<name>` is 1:1 across traefik router,
+   compose service, and container — any model class the pool serves (chat
+   LLMs, image/video gen): the prefix names the POOL, not the workload.
+   Shared/non-instance routers are `fleet-*`,
+   never `gpu-*` (`make doctor`'s orphan check assumes that prefix).
+   `gpuServiceRe` (panel-do) and `GPU_NAME_RE` (panel-api) must stay
+   identical. (The LLM fallback router, `LLM_API_KEY` and the `panel.category=LLM`
+   label are LLM-scoped and keep their names.)
+7. **Every compose render that can create/recreate a `gpu-*` container must
+   include `-f /opt/panel-api/gpu-pool-override.yml`** (the GPU pool's pins) —
    `panel-do` actions and `setup/common.sh` already do; a render without it
    pins fallback cards and shows up as drift in the GPU view.
 8. **The auto-update re-runs `setup/08-update.sh` verbatim — no second update
@@ -102,14 +106,14 @@ change, not a refactor. The "why" for each is in `docs/ARCHITECTURE.md`.
 - **New privileged action**: one Go function + one registry entry in the
   `ACTIONS` section of `panel-do/main.go` → `make panel-do`.
   RUNBOOK → "Add a privileged action".
-- **New LLM instance**: copy an `llm-*` compose block + its radiance config
-  in `compose/llm-configs/` (keep `llm.cards` == the config's `tp`, distinct
-  display label) + its router pair in
-  `traefik/dynamic/llm.yml` + an `|| Host(...)` clause in the `fleet-open` rule —
+- **New fleet instance**: copy a `gpu-*` compose block + its radiance config
+  in `compose/gpu-configs/` (keep `gpu.cards` == the config's `tp`, distinct
+  display label; non-LLM model classes get their own `panel.category`) +
+  its router pair in `traefik/dynamic/gpu.yml` + an `|| Host(...)` clause in the `fleet-open` rule —
   six name references total; `make doctor` flags any that drift (it also flags the
   v2-style multi-value `Host(a, b)` that Traefik v3 drops silently, and
-  cross-checks `llm.cards` against the config's `tp`). →
-  `make update`. RUNBOOK → "LLM fleet".
+  cross-checks `gpu.cards` against the config's `tp`). →
+  `make update`. RUNBOOK → "GPU fleet".
 - **Servitor VM (day-2)**: four `servitor-*` panel actions (status/vm-
   restart/sync/doctor); the route (`traefik/dynamic/servitor.yml`, raw VM IP
   upstream — invariant 2: still a file, no docker.sock) and the actions live

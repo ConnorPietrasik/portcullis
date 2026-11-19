@@ -69,11 +69,11 @@ export default function Services({ intervalMs }: { intervalMs: number }) {
   async function act(c: ContainerInfo, action: string) {
     if (action !== 'start' && !window.confirm(`${action} ${c.name}?`)) return
     try {
-      if (action === 'start' && c.service?.startsWith('llm-')) {
+      if (action === 'start' && c.service?.startsWith('gpu-')) {
         // GPU-aware start: the saved card set when free, else the lowest
         // free set — a raw `docker start` would reuse the create-time env
         // and could resurrect cards another instance now owns (GPU view).
-        await api('/llm/gpus/start', { method: 'POST', body: JSON.stringify({ service: c.service }) })
+        await api('/gpus/start', { method: 'POST', body: JSON.stringify({ service: c.service }) })
       } else {
         await api(`/containers/${c.id}/${action}`, { method: 'POST' })
       }
@@ -89,10 +89,10 @@ export default function Services({ intervalMs }: { intervalMs: number }) {
       // The generic action endpoint answers 200 + {ok:false, stderr} on a
       // panel-do failure (unlike the container endpoint, which raises 502)
       // — surface that instead of silently refreshing.
-      if (s.name.startsWith('llm-')) {
+      if (s.name.startsWith('gpu-')) {
         // GPU-aware create+start: picks the instance's saved cards (or the
         // lowest free set) and writes the assignment — see the GPU view.
-        await api('/llm/gpus/start', { method: 'POST', body: JSON.stringify({ service: s.name }) })
+        await api('/gpus/start', { method: 'POST', body: JSON.stringify({ service: s.name }) })
       } else {
         const res = await api<ActionResult>('/action/start-service', {
           method: 'POST',
@@ -181,7 +181,7 @@ export default function Services({ intervalMs }: { intervalMs: number }) {
                       <td className="muted">{c.status}</td>
                       <td className="btns">
                         {/* running only — while the instance is down the /open bounce lands on a 502 */}
-                        {c.state === 'running' && c.service?.startsWith('llm-') && (
+                        {c.state === 'running' && c.service?.startsWith('gpu-') && (
                           <a
                             href={`https://${c.service.slice(4)}.pietrasik.top/open`}
                             target="_blank"

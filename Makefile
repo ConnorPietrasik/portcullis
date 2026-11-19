@@ -48,8 +48,8 @@ update:
 	bash setup/08-update.sh
 
 ## rollback [WHAT=...]: no WHAT — restore the whole stack to the snapshot
-## taken at the last `make update`. WITH WHAT — a service name (llm-27b), a
-## prefix (llm), or an image name (radiance) — roll back ONLY those services'
+## taken at the last `make update`. WITH WHAT — a service name (gpu-27b), a
+## prefix (gpu), or an image name (radiance) — roll back ONLY those services'
 ## images; everything else stays in place.
 rollback:
 	bash setup/09-rollback.sh $(WHAT)
@@ -63,6 +63,6 @@ autoupdate:
 ## local sanity checks (no server needed): shell syntax + python syntax
 verify:
 	@set -e; for f in setup/*.sh tools/*.sh; do bash -n "$$f"; done
-	@python3 -m py_compile panel-api/main.py panel-api/llm_gpus.py panel-api/llm_autostart.py ddns/ddns.py
+	@python3 -m py_compile panel-api/main.py panel-api/gpu_pool.py panel-api/gpu_autostart.py ddns/ddns.py
 	@rm -rf panel-api/__pycache__ ddns/__pycache__  # py_compile always writes bytecode — don't litter
 	@echo "verify: ok"

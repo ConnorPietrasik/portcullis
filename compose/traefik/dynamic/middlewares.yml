@@ -29,6 +29,15 @@ http:
       chain:
         middlewares: [sec-headers, authelia]
 
+    # Rate limit for the fleet's machine-API hosts (per-instance subdomains +
+    # llm.pietrasik.top): inference is slow, so this only blunts key-guessing
+    # and scan traffic — a genuine client is never near it.
+    llm-rate:
+      rateLimit:
+        average: 10 # req/s sustained
+        period: 1s
+        burst: 20
+
     # Injected into requests forwarded to the panel API only. Clients cannot
     # set this header themselves — Traefik overwrites it.
     panel-secret:

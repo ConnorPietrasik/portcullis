@@ -33,7 +33,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
-import llm_gpus
+import gpu_pool
 
 PANEL_TOKEN = os.environ.get("PANEL_TOKEN", "")
 PANEL_DO = "/usr/local/libexec/panel-do"
@@ -66,10 +66,10 @@ if DEV_MODE:
 async def lifespan(_app: FastAPI):
     """Owns the LLM router's shared httpx client + background health probe."""
     global _llm_http
-    # LLM GPU pool: seed the state files (ledger + override) before the boot
+    # GPU pool: seed the state files (ledger + override) before the boot
     # oneshot or a compose render can want them. 02/03 already create them
     # at install time; this is the belt-and-braces for a hand-removed file.
-    llm_gpus.ensure_state_files()
+    gpu_pool.ensure_state_files()
     # read=300 s: normal streams emit bytes far more often than every 5 min,
     # but a wedged instance that accepts TCP and then goes silent (ROCm init
     # hang) must not park the client's request forever — the deadline fails
@@ -958,7 +958,7 @@ def _read_text_or_empty(p: str) -> str:
 def _parse_compose_images(text: str) -> dict[str, str]:
     """service → image ref from a compose file. Line-based (this file is
     hand-kept at 2/4-indent): an explicit `image:` wins, a `<<: *anchor` merge
-    resolves to the anchor's own image (the x-llm-base pattern — llm-* fleet
+    resolves to the anchor's own image (the x-gpu-base pattern — gpu-* fleet
     instances carry no image line of their own)."""
     anchors: dict[str, str] = {}
     images: dict[str, str] = {}
@@ -1190,13 +1190,13 @@ def update_preview(_admin: Optional[str] = Depends(require_admin)) -> dict[str, 
 #
 # Auth is the same gate as the per-instance subdomains: Authorization: Bearer
 # with LLM_API_KEY. No Authelia here — API clients speak bearer tokens, and
-# forward-auth is cookie-based (see the llm.yml header). /v1/models needs no
+# forward-auth is cookie-based (see the gpu.yml header). /v1/models needs no
 # special handling: it simply proxies to the active instance. The gate is
 # NOT bypassed by PANEL_DEV=1 (unlike the panel endpoints): local dev of
 # the router needs LLM_API_KEY set to any non-empty value.
 #
-# Security: the order holds compose SERVICE names (llm-<name> — what the
-# traefik rules and `make rollback` use), validated against the live llm-*
+# Security: the order holds compose SERVICE names (gpu-<name> — what the
+# traefik rules and `make rollback` use), validated against the live gpu-*
 # containers and resolved to edge-network IPs server-side — the config
 # (and its admin) can never name an arbitrary host address, so there is no
 # SSRF surface beyond the fleet the admin already fully controls.
@@ -1216,7 +1216,7 @@ LLM_MAX_ORDER = 8
 # for coding-agent workloads: base64 images inflate ~33%, and one request
 # can carry several multi-MB crops (screenshot/OCR-style work).
 LLM_MAX_BODY = 64 * 1024 * 1024
-LLM_NAME_RE = re.compile(r"^llm-[a-z0-9][a-z0-9-]{0,62}$")
+GPU_NAME_RE = re.compile(r"^gpu-[a-z0-9][a-z0-9-]{0,62}$")
 
 # Stripped in both directions: RFC 7230 §6.1 hop-by-hop + content-length
 # (recomputed by starlette) + accept-encoding (forced identity, so upstream
@@ -1318,10 +1318,10 @@ async def _llm_probe_loop() -> None:
         try:
             order = await asyncio.to_thread(_llm_load)
             ips = await asyncio.to_thread(_edge_ips)
-            fleet = await asyncio.to_thread(_llm_fleet)
+            fleet = await asyncio.to_thread(_gpu_fleet)
         except Exception:  # noqa: BLE001 — a probe-cycle hiccup is not fatal
             continue
-        ip_by_name = _llm_ip_by_name(fleet, ips)
+        ip_by_name = _gpu_ip_by_name(fleet, ips)
 
         async def one(name: str) -> None:
             ip = ip_by_name.get(name, "")
@@ -1337,14 +1337,14 @@ async def _llm_probe_loop() -> None:
             _llm_down_until.pop(name, None)
 
 
-def _llm_fleet() -> list[dict[str, str]]:
-    """All llm-* containers (running or stopped) as {name, container, display, state}.
+def _gpu_fleet() -> list[dict[str, str]]:
+    """All gpu-* containers (running or stopped) as {name, container, display, state}.
 
     `name` is the identifier the order holds: the compose SERVICE name
-    (llm-27b — the same name the traefik rules, the RUNBOOK and `make
+    (gpu-27b — the same name the traefik rules, the RUNBOOK and `make
     rollback WHAT=…` use) when the container carries the compose service
-    label, else the bare container name (a hand-`docker run`-ed llm-*).
-    NOT the docker container name — compose prefixes it (panel-llm-27b),
+    label, else the bare container name (a hand-`docker run`-ed gpu-*).
+    NOT the docker container name — compose prefixes it (panel-gpu-27b),
     so keying on it would find nothing on the deployed stack.
     `container` is that docker name: the key _edge_ips() maps to an IP.
     """
@@ -1353,8 +1353,8 @@ def _llm_fleet() -> list[dict[str, str]]:
         raw_names = x.get("Names") or ""
         container = str(raw_names[0] if isinstance(raw_names, list) else raw_names or "").lstrip("/")
         svc = _cli_label_get(x.get("Labels") or "", "com.docker.compose.service")
-        name = svc if svc and LLM_NAME_RE.match(svc) else container
-        if not name.startswith("llm-"):
+        name = svc if svc and GPU_NAME_RE.match(svc) else container
+        if not name.startswith("gpu-"):
             continue
         state = x.get("State", "unknown")
         # a recreated service leaves its old container in `ps -a` — two rows
@@ -1378,12 +1378,12 @@ def _llm_fleet() -> list[dict[str, str]]:
     return sorted(out, key=lambda f: f["name"])
 
 
-def _llm_fleet_view() -> list[dict[str, str]]:
-    """All llm-* containers (running or stopped): the UI's add-list."""
-    return [{"name": f["name"], "display": f["display"], "state": f["state"]} for f in _llm_fleet()]
+def _gpu_fleet_view() -> list[dict[str, str]]:
+    """All gpu-* containers (running or stopped): the UI's add-list."""
+    return [{"name": f["name"], "display": f["display"], "state": f["state"]} for f in _gpu_fleet()]
 
 
-def _llm_ip_by_name(fleet: list[dict[str, str]], ips: dict[str, str]) -> dict[str, str]:
+def _gpu_ip_by_name(fleet: list[dict[str, str]], ips: dict[str, str]) -> dict[str, str]:
     """Order name → edge-network IP ("" = no container row or no IP)."""
     return {f["name"]: ips.get(f["container"], "") for f in fleet}
 
@@ -1490,7 +1490,7 @@ def llm_dashboard_open(_admin: Optional[str] = Depends(require_forward_auth_admi
 # Key reuse is an owner decision: the gate authenticates with the SAME
 # LLM_API_KEY as the /v1 router (trade-offs recorded in
 # docs/ARCHITECTURE.md: no search-only rotation — rotating the key re-
-# creates the llm-* containers; a leaked key grants search too). Bearer AND
+# creates the gpu-* containers; a leaked key grants search too). Bearer AND
 # Basic (username ignored, constant-time on the key bytes) — Basic exists
 # for mcp-searxng, which is Basic-only. open_metrics must never be set to
 # this key (see compose/searxng/settings.yml) — the doctor's /metrics→404
@@ -1591,10 +1591,10 @@ async def llm_proxy(path: str, request: Request):
     order = await asyncio.to_thread(_llm_load)
     ips = await asyncio.to_thread(_edge_ips)
     try:
-        fleet = await asyncio.to_thread(_llm_fleet)
+        fleet = await asyncio.to_thread(_gpu_fleet)
     except HTTPException:
         fleet = []  # panel-do down: degrade to 503-with-reasons, not a 500
-    ip_by_name = _llm_ip_by_name(fleet, ips)
+    ip_by_name = _gpu_ip_by_name(fleet, ips)
     names_in_fleet = {f["name"] for f in fleet}
     reasons = []
     for name in order:
@@ -1653,20 +1653,20 @@ def llm_settings_get(_admin: Optional[str] = Depends(require_admin)) -> dict[str
         "order": order,
         "status": status,
         "active": active,
-        "fleet": _llm_fleet_view(),
+        "fleet": _gpu_fleet_view(),
         "probe_interval_s": LLM_PROBE_INTERVAL_S,
     }
 
 
 @app.put("/api/settings/llm")
 def llm_settings_put(body: LLMSettingsBody, _admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
-    known = {f["name"] for f in _llm_fleet_view()}
+    known = {f["name"] for f in _gpu_fleet_view()}
     order: list[str] = []
     for name in body.order:
-        if not LLM_NAME_RE.match(name):
-            raise HTTPException(400, f"bad instance name {name!r} (want llm-<name>)")
+        if not GPU_NAME_RE.match(name):
+            raise HTTPException(400, f"bad instance name {name!r} (want gpu-<name>)")
         if name not in known:
-            raise HTTPException(400, f"unknown instance {name!r} (not a llm-* container)")
+            raise HTTPException(400, f"unknown instance {name!r} (not a gpu-* container)")
         if name not in order:
             order.append(name)
     if len(order) > LLM_MAX_ORDER:
@@ -1677,22 +1677,22 @@ def llm_settings_put(body: LLMSettingsBody, _admin: Optional[str] = Depends(requ
     return {"order": order, "status": status, "active": active}
 
 
-# ─────────────────────────── LLM GPU pool ────────────────────────────────────
+# ─────────────────────────── GPU pool ────────────────────────────────────────
 # The GPU view (panel tab "GPUs"): which cards each fleet instance runs on,
 # a pool with free/held per card, auto-grab (lowest free set, sized by the
-# instance's llm.cards label — radiance 2.x has no --tp left to read), and
+# instance's gpu.cards label — radiance 2.x has no --tp left to read), and
 # the boot-autostart list.
 #
-# State split: the LEDGER (llm-gpus.py / llm-gpu.json)
+# State split: the LEDGER (gpu_pool.py / gpu-pool.json)
 # is intent — panel-api + the boot oneshot write it, under the flock in
-# llm_gpus.gpu_lock(). The OVERRIDE (llm-gpu-override.yml) is its compose
+# gpu_pool.gpu_lock(). The OVERRIDE (gpu-pool-override.yml) is its compose
 # projection (ROCR_VISIBLE_DEVICES per instance); every compose render that
-# can create/recreate a fleet container includes it (panel-do llm-apply / llm-stop,
+# can create/recreate a fleet container includes it (panel-do gpu-apply / gpu-stop,
 # COMPOSE_STACK in setup/common.sh) so `make update` recreates keep the
 # assignment. LIVE holds come from the containers themselves (panel-do
-# llm-live) — the ledger is never consulted for "what is up".
-# All privileged work below is panel-do (llm-fleet / llm-live / llm-apply /
-# llm-stop); this section only computes + persists state.
+# gpu-live) — the ledger is never consulted for "what is up".
+# All privileged work below is panel-do (gpu-fleet / gpu-live / gpu-apply /
+# gpu-stop); this section only computes + persists state.
 
 
 def _panel_do_json(action: str, timeout: float) -> Any:
@@ -1710,20 +1710,20 @@ def _panel_do_json(action: str, timeout: float) -> Any:
 
 
 def _fleet_defs() -> list[dict[str, Any]]:
-    """The fleet's static half (panel-do llm-fleet): {name, display, cards}.
+    """The fleet's static half (panel-do gpu-fleet): {name, display, cards}.
     Fresh, not cached — it feeds the override PRUNE, and a stale fleet set
     would let a removed service's entry linger in the override (a phantom
     service with no image would then break every compose render)."""
-    data = _panel_do_json("llm-fleet", 25.0)
+    data = _panel_do_json("gpu-fleet", 25.0)
     if not isinstance(data, list):
-        raise HTTPException(502, "llm-fleet: expected a JSON array")
+        raise HTTPException(502, "gpu-fleet: expected a JSON array")
     return data
 
 
 def _live_fleet() -> list[dict[str, Any]]:
-    """The fleet's live half (panel-do llm-live): {service, container, state,
+    """The fleet's live half (panel-do gpu-live): {service, container, state,
     gpus}. Empty on failure → the pool simply shows nothing held."""
-    data = _panel_do_json("llm-live", 25.0)
+    data = _panel_do_json("gpu-live", 25.0)
     return data if isinstance(data, list) else []
 
 
@@ -1736,16 +1736,16 @@ def _gpu_pool_view(
     """The GPU view's shape: pool (live holds) + instances (ledger ∪ live).
     `assigned` (ledger) and `holding` (live) are shown separately — drift
     between them means an apply failed or a hand-run compose diverged."""
-    holds = llm_gpus.live_holds(live)
+    holds = gpu_pool.live_holds(live)
     state_by_service: dict[str, str] = {}
     for row in live:
         svc, st = row.get("service"), row.get("state", "unknown")
         if not isinstance(svc, str) or not isinstance(st, str):
             continue
         # a recreated service leaves its old container in `ps -a` — prefer the
-        # holding state, same rule as _llm_fleet()
+        # holding state, same rule as _gpu_fleet()
         cur = state_by_service.get(svc)
-        if cur is None or (st in llm_gpus.HOLDING_STATES and cur not in llm_gpus.HOLDING_STATES):
+        if cur is None or (st in gpu_pool.HOLDING_STATES and cur not in gpu_pool.HOLDING_STATES):
             state_by_service[svc] = st
     instances: list[dict[str, Any]] = []
     for d in defs:
@@ -1760,9 +1760,9 @@ def _gpu_pool_view(
                 "display": d.get("display") or name,
                 "cards_needed": int(d.get("cards") or 1),
                 "assigned": sorted(assigned) if assigned else None,
-                "holding": llm_gpus.holding_of(live, name) or None,
+                "holding": gpu_pool.holding_of(live, name) or None,
                 "state": st,
-                "running": st in llm_gpus.HOLDING_STATES,
+                "running": st in gpu_pool.HOLDING_STATES,
                 "autostart": name in ledger["autostart"],
             }
         )
@@ -1771,7 +1771,7 @@ def _gpu_pool_view(
         "pool": [{"index": c, "holder": holds.get(c)} for c in range(cards_total)],
         "instances": instances,
         "autostart": list(ledger["autostart"]),
-        "warnings": llm_gpus.autostart_warnings(ledger) + llm_gpus.assignment_warnings(defs, ledger),
+        "warnings": gpu_pool.autostart_warnings(ledger) + gpu_pool.assignment_warnings(defs, ledger),
     }
 
 
@@ -1780,9 +1780,9 @@ def _gpu_pool_now() -> dict[str, Any]:
     response self-consistent without a second round-trip)."""
     defs = _fleet_defs()
     live = _live_fleet()
-    with llm_gpus.gpu_lock():
-        ledger = llm_gpus.load_ledger()
-        llm_gpus.sync_override(ledger, {d["name"] for d in defs if isinstance(d.get("name"), str)})
+    with gpu_pool.gpu_lock():
+        ledger = gpu_pool.load_ledger()
+        gpu_pool.sync_override(ledger, {d["name"] for d in defs if isinstance(d.get("name"), str)})
     return _gpu_pool_view(len(amd_gpus()), defs, live, ledger)
 
 
@@ -1807,112 +1807,112 @@ def _panel_do_checked(name: str, args: list[str], user: Optional[str]) -> None:
     invalidate_containers_cache()  # the fleet just changed
 
 
-def _check_llm_name(service: str) -> None:
-    if not LLM_NAME_RE.match(service):
-        raise HTTPException(400, f"bad instance name {service!r} (want llm-<name>)")
+def _check_gpu_name(service: str) -> None:
+    if not GPU_NAME_RE.match(service):
+        raise HTTPException(400, f"bad instance name {service!r} (want gpu-<name>)")
 
 
-@app.get("/api/llm/gpus")
-def llm_gpus_view(_admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
+@app.get("/api/gpus")
+def gpus_view(_admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
     defs = _fleet_defs()
     live = _live_fleet()
-    with llm_gpus.gpu_lock():
+    with gpu_pool.gpu_lock():
         # reload under the lock (a writer can't slip in between) and
         # re-render the override — self-healing prune of removed services,
         # a no-op write when already in sync.
-        ledger = llm_gpus.load_ledger()
-        llm_gpus.sync_override(ledger, {d["name"] for d in defs if isinstance(d.get("name"), str)})
+        ledger = gpu_pool.load_ledger()
+        gpu_pool.sync_override(ledger, {d["name"] for d in defs if isinstance(d.get("name"), str)})
     return _gpu_pool_view(len(amd_gpus()), defs, live, ledger)
 
 
-class LlmGpuAssignBody(BaseModel):
+class GpuAssignBody(BaseModel):
     service: str
     gpus: str = "auto"  # "auto" (lowest free set) or "0,1" (explicit)
 
 
-@app.post("/api/llm/gpus/assign")
-def llm_gpus_assign(body: LlmGpuAssignBody, _admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
+@app.post("/api/gpus/assign")
+def gpus_assign(body: GpuAssignBody, _admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
     """Assign cards to an instance and (re)create it on them — GPU env only
     exists at container creation, so "set cards" and "run on them" are one
     operation. Running instance → brief downtime (the model reloads)."""
-    _check_llm_name(body.service)
+    _check_gpu_name(body.service)
     spec = body.gpus.strip()
     if spec != "auto":
         try:
-            llm_gpus.parse_cards(spec)
+            gpu_pool.parse_cards(spec)
         except ValueError as e:
             raise HTTPException(400, str(e)) from e
     user = _admin
-    with llm_gpus.gpu_lock():
-        ledger = llm_gpus.load_ledger()
+    with gpu_pool.gpu_lock():
+        ledger = gpu_pool.load_ledger()
         defs = _fleet_defs()
         live = _live_fleet()
         try:
-            ledger, gpus = llm_gpus.allocate(ledger, defs, live, len(amd_gpus()), body.service, spec)
+            ledger, gpus = gpu_pool.allocate(ledger, defs, live, len(amd_gpus()), body.service, spec)
         except ValueError as e:
             raise HTTPException(400, str(e)) from e
-        llm_gpus.save_ledger(ledger)
-        llm_gpus.sync_override(ledger, {d["name"] for d in defs if isinstance(d.get("name"), str)})
-    _panel_do_checked("llm-apply", [body.service], user)
-    _audit(user, "llm-gpu-assign", [body.service, spec, ",".join(map(str, gpus))], 0)
+        gpu_pool.save_ledger(ledger)
+        gpu_pool.sync_override(ledger, {d["name"] for d in defs if isinstance(d.get("name"), str)})
+    _panel_do_checked("gpu-apply", [body.service], user)
+    _audit(user, "gpu-assign", [body.service, spec, ",".join(map(str, gpus))], 0)
     return _gpu_pool_now()
 
 
-class LlmGpuServiceBody(BaseModel):
+class GpuServiceBody(BaseModel):
     service: str
 
 
-@app.post("/api/llm/gpus/start")
-def llm_gpus_start(body: LlmGpuServiceBody, _admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
+@app.post("/api/gpus/start")
+def gpus_start(body: GpuServiceBody, _admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
     """GPU-aware start (also the "create + start" path for a
     container-less instance): the saved set when it is free, else the lowest
     free set — never a raw `docker start`, which would reuse the create-time
     env and could resurrect cards another instance now owns."""
-    _check_llm_name(body.service)
+    _check_gpu_name(body.service)
     user = _admin
-    with llm_gpus.gpu_lock():
-        ledger = llm_gpus.load_ledger()
+    with gpu_pool.gpu_lock():
+        ledger = gpu_pool.load_ledger()
         defs = _fleet_defs()
         live = _live_fleet()
         try:
-            ledger, gpus = llm_gpus.plan_start(ledger, defs, live, len(amd_gpus()), body.service)
+            ledger, gpus = gpu_pool.plan_start(ledger, defs, live, len(amd_gpus()), body.service)
         except ValueError as e:
             raise HTTPException(400, str(e)) from e
-        llm_gpus.save_ledger(ledger)
-        llm_gpus.sync_override(ledger, {d["name"] for d in defs if isinstance(d.get("name"), str)})
-    _panel_do_checked("llm-apply", [body.service], user)
-    _audit(user, "llm-gpu-start", [body.service, ",".join(map(str, gpus))], 0)
+        gpu_pool.save_ledger(ledger)
+        gpu_pool.sync_override(ledger, {d["name"] for d in defs if isinstance(d.get("name"), str)})
+    _panel_do_checked("gpu-apply", [body.service], user)
+    _audit(user, "gpu-start", [body.service, ",".join(map(str, gpus))], 0)
     return _gpu_pool_now()
 
 
-@app.post("/api/llm/gpus/stop")
-def llm_gpus_stop(body: LlmGpuServiceBody, _admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
+@app.post("/api/gpus/stop")
+def gpus_stop(body: GpuServiceBody, _admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
     """Stop (container kept — the panel starts it again; cards free on exit).
     The ledger's assignment is untouched: a later start re-uses it when free."""
-    _check_llm_name(body.service)
-    _panel_do_checked("llm-stop", [body.service], _admin)
+    _check_gpu_name(body.service)
+    _panel_do_checked("gpu-stop", [body.service], _admin)
     return _gpu_pool_now()
 
 
-class LlmGpuAutostartBody(BaseModel):
+class GpuAutostartBody(BaseModel):
     service: str
     enabled: bool
 
 
-@app.post("/api/llm/gpus/autostart")
-def llm_gpus_autostart(body: LlmGpuAutostartBody, _admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
-    """Toggle the boot-autostart list (applied by llm-autostart.service on
+@app.post("/api/gpus/autostart")
+def gpus_autostart(body: GpuAutostartBody, _admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
+    """Toggle the boot-autostart list (applied by gpu-autostart.service on
     boot, in list order; overlaps are resolved there by re-grabbing — see
     the warnings in the response)."""
-    _check_llm_name(body.service)
-    with llm_gpus.gpu_lock():
-        ledger = llm_gpus.load_ledger()
+    _check_gpu_name(body.service)
+    with gpu_pool.gpu_lock():
+        ledger = gpu_pool.load_ledger()
         auto = ledger["autostart"]
         if body.enabled and body.service not in auto:
             auto.append(body.service)
         elif not body.enabled:
             auto[:] = [s for s in auto if s != body.service]
         ledger["autostart"] = auto
-        llm_gpus.save_ledger(ledger)
-    _audit(_admin, "llm-gpu-autostart", [body.service, "on" if body.enabled else "off"], 0)
+        gpu_pool.save_ledger(ledger)
+    _audit(_admin, "gpu-autostart", [body.service, "on" if body.enabled else "off"], 0)
     return _gpu_pool_now()

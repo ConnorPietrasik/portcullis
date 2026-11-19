@@ -85,7 +85,7 @@ fi
 # ── configs render ───────────────────────────────────────────────────────────
 # Both compose trees must interpolate with their .env BEFORE anything runs —
 # a required var a new block needs but .env lacks (a ${LLM_API_KEY:?...} added
-# with a new llm-* block after git pull) would otherwise surface only at
+# with a new gpu-* block after git pull) would otherwise surface only at
 # pull/up time, after the configs are already half-synced. `config -q`
 # renders the model without touching any container.
 section "configs render"
@@ -104,11 +104,11 @@ if [[ -f /opt/panel/docker-compose.yml ]]; then
   # the deployed render includes the GPU pool override — that is exactly what
   # COMPOSE_STACK (make update / rollback / panel-do) renders, so a stale or
   # broken override surfaces HERE, not mid-update.
-  if [[ ! -f /opt/panel-api/llm-gpu-override.yml ]]; then
-    bad "llm-gpu-override.yml missing — every compose render on this host is broken"
-    hint "sudo mkdir -p /opt/panel-api && printf 'services: {}\\n' | sudo tee /opt/panel-api/llm-gpu-override.yml && sudo chmod 644 /opt/panel-api/llm-gpu-override.yml — or re-run: make api (re-creates it)"
+  if [[ ! -f /opt/panel-api/gpu-pool-override.yml ]]; then
+    bad "gpu-pool-override.yml missing — every compose render on this host is broken"
+    hint "sudo mkdir -p /opt/panel-api && printf 'services: {}\\n' | sudo tee /opt/panel-api/gpu-pool-override.yml && sudo chmod 644 /opt/panel-api/gpu-pool-override.yml — or re-run: make api (re-creates it)"
   elif render_out="$(sudo docker compose --project-directory /opt/panel \
-      -f /opt/panel/docker-compose.yml -f /opt/panel-api/llm-gpu-override.yml config -q 2>&1)"; then
+      -f /opt/panel/docker-compose.yml -f /opt/panel-api/gpu-pool-override.yml config -q 2>&1)"; then
     ok "deployed compose (+ GPU override) renders with /opt/panel/.env"
   else
     bad "deployed compose does NOT render with /opt/panel/.env (half-synced state?)"
@@ -120,39 +120,39 @@ fi
 
 # ── fleet routes ───────────────────────────────────────────────────────────────
 # A fleet instance is reachable only through its router pair in
-# traefik/dynamic/llm.yml: router <name> (rule Host(<sub>.pietrasik.top)) +
+# traefik/dynamic/gpu.yml: router <name> (rule Host(<sub>.pietrasik.top)) +
 # service <name> (url http://<name>:8000), and it runs only through its
-# radiance config (compose/llm-configs/<name>.yaml — radiance 2.x takes no
+# radiance config (compose/gpu-configs/<name>.yaml — radiance 2.x takes no
 # command-line flags, only --config). Those name references come from a
 # hand-copied block, and one wrong one leaves the container up but the
-# subdomain dead — silently — or the block red at panel-do llm-fleet.
+# subdomain dead — silently — or the block red at panel-do gpu-fleet.
 # Both trees are checked: the repo's (make update
 # refuses to run while this is red — doctor is its precondition) and the
-# deployed one (what actually routes). The llm-* prefix IS the instance
-# marker: the orphan check below assumes any llm-* router pairs with a
+# deployed one (what actually routes). The gpu-* prefix IS the instance
+# marker: the orphan check below assumes any gpu-* router pairs with a
 # compose service, so shared (non-instance) routers carry the fleet-*
 # prefix instead (fleet-fallback, fleet-open — both route to the panel-api
-# service in panel.yml) and need no exemption; a shared router named llm-*
+# service in panel.yml) and need no exemption; a shared router named gpu-*
 # reports as stale on purpose (rename it). fleet-open's Host() list is
 # checked separately: it must name every instance host (end of
 # fleet_routes).
-# The llm.cards label is the GPU pool's ONLY source of the instance's card
+# The gpu.cards label is the GPU pool's ONLY source of the instance's card
 # need (radiance 2.x: no --tp left in the command to fall back to) — a
 # missing label is checked here, not left to panel-do's runtime error.
-fleet_routes() { # <compose.yml> <llm.yml> <label>
+fleet_routes() { # <compose.yml> <gpu.yml> <label>
   local comp="$1" routes="$2" label="$3" svc sub orph cards cfg tp
   local -a svcs
-  mapfile -t svcs < <(grep -oE '^  llm-[a-z0-9][a-z0-9-]*:' "$comp" | sed 's/^  //; s/:$//' | sort -u)
+  mapfile -t svcs < <(grep -oE '^  gpu-[a-z0-9][a-z0-9-]*:' "$comp" | sed 's/^  //; s/:$//' | sort -u)
   for svc in "${svcs[@]}"; do
-    sub="${svc#llm-}"
+    sub="${svc#gpu-}"
     if ! grep -q "^    ${svc}:" "$routes"; then
-      bad "$label: $svc (compose) has no router entry in llm.yml"
+      bad "$label: $svc (compose) has no router entry in gpu.yml"
       hint "the container would run but ${sub}.pietrasik.top would 404 — add the router + service pair (one block each)"
     elif ! grep -qF "Host(\`${sub}.pietrasik.top\`)" "$routes"; then
-      bad "$label: $svc — Host(\`${sub}.pietrasik.top\`) not found in llm.yml"
+      bad "$label: $svc — Host(\`${sub}.pietrasik.top\`) not found in gpu.yml"
       hint "the subdomain would not reach this instance — fix the router's rule"
     elif ! grep -qF "http://${svc}:8000" "$routes"; then
-      bad "$label: $svc — no service url http://${svc}:8000 in llm.yml"
+      bad "$label: $svc — no service url http://${svc}:8000 in gpu.yml"
       hint "the subdomain would 503 — add the service block (loadBalancer → servers → url)"
     else
       ok "$label: $svc ↔ ${sub}.pietrasik.top (router + Host + url)"
@@ -160,40 +160,40 @@ fleet_routes() { # <compose.yml> <llm.yml> <label>
     # The block's own lines: from its key to the next top-level service.
     local block
     block="$(awk -v start="  ${svc}:" 'index($0, start) == 1 {f=1; next} f && /^  [a-z0-9]/ {f=0} f' "$comp")"
-    # llm.cards — the pool's card-need source (panel-do llm-fleet errors
+    # gpu.cards — the pool's card-need source (panel-do gpu-fleet errors
     # without it, taking the whole GPUs view red with it).
-    cards="$(printf '%s\n' "$block" | grep -oE 'llm\.cards=[0-9]+' | head -n1 | cut -d= -f2)"
+    cards="$(printf '%s\n' "$block" | grep -oE 'gpu\.cards=[0-9]+' | head -n1 | cut -d= -f2)"
     if ! [[ "${cards:-0}" =~ ^[1-9][0-9]*$ ]]; then
-      bad "$label: $svc (compose) has no positive llm.cards label (the GPU pool's card need)"
-      hint "add '- llm.cards=N' to the block — N == tp in compose/llm-configs/${svc}.yaml (radiance 2.x has no --tp to fall back to)"
+      bad "$label: $svc (compose) has no positive gpu.cards label (the GPU pool's card need)"
+      hint "add '- gpu.cards=N' to the block — N == tp in compose/gpu-configs/${svc}.yaml (radiance 2.x has no --tp to fall back to)"
     fi
     # The radiance config (2.x's ONLY settings surface) — mounted per block,
     # named after the service; its tp must equal the label.
-    cfg="$(printf '%s\n' "$block" | grep -oE '\./llm-configs/[a-z0-9._-]+\.yaml' | head -n1)"
+    cfg="$(printf '%s\n' "$block" | grep -oE '\./gpu-configs/[a-z0-9._-]+\.yaml' | head -n1)"
     if [[ -z "$cfg" ]]; then
       bad "$label: $svc (compose) mounts no radiance config (2.x runs on --config only)"
-      hint "add '- ./llm-configs/${svc}.yaml:/etc/radiance/radiance.yaml:ro' to the block's volumes"
+      hint "add '- ./gpu-configs/${svc}.yaml:/etc/radiance/radiance.yaml:ro' to the block's volumes"
     elif [[ ! -f "$(dirname "$comp")/$cfg" ]]; then
       bad "$label: $svc (compose) mounts $cfg, which does not exist"
-      hint "create compose/llm-configs/${svc}.yaml (copy a sibling; rename its model entry as needed)"
+      hint "create compose/gpu-configs/${svc}.yaml (copy a sibling; rename its model entry as needed)"
     else
       tp="$(grep -oE '^[[:space:]]*tp:[[:space:]]*[0-9]+' "$(dirname "$comp")/$cfg" | head -n1 | grep -oE '[0-9]+')"
       if [[ -z "$tp" ]]; then
         bad "$label: $cfg has no tp: key (the engine defaults to 1 — the card pin will not match)"
       elif [[ -n "$cards" && "$tp" != "$cards" ]]; then
-        bad "$label: $svc — llm.cards=${cards} but $cfg says tp: ${tp} (the pool grabs a different count than the engine shards)"
+        bad "$label: $svc — gpu.cards=${cards} but $cfg says tp: ${tp} (the pool grabs a different count than the engine shards)"
         hint "make them agree (the label == the config's tp)"
       fi
     fi
   done
   while IFS= read -r orph; do
     if ! grep -q "^  ${orph}:" "$comp"; then
-      bad "$label: $orph router in llm.yml but no compose service"
+      bad "$label: $orph router in gpu.yml but no compose service"
       hint "stale route (instance deleted?) — remove the router + service pair"
     fi
-  done < <(awk '/^  routers:/{f=1;next} f && /^  [a-z]/{f=0} f && /^    llm-[a-z0-9][a-z0-9-]*:/{print}' "$routes" \
+  done < <(awk '/^  routers:/{f=1;next} f && /^  [a-z]/{f=0} f && /^    gpu-[a-z0-9][a-z0-9-]*:/{print}' "$routes" \
     | sed 's/^    //; s/:$//' | sort -u)
-  [[ ${#svcs[@]} -eq 0 ]] && warn "$label: no llm-* services in compose (fleet not configured?)"
+  [[ ${#svcs[@]} -eq 0 ]] && warn "$label: no gpu-* services in compose (fleet not configured?)"
   # The fleet-open list — the one copy of instance names that is not a
   # router/service pair: the shared key-bootstrap router routes to the
   # panel-api service (no compose service to pair), but its host list must
@@ -219,10 +219,10 @@ fleet_routes() { # <compose.yml> <llm.yml> <label>
     open_hosts="$(awk '/^  routers:/{f=1;next} f && /^  [a-z]/{f=0} f && /^    fleet-open:$/{g=1;next} f && g && /^    [a-z]/{g=0;next} f && g{print}' "$routes" \
       | sed 's/#.*$//' \
       | { grep -oE 'Host\([^)]*\)' || true; } | { grep -oE '`[^`]+`' || true; } | tr -d '`' | LC_ALL=C sort -u)"
-    inst_hosts="$(for svc in "${svcs[@]}"; do printf '%s\n' "${svc#llm-}.pietrasik.top"; done | LC_ALL=C sort -u)"
+    inst_hosts="$(for svc in "${svcs[@]}"; do printf '%s\n' "${svc#gpu-}.pietrasik.top"; done | LC_ALL=C sort -u)"
     if [[ -z $open_hosts ]]; then
-      bad "$label: no hosts parseable from the fleet-open rule in llm.yml — every dashboard link 401s 'invalid api key'"
-      hint "restore the fleet-open router block (key bootstrap → panel-api; see its comment in llm.yml)"
+      bad "$label: no hosts parseable from the fleet-open rule in gpu.yml — every dashboard link 401s 'invalid api key'"
+      hint "restore the fleet-open router block (key bootstrap → panel-api; see its comment in gpu.yml)"
     else
       missing="$(LC_ALL=C comm -13 <(printf '%s\n' "$open_hosts") <(printf '%s\n' "$inst_hosts") || true)"
       stale="$(LC_ALL=C comm -23 <(printf '%s\n' "$open_hosts") <(printf '%s\n' "$inst_hosts") || true)"
@@ -233,7 +233,7 @@ fleet_routes() { # <compose.yml> <llm.yml> <label>
           add+="${add:+ || }Host(\`${h}\`)"
         done <<<"$missing"
         bad "$label: fleet-open rule missing $(tr '\n' ' ' <<<"$missing" | sed 's/ *$//') — its dashboard link(s) 401 'invalid api key'"
-        hint "add ${add} to the fleet-open rule (between the parens): llm.yml → fleet-open → rule"
+        hint "add ${add} to the fleet-open rule (between the parens): gpu.yml → fleet-open → rule"
       fi
       [[ -n $stale ]] && warn "$label: fleet-open rule lists $(tr '\n' ' ' <<<"$stale" | sed 's/ *$//') with no compose service (instance deleted?) — trim the list"
       [[ -z $missing && -z $stale ]] && ok "$label: fleet-open Host() list ↔ ${#svcs[@]} instance host(s)"
@@ -242,13 +242,13 @@ fleet_routes() { # <compose.yml> <llm.yml> <label>
   return 0
 }
 section "fleet routes"
-if [[ -f "$REPO_ROOT/compose/docker-compose.yml" && -f "$REPO_ROOT/compose/traefik/dynamic/llm.yml" ]]; then
-  fleet_routes "$REPO_ROOT/compose/docker-compose.yml" "$REPO_ROOT/compose/traefik/dynamic/llm.yml" "repo"
+if [[ -f "$REPO_ROOT/compose/docker-compose.yml" && -f "$REPO_ROOT/compose/traefik/dynamic/gpu.yml" ]]; then
+  fleet_routes "$REPO_ROOT/compose/docker-compose.yml" "$REPO_ROOT/compose/traefik/dynamic/gpu.yml" "repo"
 else
   skip "repo fleet routes (compose/ tree missing — fresh clone: make secrets/deploy)"
 fi
-if [[ -f /opt/panel/docker-compose.yml && -f /opt/panel/traefik/dynamic/llm.yml ]]; then
-  fleet_routes /opt/panel/docker-compose.yml /opt/panel/traefik/dynamic/llm.yml "deployed"
+if [[ -f /opt/panel/docker-compose.yml && -f /opt/panel/traefik/dynamic/gpu.yml ]]; then
+  fleet_routes /opt/panel/docker-compose.yml /opt/panel/traefik/dynamic/gpu.yml "deployed"
 else
   skip "deployed fleet routes (no /opt/panel — make deploy, RUNBOOK Phase 2)"
 fi
@@ -796,23 +796,23 @@ fi
 # GPU pool state (the ledger is intent — panel-owned 0600; the override is
 # its compose projection — 0644, read by docker compose as root). Both are
 # seeded by make deploy / make api and re-seeded by panel-api at startup.
-if [[ -f /opt/panel-api/llm-gpu.json ]]; then
-  m="$(stat -c %a /opt/panel-api/llm-gpu.json 2>/dev/null || true)"
-  if [[ "$m" == 600 ]]; then ok "llm-gpu.json (GPU ledger) mode 600"; else
-    warn "llm-gpu.json mode ${m:-unreadable} (want 600)"; hint "sudo chown panel:panel && sudo chmod 600 /opt/panel-api/llm-gpu.json"
+if [[ -f /opt/panel-api/gpu-pool.json ]]; then
+  m="$(stat -c %a /opt/panel-api/gpu-pool.json 2>/dev/null || true)"
+  if [[ "$m" == 600 ]]; then ok "gpu-pool.json (GPU ledger) mode 600"; else
+    warn "gpu-pool.json mode ${m:-unreadable} (want 600)"; hint "sudo chown panel:panel && sudo chmod 600 /opt/panel-api/gpu-pool.json"
   fi
 else
-  warn "llm-gpu.json missing — panel-api seeds it at startup"; hint "systemctl restart panel-api (or make api)"
+  warn "gpu-pool.json missing — panel-api seeds it at startup"; hint "systemctl restart panel-api (or make api)"
 fi
-if [[ -f /opt/panel-api/llm-gpu-override.yml ]]; then
-  ok "llm-gpu-override.yml present (GPU pool compose projection)"
+if [[ -f /opt/panel-api/gpu-pool-override.yml ]]; then
+  ok "gpu-pool-override.yml present (GPU pool compose projection)"
 else
-  bad "llm-gpu-override.yml missing — compose renders (make update) will fail"; hint "make api (re-creates it)"
+  bad "gpu-pool-override.yml missing — compose renders (make update) will fail"; hint "make api (re-creates it)"
 fi
-if systemctl is-enabled --quiet llm-autostart 2>/dev/null; then
-  ok "llm-autostart.service enabled (fleet boot autostart)"
+if systemctl is-enabled --quiet gpu-autostart 2>/dev/null; then
+  ok "gpu-autostart.service enabled (fleet boot autostart)"
 else
-  warn "llm-autostart.service not enabled — the fleet won't auto-start on boot"; hint "make api (installs + enables it)"
+  warn "gpu-autostart.service not enabled — the fleet won't auto-start on boot"; hint "make api (installs + enables it)"
 fi
 code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://172.17.0.1:8010/api/metrics 2>/dev/null)"
 if [[ "$code" == 401 ]]; then
@@ -899,13 +899,13 @@ if [[ -x /usr/local/libexec/panel-do ]]; then
     bad "panel-do registry missing edge-ips — llm.pietrasik.top will report every instance down"
     hint "binary is stale — make panel-do (rebuilds + reinstalls it)"
   fi
-  # The GPU view (panel tab "GPUs") rides on llm-fleet/llm-live/llm-apply/
-  # llm-stop; a stale binary makes the view error instead of erroring
+  # The GPU view (panel tab "GPUs") rides on gpu-fleet/gpu-live/gpu-apply/
+  # gpu-stop; a stale binary makes the view error instead of erroring
   # silently, so presence is a hard check like the others above.
-  if sudo -u panel sudo -n /usr/local/libexec/panel-do --list 2>/dev/null | grep -q '"name":"llm-apply"'; then
-    ok "llm-apply action present (GPU pool: (re)create an instance on its card set)"
+  if sudo -u panel sudo -n /usr/local/libexec/panel-do --list 2>/dev/null | grep -q '"name":"gpu-apply"'; then
+    ok "gpu-apply action present (GPU pool: (re)create an instance on its card set)"
   else
-    bad "panel-do registry missing llm-apply — the GPU view cannot assign cards"
+    bad "panel-do registry missing gpu-apply — the GPU view cannot assign cards"
     hint "binary is stale — make panel-do (rebuilds + reinstalls it)"
   fi
   # The Services view's "defined, no container" → create+start button rides on
@@ -1027,7 +1027,7 @@ else
     fi
   fi
   # A stale panel-do binary makes the panel's servitor buttons 500 — the same
-  # hard presence check as edge-ips / llm-apply / start-service above.
+  # hard presence check as edge-ips / gpu-apply / start-service above.
   if sudo -u panel sudo -n /usr/local/libexec/panel-do --list 2>/dev/null | grep -q '"name":"servitor-status"'; then
     ok "servitor-* actions present in the panel-do registry"
   else

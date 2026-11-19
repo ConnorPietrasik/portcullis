@@ -50,7 +50,7 @@
 # callback") and the LAST GOOD config stays in effect — the feature simply
 # doesn't land, everything else keeps routing; on a FIRST LOAD / traefik
 # RESTART with the bad file on disk the file provider contributes ZERO
-# routes, and since EVERY route in this repo (panel, llm fleet, portfolio,
+# routes, and since EVERY route in this repo (panel, gpu fleet, portfolio,
 # authelia) lives in the file provider, every host 404s with traefik
 # itself healthy — a full edge outage until the file is fixed or removed.
 # (The doctor's multi-value Host() note — "router is dropped, the rest of
@@ -61,7 +61,7 @@
 # landing stage; if it fails, do not ship the file at all — defer the
 # feature (or the offending key) as its own change.
 #
-# Naming: no llm-*/fleet-* prefix — not a fleet instance (invariant 6,
+# Naming: no gpu-*/fleet-* prefix — not a fleet instance (invariant 6,
 # doctor's orphan check). Placeholder-free by invariant: no secret may
 # ever live in a dynamic file; the key lives only in .panel-api.env.
 http:
