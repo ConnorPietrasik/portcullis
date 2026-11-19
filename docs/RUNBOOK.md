@@ -825,7 +825,7 @@ container itself is dropped by the rollback's recreate (`--remove-orphans`); the
 
 ### Client setup
 
-**pi-web-access** (current latest: 0.47.0 — its SearXNG provider speaks exactly this endpoint:
+**pi-web-access** (current latest: 0.48.0 — its SearXNG provider speaks exactly this endpoint:
 `GET {base}/search?q=…&format=json` (+ `time_range`)). Per pi machine, NOT in the repo — merge
 into the `web-search.json` that pi ACTUALLY reads (**chmod 600 — it holds the key**): pi checks
 `~/.pi/agent/web-search.json` first and falls back to the legacy `~/.pi/web-search.json` only
@@ -950,7 +950,7 @@ host firewall line below.
 ### One-time install (short version)
 
 The servitor repo's `deploy/portcullis/INSTALL.md` is the step-by-step
-reference (image build vs fast path, the domain template, the failure-mode
+reference (image build, the domain template, the failure-mode
 table distilled from the dev box). The host-side shape, in order:
 
 ```bash
@@ -980,8 +980,7 @@ sudo chmod 600 /opt/servitor-repo/.env
 #      (sync.sh sources the file); the rest may stay at defaults.
 
 # 4. Guest image (the Makefile target runs as the invoking user — the build
-#    needs root, so the sudo is on `make` — or the fast path, INSTALL.md
-#    §4 + Appendix A)
+#    needs root, so the sudo is on `make`)
 cd /opt/servitor-repo
 sudo make guest   # = unshare -m deploy/guest/build.sh --env .env --deploy-key /root/.srv/deploy_key.pub
 
