@@ -29,14 +29,15 @@ http:
       chain:
         middlewares: [sec-headers, authelia]
 
-    # Rate limit for the fleet's machine-API hosts (per-instance subdomains +
-    # llm.pietrasik.top): inference is slow, so this only blunts key-guessing
-    # and scan traffic — a genuine client is never near it.
-    llm-rate:
-      rateLimit:
-        average: 10 # req/s sustained
-        period: 1s
-        burst: 20
+    # No rate-limit middleware on the fleet's machine-API hosts (per-instance
+    # subdomains + llm.pietrasik.top). The API key IS the gate: a wrong key
+    # 401s before any GPU work, and at 256 bits of entropy guessing is
+    # infeasible at any rate; radiance's admission control (429 +
+    # Retry-After) is the backpressure that actually bounds GPU spend. A
+    # per-IP token bucket shared by every client behind one NAT (the
+    # dashboard's 5 req/s /history polling, agents on the same box) only
+    # punished genuine traffic while a leaked key from another IP would
+    # bypass it entirely. If you are tempted to re-add one: don't.
 
     # Injected into requests forwarded to the panel API only. Clients cannot
     # set this header themselves — Traefik overwrites it.

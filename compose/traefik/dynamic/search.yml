@@ -92,9 +92,9 @@ http:
 
     search-rate:
       rateLimit:
-        # Budget sized to the 4-thread ceiling, not to llm-rate's
-        # inference scale. Search and the UI share the pool; the rate
-        # limit blunts abuse, GRANIAN_BLOCKING_THREADS is the capacity.
+        # Budget sized to the 4-thread ceiling, not to any inference
+        # rate: search and the UI share the pool; the rate limit blunts
+        # abuse, GRANIAN_BLOCKING_THREADS is the capacity.
         average: 2
         period: 1s
         burst: 10

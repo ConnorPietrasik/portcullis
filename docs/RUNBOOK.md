@@ -474,8 +474,9 @@ re-pins itself automatically as part of `make update` (see Updates).
 
 [Radiance](https://codeberg.org/StillDeadcode/radiance) instances on 6 shared R9700s; start/stop and GPU assignment from the panel
 (Services view for the containers, **GPUs view** for the cards — see **GPU pool** below).
-Machine APIs, not browser apps: no Authelia — the gate is the server's own API key (`Authorization: Bearer`) behind the wildcard cert
-+ `llm-rate`; clients use `base_url=https://<name>.pietrasik.top/v1` + key, exactly like OpenAI.
+Machine APIs, not browser apps: no Authelia — the gate is the server's own API key (`Authorization: Bearer`) behind the
+wildcard cert; clients use `base_url=https://<name>.pietrasik.top/v1` + key, exactly like OpenAI. No rate-limit middleware
+on these hosts — see the "no rate-limit" note in `traefik/dynamic/middlewares.yml`.
 
 **An instance = a service block + a radiance config + a router pair**, deployed by `make update`: `gpu-<name>` in `compose/docker-compose.yml` (merges
 `x-gpu-base`) ↔ `Host(`<name>.pietrasik.top`)` → `http://gpu-<name>:8000` in `traefik/dynamic/gpu.yml`. One subdomain per instance so

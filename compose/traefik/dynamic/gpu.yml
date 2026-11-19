@@ -5,7 +5,9 @@
 # only speak bearer tokens. These routers deliberately omit auth-chain@file,
 # so plain OpenAI clients work with
 #   base_url = https://<name>.pietrasik.top/v1
-# The API key is the gate; llm-rate blunts key-guessing and scan traffic. A
+# The API key is the gate — a wrong key 401s before any GPU work, and
+# radiance's admission control (429 + Retry-After) bounds spend (see the
+# "no rate-limit" note in middlewares.yml). A
 # host 502s until its instance is up — harmless. Rule: service gpu-<name> ↔
 # Host(`<name>.pietrasik.top`) ↔ http://gpu-<name>:8000 (RUNBOOK → GPU fleet).
 #
@@ -24,22 +26,22 @@ http:
     # one pair per instance — copy for each (gpu-27b2 → 27b2.pietrasik.top, …)
     gpu-27b:
       rule: "Host(`27b.pietrasik.top`)"
-      middlewares: [sec-headers@file, llm-rate@file]
+      middlewares: [sec-headers@file]
       service: gpu-27b
 
     gpu-27b-1:
       rule: "Host(`27b-1.pietrasik.top`)"
-      middlewares: [sec-headers@file, llm-rate@file]
+      middlewares: [sec-headers@file]
       service: gpu-27b-1
 
     gpu-27b-2:
       rule: "Host(`27b-2.pietrasik.top`)"
-      middlewares: [sec-headers@file, llm-rate@file]
+      middlewares: [sec-headers@file]
       service: gpu-27b-2
 
     gpu-flashnext:
       rule: "Host(`flashnext.pietrasik.top`)"
-      middlewares: [sec-headers@file, llm-rate@file]
+      middlewares: [sec-headers@file]
       service: gpu-flashnext
 
     # Key bootstrap for the radiance dashboards (panel Services view → the
@@ -68,7 +70,7 @@ http:
     # (possibly OR-ed) conjunction.
     fleet-open:
       rule: "(Host(`27b.pietrasik.top`) || Host(`27b-1.pietrasik.top`) || Host(`27b-2.pietrasik.top`) || Host(`flashnext.pietrasik.top`)) && PathPrefix(`/open`)"
-      middlewares: [auth-chain@file, llm-rate@file]
+      middlewares: [auth-chain@file]
       service: panel-api
 
   services:

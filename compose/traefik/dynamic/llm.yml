@@ -19,5 +19,5 @@ http:
     # panel-secret chain — on this host a client could supply both headers itself.
     fleet-fallback:
       rule: "Host(`llm.pietrasik.top`) && PathPrefix(`/v1`)"
-      middlewares: [sec-headers@file, llm-rate@file]
+      middlewares: [sec-headers@file] # no llm-rate — see middlewares.yml
       service: panel-api
