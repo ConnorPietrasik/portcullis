@@ -995,13 +995,12 @@ sudo mkfs.ext4 -q -L servitor-state /opt/servitor-disk/servitor-state.raw
 sudo virsh define <substituted-template> && sudo virsh start servitor
 sudo virsh console servitor   # watch the first boot; Ctrl-] to leave
 
-# 7. Guest egress — the ONE host firewall change servitor needs. The VM is
-#    not a docker container: docker's FORWARD rules never see its traffic,
-#    so the host's ufw FORWARD policy (default deny routed) applies and this
-#    line is the whole story (the dev-box lesson: the NAT masquerade alone
-#    is not enough). `make doctor` checks it.
-EDGE_SUBNET=$(sudo docker network inspect edge -f '{{(index .IPAM.Config 0).Subnet}}')
-sudo ufw route allow from "$EDGE_SUBNET" comment 'servitor VM egress'
+# 7. Guest egress — the ONE host firewall change servitor needs: the VM is
+#    not a docker container, so docker's FORWARD rules never see its traffic
+#    and the host's ufw FORWARD policy (default deny routed) applies.
+#    /32 = the VM's exact address; `make doctor` checks it against the
+#    route file's upstream IP.
+sudo ufw route allow from <SERVITOR_VM_IP>/32 comment 'servitor VM egress'
 
 # 8. First sync = provisioning (keys + extension + config + doctor)
 cd /opt/servitor-repo && sudo deploy/sync.sh
@@ -1088,9 +1087,9 @@ either is missing; on CachyOS both are distro defaults, so this is usually a no-
 - [ ] `/opt/panel/authelia/db.sqlite3` mode 600 (TOTP seeds — authelia creates it 0644 at first boot; `make deploy`/`make update`
   re-tighten it, `make doctor` checks it).
 - [ ] Servitor (when installed): the VM's firewall is guest-enforced (nftables — 8787 from the edge subnet only, 22 from the
-  LAN subnet only); the host never opens 8787, and its only firewall change is the one `ufw route allow from <edge subnet>`
-  egress line (doctor checks it). The `/opt/servitor-repo` checkout stays root/admin-owned and not group/other-writable
-  anywhere in its directory chain (panel-do's `checkManagedScript` refuses to exec its scripts otherwise).
+  LAN subnet only); the host never opens 8787, and its only firewall change is the one `ufw route allow from <the VM's IP>/32`
+  egress line (doctor checks it against the route file's upstream IP). The `/opt/servitor-repo` checkout stays root/admin-owned
+  and not group/other-writable anywhere in its directory chain (panel-do's `checkManagedScript` refuses to exec its scripts otherwise).
 
 ## Troubleshooting
 

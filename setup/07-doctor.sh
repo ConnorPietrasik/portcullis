@@ -993,8 +993,16 @@ else
     # host's ufw FORWARD policy (default deny routed) applies and the
     # explicit route rule is the whole story (the laptop lesson: the NAT
     # masquerade alone is not enough).
-    edge_subnet="$(sudo docker network inspect edge -f '{{(index .IPAM.Config 0).Subnet}}' 2>/dev/null || true)"
-    if [[ -n "$edge_subnet" ]]; then
+    # Scoped to the VM's exact /32 (the bridge's only non-docker resident);
+    # the IP is parsed from the route file — the record of which address the
+    # edge serves; deployed tree first, repo fallback.
+    serv_route_ip="$(grep -hoE 'url: "http://(([0-9]{1,3}\.){3}[0-9]{1,3}):[0-9]+"' \
+        /opt/panel/traefik/dynamic/servitor.yml \
+        "$REPO_ROOT/compose/traefik/dynamic/servitor.yml" 2>/dev/null \
+        | head -n1 | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' || true)"
+    if [[ -z "$serv_route_ip" ]]; then
+      warn "could not parse the servitor route's upstream IP — could not verify the guest egress rule"
+    else
       serv_ufw_status="$(sudo ufw status 2>/dev/null || true)"
       if ! grep -q "Status: active" <<<"$serv_ufw_status"; then
         # The firewall section below fails separately when ufw is not
@@ -1004,19 +1012,18 @@ else
         # No `ufw status route` — status takes only verbose|numbered and
         # rejects anything else (non-zero exit, no rule output). Route
         # rules render as the ALLOW FWD lines of plain `ufw status`, and
-        # we grep only those: the same subnet legitimately appears in the
-        # panel-api ingress rule (allow from $edge_subnet to 172.17.0.1
-        # port 8010), so a whole-output grep would false-positive on it.
+        # we grep only those: the edge subnet legitimately appears in the
+        # panel-api ingress rule (allow from <subnet> to 172.17.0.1 port
+        # 8010), so a whole-output grep would false-positive on it. ufw
+        # renders a /32 source as the bare IP — anchor on field boundaries.
         route_rules="$(grep -F 'ALLOW FWD' <<<"$serv_ufw_status" || true)"
-        if grep -qF "$edge_subnet" <<<"$route_rules"; then
-          ok "guest egress rule present (ufw route allow from $edge_subnet)"
+        if grep -qE "(^|[[:space:]])${serv_route_ip}([[:space:]]|$)" <<<"$route_rules"; then
+          ok "guest egress rule present (ufw route allow from ${serv_route_ip}/32)"
         else
-          bad "no ufw route rule for the edge subnet — the VM's public egress (DNS, search, npm) is dropped"
-          hint "sudo ufw route allow from $edge_subnet (RUNBOOK → Servitor)"
+          bad "no ufw route rule for the servitor VM (${serv_route_ip}/32) — the VM's public egress (DNS, search, npm) is dropped"
+          hint "sudo ufw route allow from ${serv_route_ip}/32 comment 'servitor VM egress' (RUNBOOK → Servitor)"
         fi
       fi
-    else
-      warn "edge subnet unreadable — could not verify the guest egress rule"
     fi
   fi
   # A stale panel-do binary makes the panel's servitor buttons 500 — the same

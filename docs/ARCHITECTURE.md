@@ -146,10 +146,11 @@ anti-swap standard as the auto-update clone (`checkManagedScript`: script +
 directory chain to `/`, not group/other-writable, not panel-owned, bash
 shebang). A hardcoded unvalidated script path was the original design and is
 exactly the replaceable-root-script hole that standard exists to close. (3) **one
-ufw line** — `route allow from <edge subnet>`: the VM is not a docker container,
-so docker's FORWARD rules never see its traffic and the host's default-deny
-routed policy applies to its egress; without the line the VM has no public DNS
-and its model/search calls die. What portcullis does NOT do: run any servitor
+ufw line** — `route allow from <the VM's IP>/32`: the VM is not a docker
+container, so docker's FORWARD rules never see its traffic and the host's
+default-deny routed policy applies to its egress; without the line the VM has
+no public DNS and its model/search calls die. The doctor parses the IP from
+the route file and checks the rule against it. What portcullis does NOT do: run any servitor
 process, hold its secrets (the key slice lives in the guest's 0600 env file,
 injected by its own sync pipeline), or open 8787 on the host (nothing on the
 host listens on it — the only host-side consumer is panel-do's 5 s healthz
