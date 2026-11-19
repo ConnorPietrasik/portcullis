@@ -37,6 +37,18 @@ access_control:
                    # through to the *.pietrasik.top wildcard below and are
                    # admitted after 2FA (UI shell; the API still 403s them)
 
+    - domain: servitor.pietrasik.top
+      policy: two_factor
+      subject: ['group:admins'] # agent VM: only you — same two-rule pattern
+                                # as the panel: the subject rule MATCHES
+                                # admins, the deny below excludes everyone
+                                # else (without it non-admins fall through
+                                # to the *.pietrasik.top wildcard and are
+                                # admitted after 2FA)
+
+    - domain: servitor.pietrasik.top
+      policy: deny
+
     # Example rules — uncomment (kept ABOVE the wildcard) when you add these
     # apps; until then they are dead weight (a matching router doesn't exist):
     # - domain: jellyfin.pietrasik.top # friends-only app

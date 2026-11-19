@@ -933,7 +933,10 @@ is hosted on this server. The VM is a **raw IP upstream in one traefik route**,
 not a container: the file provider reaches it at `SERVITOR_VM_IP:8787`, the
 auth chain (`auth-chain@file`) is its only gate (the app authenticates nobody),
 and the VM's own nftables admits 8787 from the edge subnet only + 22 from the
-LAN subnet only. Invariant 2 holds: the route is a file, no docker.sock
+host's edge-bridge IP /32 + the ops subnet (the host's own ssh to the VM
+sources its edge-bridge IP — the kernel picks the output-interface address
+for the connected route — so neither LAN-only nor the full edge segment is
+right). Invariant 2 holds: the route is a file, no docker.sock
 anywhere. Day-2 control is four panel-do actions (`servitor-status`,
 `servitor-vm-restart`, `servitor-sync`, `servitor-doctor`); the scripts they
 run live in the servitor repo's host checkout at **`/opt/servitor-repo`**
