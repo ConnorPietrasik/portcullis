@@ -33,6 +33,7 @@ when you change the behavior they explain.
 | `ddns/` | stdlib-only Python + systemd timer/service → NameSilo apex A record |
 | `tools/panel-hosts.sh` | client-side /etc/hosts pin of routed names (no-hairpin workaround) |
 | `docs/` | RUNBOOK (deploy/ops), ARCHITECTURE (trust boundaries) |
+| `ref/` | gitignored external reference clones (e.g. Radiance source) — local scratch, never deployed |
 
 ## Security invariants — do not weaken
 

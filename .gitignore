@@ -31,3 +31,6 @@ llm-gpu-override.yml
 *.sqlite3
 notification.txt
 acme.json
+
+# reference stuff to avoid re-downloading every time
+ref/
