@@ -496,6 +496,127 @@ sudo_warm() { # re-warm the sudo timestamp so long operations don't prompt mid-r
   sudo -n true 2>/dev/null || sudo -v 2>/dev/null || true
 }
 
+managed_script_check() { # <script> — the bash mirror of panel-do's checkManagedScript
+  # (panel-do/main.go): a regular executable file with the repo's bash shebang,
+  # and the file, its directory, and every ancestor directory up to / not
+  # group/other-writable and not owned by the panel user. A writable directory
+  # ANYWHERE in the chain lets a local user delete-and-replace the file (a
+  # writable script dir) or the checkout dir itself (a writable ancestor) —
+  # so the WHOLE chain is checked, not just the leaf. panel-do applies the
+  # identical check in Go to every script IT execs (the clone's
+  # setup/08|09-*.sh, the servitor's deploy/sync|doctor.sh); this mirror
+  # covers what THIS tree root-execs outside panel-do: the 08-update.sh
+  # servitor tail → /opt/servitor-repo/deploy/{update,sync,doctor}.sh +
+  # deploy/guest/build.sh (the tail's executed python,
+  # deploy/resolve_target.py, runs under an interpreter — update.sh: `python3
+  # resolve_target.py`, its shebang never the exec path — its file-level
+  # writability is managed_data_check's; its replaceability rides this
+  # chain). A swapped
+  # script is root code execution — the check, not the ownership, is the
+  # control.
+  # Invariant 9 (AGENTS.md): a writable checkout is a security incident, not
+  # a perms quirk.
+  local script="$1" d mode uid first
+  local panel_uid
+  panel_uid="$(id -u panel 2>/dev/null || true)" # absent user → owner checks skipped (Go: same)
+  d="$(dirname -- "$script")"
+  while :; do
+    if ! mode="$(stat -c '%a' -- "$d" 2>/dev/null)"; then
+      echo "managed-script: $d: cannot stat (missing, not a directory, or unreadable) — the checkout chain must be verifiable" >&2
+      return 1
+    fi
+    if [[ ! -d "$d" ]]; then
+      echo "managed-script: $d is not a directory" >&2
+      return 1
+    fi
+    if (( (8#$mode) & 8#022 )); then
+      echo "managed-script: $d is group/other-writable (mode $mode) — the checkout must live somewhere only you (and root) can write" >&2
+      return 1
+    fi
+    uid="$(stat -c '%u' -- "$d" 2>/dev/null || true)"
+    if [[ -n "$panel_uid" && "$uid" == "$panel_uid" ]]; then
+      echo "managed-script: $d is owned by the panel user" >&2
+      return 1
+    fi
+    [[ "$d" == "/" ]] && break
+    d="$(dirname -- "$d")"
+  done
+  if [[ -d "$script" ]]; then
+    echo "managed-script: $script is a directory" >&2
+    return 1
+  elif [[ ! -f "$script" ]]; then
+    echo "managed-script: $script is missing (or not a regular file)" >&2
+    return 1
+  fi
+  if ! mode="$(stat -c '%a' -- "$script" 2>/dev/null)"; then
+    echo "managed-script: $script: cannot stat" >&2
+    return 1
+  fi
+  if (( (8#$mode & 8#0111) == 0 )); then
+    echo "managed-script: $script is not executable (mode $mode) — re-pull the repo (the exec bit is committed)" >&2
+    return 1
+  fi
+  if (( (8#$mode) & 8#022 )); then
+    echo "managed-script: $script is group/other-writable (mode $mode)" >&2
+    return 1
+  fi
+  uid="$(stat -c '%u' -- "$script" 2>/dev/null || true)"
+  if [[ -n "$panel_uid" && "$uid" == "$panel_uid" ]]; then
+    echo "managed-script: $script is owned by the panel user" >&2
+    return 1
+  fi
+  IFS= read -r first < "$script" || true
+  first="${first%$'\r'}" # Go trims the line ending ("\r\n"); the mirror must
+                        # see the same line (a CRLF shebang fails the kernel
+                        # anyway — the check is parity, not rescue)
+  if [[ "${first:-}" != "#!/usr/bin/env bash" ]]; then
+    echo "managed-script: $script has no bash shebang (first line '${first:-}') — not a managed bash script" >&2
+    return 1
+  fi
+  return 0
+}
+
+managed_data_check() { # <file> — the FILE-LEVEL part of checkManagedScript's
+  # standard for a checkout file root-executes WITHOUT a kernel dispatch of
+  # its own (run under an interpreter: the 08-update.sh servitor tail's
+  # deploy/resolve_target.py runs via python3 as root — its shebang is
+  # never the exec path): the file itself not group/other-writable and
+  # not owned by the panel user. The exec-bit and shebang parts of the
+  # standard do not apply (the interpreter execs it, not the kernel); the
+  # DIRECTORY CHAIN is covered by the sibling scripts' managed_script_check
+  # (same checkout, same walk) — a writable directory anywhere in the chain
+  # lets a local user delete-and-replace the file. What this adds is the
+  # case the chain alone does not catch: IN-PLACE MODIFICATION of a file a
+  # local user can write (same inode, new contents) — root code execution
+  # on the next exec, exactly like a swapped script.
+  # Invariant 9 (AGENTS.md): a writable checkout is a security incident, not
+  # a perms quirk.
+  local file="$1" mode uid
+  local panel_uid
+  panel_uid="$(id -u panel 2>/dev/null || true)" # absent user → owner checks skipped (Go: same)
+  if [[ -d "$file" ]]; then
+    echo "managed-data: $file is a directory" >&2
+    return 1
+  elif [[ ! -f "$file" ]]; then
+    echo "managed-data: $file is missing (or not a regular file)" >&2
+    return 1
+  fi
+  if ! mode="$(stat -c '%a' -- "$file" 2>/dev/null)"; then
+    echo "managed-data: $file: cannot stat" >&2
+    return 1
+  fi
+  if (( (8#$mode) & 8#022 )); then
+    echo "managed-data: $file is group/other-writable (mode $mode) — the checkout must live somewhere only you (and root) can write" >&2
+    return 1
+  fi
+  uid="$(stat -c '%u' -- "$file" 2>/dev/null || true)"
+  if [[ -n "$panel_uid" && "$uid" == "$panel_uid" ]]; then
+    echo "managed-data: $file is owned by the panel user" >&2
+    return 1
+  fi
+  return 0
+}
+
 update_set_status() { # <status: in-progress|updated|failed|rolled-back|partially-rolled-back> — on the live state file
   # failed is TERMINAL and clean: the run aborted at a pre-snapshot gate
   # (preflight/doctor), the stack is exactly as it was, nothing to roll back.

@@ -26,6 +26,26 @@
 #                               doctor` before updating is the precondition —
 #                               a pre-existing doctor failure would auto-revert
 #                               every update.
+#   SERVITOR_UPDATE=1           run the servitor (agent VM) update as a
+#                               best-effort tail AFTER the host gates pass
+#                               (0 = skip). Non-gating: a servitor failure
+#                               never rolls back the host stack — the servitor
+#                               world rolls back on its own (shape AND image).
+#                               It inherits UPDATE_DOCTOR (0 skips its
+#                               precheck + verify doctors too).
+#                               INVARIANT 9: the scripts this tail
+#                               root-execs live in an admin-editable
+#                               checkout OUTSIDE panel-do — the bash ones
+#                               (deploy/update.sh + its siblings
+#                               sync/doctor.sh + deploy/guest/build.sh)
+#                               pass managed_script_check (the bash mirror
+#                               of checkManagedScript), and the executed
+#                               python (deploy/resolve_target.py — run
+#                               under python3 by update.sh, its shebang
+#                               never the exec path) the file-level
+#                               managed_data_check — right here, before the
+#                               exec. A failed check skips its update
+#                               loudly; it never rolls back the host.
 set -euo pipefail
 source "$(dirname "$(realpath "$0")")/common.sh"
 # panel-do's update-run/-force launch this script with --detach: re-exec in a
@@ -232,6 +252,101 @@ if [[ "${UPDATE_DOCTOR:-1}" != "0" ]]; then
     update_rollback_or_die "doctor (post-update)" "$(cat "$doc_tmp")"
   fi
   rm -f "$doc_tmp"
+fi
+
+# ── servitor (agent VM) update — a best-effort tail, NOT a gate ─────────────
+# The host stack is fully updated and green here, and the snapshot above is
+# its rollback anchor. The servitor world rolls back on its own (shape AND
+# image, its .env re-floated to what is deployed) — a servitor failure must
+# therefore neither roll back the host stack nor mark this run failed (a
+# "failed" host update would point the operator at make rollback for a host
+# that is fine; the VM's state is visible in the panel's servitor section).
+# It runs BEFORE update_set_status updated on purpose: the panel keeps showing
+# "in progress" for the whole tail (a rebuild is ~40 min — the VM is
+# only down for the swap itself), and the host update lock stays held, so a
+# second update cannot start into the middle of it. Detection mirrors the
+# doctor's tri-state: a route in the repo or deployed tree = installed.
+# The servitor update floats pi/extension to the newest release in the same
+# major and rebuilds + swaps the guest image when its userland outgrows the
+# freshness floor (its .env: IMAGE_MAX_AGE_DAYS) — RUNBOOK → Servitor (agent
+# VM). Its own failure message says what its rollback did.
+if [[ "${SERVITOR_UPDATE:-1}" == "1" ]]; then
+  servitor_defined=0
+  grep -rqs "servitor\.pietrasik\.top" "$REPO_ROOT/compose/traefik/dynamic/" 2>/dev/null && servitor_defined=1
+  grep -rqs "servitor\.pietrasik\.top" /opt/panel/traefik/dynamic/ 2>/dev/null && servitor_defined=1
+  if (( ! servitor_defined )); then
+    info "servitor: no route in the repo or deployed tree (not installed) — skipping its update"
+  else
+    # Re-warm BEFORE any sudo use in this tail — the domstate query below
+    # and the update exec: the health gate + doctor above can outlive the
+    # sudo timestamp, and a prompt mid-tail would hang a detached
+    # auto-update tick. (The managed checks between here and the exec are
+    # plain stat/read — no second re-warm needed.)
+    sudo -v
+    if [[ ! -x /opt/servitor-repo/deploy/update.sh ]]; then
+      warn "servitor: route defined but /opt/servitor-repo/deploy/update.sh is missing — skipping its update (first install: servitor INSTALL.md; the doctor's servitor section covers the gap)"
+    elif [[ "$(sudo virsh domstate servitor 2>/dev/null || true)" == "shut off" ]]; then
+      # Planned downtime is NOT an update trigger: the doctor's tri-state
+      # treats a shut-off VM as fine, and an automated tick must not WAKE a
+      # VM the operator stopped on purpose (update.sh's image swap ends in
+      # `virsh start` — with the precheck doctor skipped via
+      # UPDATE_DOCTOR=0 nothing else would stop it). The float lands on the
+      # next tick after the VM is back, or manually (sudo make update in
+      # /opt/servitor-repo). sudo (as the doctor's own virsh query): the
+      # admin need not be in the libvirt group — a bare virsh would
+      # silently return empty and this guard would never fire. A query
+      # that cannot be made at all (libvirtd down) returns empty and we
+      # proceed — update.sh then fails loudly on its own virsh/doctor
+      # steps (non-gating, as designed).
+      info "servitor: the VM is shut off (planned downtime) — leaving it asleep: its update would wake it via the image swap (start it when you want the float: sudo virsh start servitor — the next tick then applies the update)"
+    else
+      # INVARIANT 9 on this path: every script the tail root-execs — the
+      # bash ones directly (update.sh) or through it (guest/build.sh,
+      # sync.sh, doctor.sh) — passes managed_script_check (the bash mirror
+      # of panel-do's checkManagedScript) before any exec; the check's
+      # detail line(s) are already on the log. The tail is non-gating, so a
+      # failed check skips loudly — it never rolls back the host stack (the
+      # panel's servitor-* actions fail the same check at their own exec,
+      # so a writable checkout is visible from both sides). resolve_target.py
+      # is executed code too (update.sh runs it under python3 as root — its
+      # shebang is never the exec path): the chain check above covers its
+      # replaceability, managed_data_check its file-level writability (an
+      # in-place modification of a writable file, which the chain alone does
+      # not catch).
+      managed_ok=1
+      for s in update.sh sync.sh doctor.sh guest/build.sh; do
+        if ! managed_script_check "/opt/servitor-repo/deploy/$s"; then
+          managed_ok=0
+          break
+        fi
+      done
+      if (( managed_ok )) && ! managed_data_check /opt/servitor-repo/deploy/resolve_target.py; then
+        managed_ok=0
+      fi
+      if (( ! managed_ok )); then
+        warn "servitor: a managed script in /opt/servitor-repo/deploy (update/sync/doctor/guest-build.sh, or the executed resolve_target.py) failed the managed-script check — a writable path in the checkout chain is a replaceable root script (chmod go-w the offending path, never chown panel; RUNBOOK → Servitor, day-2 note) — skipping its update"
+      else
+        info "servitor: updating the agent VM (float pi/extension + userland freshness; non-gating — its failure never rolls back the host stack)"
+        # VAR=value on sudo's command line: honored when the matched rule is
+        # ALL/SETENV (root, and any standard admin rule — %wheel ALL=(ALL) ALL
+        # matches the command ALL). A restricted sudoers does not silently
+        # drop the variable: sudo REFUSES THE COMMAND ("sorry, you are not
+        # allowed to set the following environment variables") — the tail
+        # then fails loudly below and skips (non-gating, as designed), and
+        # the update stays reachable via `sudo make update` in the checkout
+        # (root, no sudo indirection). Wherever update.sh DOES run, its own
+        # default keeps UPDATE_DOCTOR=1: the doctor only ever skips on an
+        # explicit 0.
+        set +e
+        sudo UPDATE_DOCTOR="${UPDATE_DOCTOR:-1}" /opt/servitor-repo/deploy/update.sh
+        serv_rc=$?
+        set -e
+        if [[ "$serv_rc" -ne 0 ]]; then
+          warn "servitor update failed (rc=$serv_rc) — the host stack is updated and healthy; its output above says what its own rollback did (or: manual attention — panel servitor-status / servitor-doctor, RUNBOOK → Servitor)"
+        fi
+      fi
+    fi
+  fi
 fi
 
 update_set_status updated

@@ -227,7 +227,9 @@ full `.env` secret set never sits in its environ.
 
 `make update` is the one Day-2 command: it syncs every repo change to `/opt/panel` (compose, routes, Authelia, `.env`, panel
 frontend) **and** floats everything within its declared *line*. It requires a green `make doctor`, snapshots everything before
-touching anything, and auto-rolls-back on any failure — updates are routine and safe by construction:
+touching anything, and auto-rolls-back on any failure — updates are routine and safe by construction. After the gates pass it
+also updates the servitor agent VM (when installed) as a **best-effort tail**: a servitor failure never rolls back the host
+stack (the servitor world rolls back on its own) — `SERVITOR_UPDATE=0` skips it.
 
 ```bash
 make update      # preflight (repo compose must render with repo .env) + doctor precondition —
@@ -237,7 +239,10 @@ make update      # preflight (repo compose must render with repo .env) + doctor 
                  # → pull → rebuild (bases pulled)
                  # → recreate what changed (+ restart on start-time config change) → update panel-api
                  # → gate: post-update services healthy (pre-update set + added) + panel-api serving + full doctor pass
-                 # → on any failure: automatic rollback of all of it, re-gated
+                 # → servitor (agent VM) update — best-effort tail after the gates: floats pi/extension +
+                 #   rebuilds/swaps the guest image when its userland is stale (skips a shut-off VM — the
+                 #   tick never wakes it; never gates, never rolls back the host)
+                 # → on any failure of the GATES above: automatic rollback of all of it, re-gated
 make rollback              # on demand: undo the last `make update` (same machinery)
 make rollback WHAT=radiance  # or: images ONLY of the services WHAT matches — a name (llm-27b), a
                              # prefix (llm), or an image name (radiance); everything else stays
@@ -357,6 +362,11 @@ panel-do update-run  →  setup/08-update.sh --detach   (the exact same make upd
   patch+minor security releases; the full `latest` movement of radiance + searxng), panel-web's build bases, npm deps within
   `package.json`'s ranges, pip deps within `requirements.txt`'s ranges, plus any committed-but-unapplied change in the server
   clone (and a re-anchor after a targeted rollback).
+- **Servitor tail (when installed)**: the tick's `make update` includes the best-effort servitor update AFTER the host gates —
+  it can add ~40 min (an image rebuild when the userland outgrows the freshness floor) and the VM is down for the swap itself;
+  a shut-off VM is left asleep (planned downtime — the tail never starts it; the float lands on the next tick after it is
+  back, or via a manual `sudo make update` in the checkout); a servitor failure never fails the host tick
+  (`SERVITOR_UPDATE=0` skips it).
 - **What it does NOT do**: no `git pull` — the clone only moves when *you* edit it (when you're at the computer you can run a
   manual update anyway). No majors — those are deliberate edits, and the panel flags a major in red when one lands (e.g.
   `authelia 4 → 5`, `node base 22 → 24`). No host OS packages. `panel-do` / `panel-ddns` still update only via a repo edit +
@@ -1020,16 +1030,23 @@ make update                          # gated: sync + recreate + doctor gate
 | planned reboot | panel → `servitor-vm-restart` (ACPI reboot; the app's boot reconciliation handles the unclean path — restart, never destroy) |
 | edit prompts/skills/lib | edit `agent-config/` / `lib/` in `/opt/servitor-repo`, panel → `servitor-sync` (never blocks a run — an active run gets the update-waiting flag and exit 0; the app's tick applies at the next idle moment) |
 | deploy gate | panel → `servitor-doctor` (guest certification + firewall probes + one live prompt + one live search) |
-| version bump (pi / extension) | `deploy/update.sh` in the host checkout (SSH — long, network-bound, its own conformance gates + auto-rollback; deliberately NOT a panel action). First run on a fresh server: the gate is host-side, so the checkout needs `sudo make venv` + the `slot1` user (servitor INSTALL.md §10) |
+| update pi / extension / guest userland | it runs itself as the best-effort tail of portcullis's own `make update` (host gates pass first; its failure never rolls back the host stack — `SERVITOR_UPDATE=0` skips it), or `sudo make update` in the host checkout (SSH — long, network-bound; floats each selection to the newest release in the same major, reports out-of-major releases instead of applying them, rebuilds + swaps the image when the userland outgrows the 7-day freshness floor so the guest kernel updates with it, its own conformance gates + auto-rollback; deliberately NOT a panel action). First run on a fresh server: the gate is host-side, so the checkout needs `sudo make venv` + the `slot1` user (servitor INSTALL.md §10) |
 | rotate keys | host `.env` → servitor `deploy/sync.sh` (re-injects the key slice into the guest's 0600 env file) + restart; the portcullis stack's copy of the key floats with its own `make update` as usual |
 
 The four actions exec `virsh` and the checkout's `deploy/sync.sh` /
-`deploy/doctor.sh` as root — so those scripts (their directory, and every
-ancestor up to `/`) must not be group/other-writable and must not be owned
-by `panel` (`checkManagedScript`, the same anti-swap standard as the
-auto-update clone). If the checkout is ever relocated, move it under a
-non-writable tree — a group/other-writable directory anywhere in the chain
-is a replaceable root script.
+`deploy/doctor.sh` as root, and portcullis's `make update` servitor tail
+(`setup/08-update.sh`) root-execs `deploy/update.sh` (which in turn
+root-execs `deploy/guest/build.sh` / `sync.sh` / `doctor.sh`, and runs the
+executed python `deploy/resolve_target.py` under `python3`) — so those scripts
+(their directory, and every ancestor up to `/`) must not be
+group/other-writable and must not be owned by `panel` (`checkManagedScript`
+for the actions, the bash mirror `managed_script_check` for the tail, which
+runs outside panel-do — plus the file-level `managed_data_check` for
+`resolve_target.py` — run under python3 by update.sh, its shebang never
+the exec path; the same anti-swap standard as the auto-update clone).
+If the checkout is ever relocated, move it under a non-writable tree — a
+group/other-writable directory anywhere in the chain is a replaceable root
+script.
 
 ## Add a privileged action
 
@@ -1089,7 +1106,7 @@ either is missing; on CachyOS both are distro defaults, so this is usually a no-
 | `servitor.pietrasik.top` → 502 | the route's upstream is a raw VM IP: VM down (panel `servitor-status` → `sudo virsh start servitor`), app down (`sudo virsh console servitor`, `systemctl status servitor` inside), or the route's IP drifted from `SERVITOR_VM_IP` (fix the route, `make update`) — doctor's servitor section covers all three |
 | panel's `servitor-*` actions missing or 500 | stale panel-do binary → `make panel-do` (doctor fails it explicitly: `registry missing servitor-status`) |
 | `servitor-sync` times out in the panel | the action's budget (10 min) IS a stop: at the deadline panel-do kills the script (runCmd's ctx deadline — only in-flight scp/ssh grandchildren may linger); the script is idempotent and resumable, so re-run `servitor-sync`, or check how far it got in `sudo journalctl -u panel-api -n 50`; a run active on the VM makes sync exit 0 fast (update-waiting) instead |
-| `servitor-sync`/`-doctor` → "group/other-writable" or "owned by the panel user" | the `/opt/servitor-repo` checkout (or a directory above it) lost its modes/owner — `chmod go-w` it (or the offending ancestor); never `chown panel` the checkout (RUNBOOK → Servitor, day-2 note) |
+| `servitor-sync`/`-doctor` → "group/other-writable" or "owned by the panel user" (or the update log's servitor tail skipping on the same check) | the `/opt/servitor-repo` checkout (or a directory above it) lost its modes/owner — `chmod go-w` it (or the offending ancestor); never `chown panel` the checkout (RUNBOOK → Servitor, day-2 note) |
 | all hosts 404 + traefik container healthy | a dynamic route file failed to parse — an unknown/invalid key makes the file provider send NO config at all. On a hot reload (the common case — the update landing the file on a running traefik) the LAST GOOD config persists (the feature simply doesn't land; everything else routes) and traefik logs "Error occurred during watcher callback"; on a traefik RESTART with the bad file on disk EVERY file-provider route (panel, llm, portfolio, authelia) 404s with traefik itself healthy — full edge outage. `sudo docker compose --project-directory /opt/panel logs traefik 2>&1 | grep -iE "watcher callback|building configuration"` ("building configuration" only appears on a first load / restart) — fix or remove the offending file at the repo (the single source of truth) and `make update`, or `sudo rm` it from `/opt/panel/traefik/dynamic/` to let the watcher reload |
 | update gate: `llm-* (exited)`, and the update started the WHOLE fleet | a stopped fleet container was pruned (raw `docker container prune` / `docker system prune`), so the update read the missing container as a new service and started every instance at once — invalid when they share cards. The auto-rollback leaves the fleet containers in place, so a re-run of `make update` classifies them as deliberately stopped again (deploys the new configs, pulls the images, starts nothing fleet). With the current guard, a pruned (or brand-new) `restart: "no"` service is never auto-started — the update names it and leaves it down. Bring it back from the panel: Services view → *defined, no container* → *create + start*. Don't raw-prune containers on this box — use the panel's `prune-docker` action (images + build cache only) |
 | domain resolves to an old IP | panel-ddns failing → `journalctl -u panel-ddns`; then `sudo systemctl start panel-ddns` (missing/stale records are fixed in place) |
