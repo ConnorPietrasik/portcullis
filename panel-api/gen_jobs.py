@@ -645,12 +645,16 @@ def claim_job(
     started: bool = False,
 ) -> Optional[dict[str, Any]]:
     """queued → ``state`` on ``slot`` — the claim (one critical section).
-    Call OUTSIDE gen_lock()."""
+    A QUEUED job's error is a wait reason by construction (the tick's mark,
+    a re-queue, the startup reap) — the claim clears it, so the lane wait
+    shows until the job is admitted, never into the start. Call OUTSIDE
+    gen_lock()."""
     def _m(job: dict[str, Any]) -> None:
         if job.get("state") != QUEUED:
             raise RuntimeError(f"{jid} is {job.get('state')}, not queued")
         job["slot"] = slot
         job["state"] = state
+        job["error"] = None  # stale the moment the job is admitted
         if started:
             job["started_at"] = job.get("started_at") or time.time()
 
@@ -665,7 +669,10 @@ def claim_enhance(jid: str) -> Optional[dict[str, Any]]:
     (gated by enhance_admission's global cap, not a lane). The job's FIFO
     position is untouched (it rides the order list): on success it goes back
     to QUEUED with enhanced_prompt set, and the gen phase claims it in its
-    own position. One critical section, like claim_job. Call OUTSIDE
+    own position. Like claim_job the claim clears the error — a QUEUED job's
+    is a wait reason by construction (e.g. a structural enhance mark, whose
+    target is fine again by the time the phase is admitted). One critical
+    section, like claim_job. Call OUTSIDE
     gen_lock()."""
 
     def _m(job: dict[str, Any]) -> None:
@@ -673,6 +680,7 @@ def claim_enhance(jid: str) -> Optional[dict[str, Any]]:
             raise RuntimeError(f"{jid} is {job.get('state')}, not queued")
         job["state"] = ENHANCING
         job["slot"] = None  # off-slot — the gen phase re-picks its slot later
+        job["error"] = None  # the wait reason is stale the moment the phase is admitted
 
     try:
         return update_job(jid, _m)
@@ -703,22 +711,40 @@ def job_candidates(
     return [(name, why) for name, why, _load in out]
 
 
-def queue_wait_reason(job: dict[str, Any], slots: dict[str, dict[str, Any]]) -> Optional[str]:
+def queue_wait_reason(
+    job: dict[str, Any],
+    slots: dict[str, dict[str, Any]],
+    status: Optional[dict[str, dict[str, Any]]] = None,
+) -> Optional[str]:
     """Why a QUEUED, gen-phase-bound job can never be claimed under the
-    CURRENT configs — the structural reasons only (the transient ones —
-    gen-phase cap, a blocked lane, a stop that didn't land — are the normal
-    queue and need no say-so). The engine marks the result on the record's
-    error column, so a config drift since the job was queued (its model is
-    no longer hosted) shows up in the UI instead of a job that quietly waits
-    forever. The enhance target's structural reasons are marked UP FRONT by
-    the tick's enhance branch (a pending-enhance job never reaches the slot
-    loop). None when the wait is a usual lane condition (the caller then
-    leaves the record's error alone — a re-queue's reason may be riding
-    it)."""
+    CURRENT configs, when the wait would otherwise run in silence: a config
+    drift since the job was queued (its model is no longer hosted), or a
+    lane EVERY hosting slot is blocked on. The normal queue (the gen-phase
+    cap, a free or yieldable lane, a stop that didn't land) says nothing
+    and gets None. The engine marks the result on the record's error column
+    so the job row says why instead of a job quietly waiting forever; a
+    transient block (a busy holder that drains on its own) is marked too —
+    the mark rides until the claim, which clears it (claim_job: a QUEUED
+    job's error is a wait reason by construction). The enhance target's
+    structural reasons are marked UP FRONT by the tick's enhance branch (a
+    pending-enhance job never reaches the slot loop). None otherwise (the
+    caller then leaves the record's error alone — a re-queue's reason may
+    be riding it)."""
     model = job.get("model") or ""
     hosting = [s for s in slots.values() if model in s["models"]]
     if not hosting:
         return f"no gen slot hosts {model!r} (a config changed since the job was queued)"
+    # Every hosting slot blocked (a lane the engine can't free: held by an
+    # LLM instance, the pool can't cover it even after the idle yield —
+    # structural, only an admin clears it — or a busy gen holder — transient,
+    # it drains on its own), so the job row says why instead of waiting in
+    # silence. The mark rides until the claim, which clears it (claim_job).
+    if status is not None:
+        sts = [status.get(s["name"]) for s in sorted(hosting, key=lambda s: s["name"])]
+        if sts and all(st is not None and st.get("state") == "blocked" for st in sts):
+            for st in sts:
+                for b in st.get("blockers") or []:
+                    return f"waiting for the lane: {b}"
     return None
 
 
@@ -726,50 +752,158 @@ def slot_status(
     slots: dict[str, dict[str, Any]],
     jobs: dict[str, Any],
     holds: dict[int, str],
+    cards_total: int = 0,
+    reserved: Optional[dict[int, dict[str, Any]]] = None,
 ) -> dict[str, dict[str, Any]]:
     """Per slot: the UI state + the IDLE gen slots that would have to stop
     to free its lane + the blockers otherwise. Pure — ``holds`` is
-    gpu_pool.live_holds(live) (card index → holding service).
+    gpu_pool.live_holds(live) (card index → holding service), ``reserved``
+    the ledger's fence (card → {for, note, bdf}), ``cards_total`` the pool
+    size (0 in dev, where the engine is off).
 
-    states: running | down | down-idle-stops | blocked.
-    Only a gen slot (a fleet instance with gen models) is ever stoppable by
-    the engine; an LLM instance or a busy gen slot is a blocker, full stop.
+    The LANE is the card set a start would actually take — gpu_pool.plan_start's
+    two branches:
+    * the SAVED set, when the plan's saved-set branch would take it (shape-
+      valid for the slot's card need and not fenced by a reservation for
+      another service): the yield reasons over ITS cards;
+    * else the FREE-GRAB — the set plan_start's fallback takes: the slot's
+      OWN reserved cards first, then the lowest unheld, then (only if still
+      short) the LOWEST cards the IDLE gen slots hold, until the need is met
+      (stopping them frees them; a card reserved for ANOTHER service is
+      fenced — the grab skips it). free_cards' own-first ordering is
+      mirrored EXACTLY, not approximated: an idle neighbour on a card the
+      grab would skip must not be stopped for nothing. A slot with NO usable
+      saved set (a fresh deploy never assigned it, a reservation fence, a
+      shape drift) rides this branch — the idle neighbours holding the cards
+      the grab would take are the yield set (the lazy-stop rule still
+      applies: a queued job that needs the lane stops them itself), and a
+      lane the pool can't cover even after the yield is BLOCKED — the
+      blocker names what holds the gap (a busy gen slot that drains on its
+      own, an LLM occupant to stop, a fenced card to unreserve) — instead
+      of the engine claiming the job and flapping a start it can't win.
+
+    states: running | down | down-idle-stops | blocked. ``stops`` is
+    non-empty ONLY in down-idle-stops — a blocked lane is not stopped into
+    by any consumer (the tick, the engine's _gen_free_slot, the admin-start
+    path and the UI all gate on that state), and its blocker text names the
+    would-be stops anyway. Only a gen slot (a fleet instance with gen
+    models) is ever stoppable by the engine; an LLM instance or a busy gen
+    slot is a blocker, full stop.
     """
+    reserved = reserved or {}
     out: dict[str, dict[str, Any]] = {}
     for name, slot in slots.items():
         busy = bool(flights_on_slot(jobs, name))
         if slot["running"]:
             out[name] = {"state": "running", "stops": [], "blockers": [], "busy": busy}
             continue
-        cards = set(slot["assigned"] or [])
-        if not cards:
-            out[name] = {
-                "state": "down",
-                "stops": [],
-                "blockers": ["unassigned — assign its lane cards in the GPU view (a start auto-grabs the lowest free)"],
-                "busy": False,
-            }
-            continue
+        n = int(slot.get("cards") or 1)
+        saved = slot["assigned"]
+        # The plan's saved-set branch would take it (gpu_pool._saved_set_usable
+        # + in-range): the lane is the saved cards. Anything else (no saved
+        # set, a shape drift, a reservation fence) lands in the free-grab lane.
+        saved_lanes = (
+            isinstance(saved, list)
+            and len(saved) == n
+            and len(set(saved)) == n
+            and all(isinstance(c, int) and not isinstance(c, bool) and 0 <= c < cards_total for c in saved)
+            and all(reserved.get(c, {}).get("for") in (None, name) for c in saved)
+        )
         stops: list[str] = []
         blockers: list[str] = []
-        for c in sorted(cards):
-            holder = holds.get(c)
-            if holder is None:
-                continue
-            if holder in slots:
-                if flights_on_slot(jobs, holder):
-                    blockers.append(f"card {c} held by {holder} (busy — its jobs finish first)")
-                elif holder not in stops:
-                    stops.append(holder)
+        if saved_lanes:
+            for c in sorted(set(saved)):
+                holder = holds.get(c)
+                if holder is None:
+                    continue
+                if holder in slots:
+                    if flights_on_slot(jobs, holder):
+                        blockers.append(f"card {c} held by {holder} (busy — its jobs finish first)")
+                    elif holder not in stops:
+                        stops.append(holder)
+                else:
+                    blockers.append(f"card {c} held by {holder} (not a gen slot — stop it in the GPU view)")
+            st = "down-idle-stops" if stops else "down"
+        else:
+            # Free-grab lane: free_cards' own-first ordering (the slot's
+            # reserved cards first, then the lowest unheld), topped up with
+            # the LOWEST idle-gen-held cards until the need is met. A card
+            # reserved for ANOTHER service is fenced (the grab skips it —
+            # it is not free), and the top-up skips it for the same reason:
+            # a card an idle slot holds that is reserved for that slot ITSELF
+            # frees nothing the grab can take, so stopping the slot would be
+            # for nothing. The slot's OWN reserved cards are free here iff
+            # unheld, and sort first, exactly like the grab.
+            own = [c for c in range(cards_total) if c not in holds and reserved.get(c, {}).get("for") == name]
+            rest = [c for c in range(cards_total) if c not in holds and reserved.get(c, {}).get("for") is None]
+            idle = {
+                c: svc
+                for c, svc in holds.items()
+                if svc in slots and reserved.get(c, {}).get("for") in (None, name) and not flights_on_slot(jobs, svc)
+            }
+            lane = (sorted(own) + sorted(rest))[:n]
+            for c in sorted(idle):  # lowest idle first: the grab takes the lowest it needs
+                if len(lane) >= n:
+                    break
+                lane.append(c)
+            stops = sorted({idle[c] for c in lane if c in idle})
+            if len(lane) < n:
+                st = "blocked"
+                who = ", ".join(stops) or "none"
+                # Name what holds the gap — the advice differs by kind: a
+                # busy gen slot drains on its own (the wait clears without
+                # an admin); an LLM occupant needs one stopped in the GPU
+                # view; a card reserved for ANOTHER service is fenced
+                # (unreserve it). (A gen slot in the gap is either fenced
+                # (named as such) or necessarily busy: every UNFENCED idle
+                # one is in the lane — the shortfall means the idle cards
+                # ran out.)
+                lane_set = set(lane)
+                gap_busy: dict[str, list[int]] = {}
+                gap_llm: dict[str, list[int]] = {}
+                gap_fenced: list[tuple[int, str]] = []
+                for c in range(cards_total):
+                    if c in lane_set:
+                        continue
+                    owner = reserved.get(c, {}).get("for")
+                    holder = holds.get(c)
+                    if owner is not None and owner != name:
+                        gap_fenced.append((c, owner))
+                    elif holder is not None:
+                        (gap_busy if holder in slots else gap_llm).setdefault(holder, []).append(c)
+                detail: list[str] = []
+                for svc in sorted(gap_busy):
+                    detail.append(
+                        f"card(s) {', '.join(map(str, sorted(gap_busy[svc])))} held by {svc} "
+                        "(busy — it drains on its own)"
+                    )
+                for svc in sorted(gap_llm):
+                    detail.append(
+                        f"card(s) {', '.join(map(str, sorted(gap_llm[svc])))} held by {svc} "
+                        "(stop it in the GPU view)"
+                    )
+                for c, owner in sorted(gap_fenced):
+                    detail.append(f"card {c} reserved for {owner} (fenced — unreserve it in the GPU view)")
+                if not detail:
+                    detail.append("the pool has no more cards")
+                blockers.append(
+                    f"lane short: {name} needs {n} card(s), only {len(lane)} free even after "
+                    f"stopping the idle gen slots ({who}) — {'; '.join(detail)} — "
+                    + (
+                        f"its saved set {sorted(saved)} is unusable (fenced or drifted): reassign it (auto)"
+                        if saved
+                        else "unassigned: assign its lane cards in the GPU view"
+                    )
+                )
             else:
-                blockers.append(f"card {c} held by {holder} (not a gen slot — stop it in the GPU view)")
+                st = "down-idle-stops" if stops else "down"
         if blockers:
             st = "blocked"
-        elif stops:
-            st = "down-idle-stops"
-        else:
-            st = "down"
-        out[name] = {"state": st, "stops": sorted(stops), "blockers": blockers, "busy": False}
+            # A blocked lane is never stopped into (see the states contract
+            # above) — the local `stops` already rode into the lane-short
+            # blocker's "who" text; the reported field stays strict.
+            stops = []
+        out[name] = {"state": st, "stops": sorted(stops), "blockers": blockers, "busy": busy}
     return out
 
 

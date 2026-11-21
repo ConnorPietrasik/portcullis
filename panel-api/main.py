@@ -1880,20 +1880,41 @@ def _gen_idle_conflict_stops(
     service: str,
 ) -> list[str]:
     """The IDLE gen slots whose cards would block this start — the Gen
-    section's lazy-stop rule applied to an admin's explicit start: a drained
-    gen slot yields, a busy gen slot or any LLM instance never does (the
-    start fails as before — the shortage named, the holders in the GPUs view)."""
+    section's lazy-stop rule applied to an admin's explicit start, on the
+    SAME lane the engine's tick yields (the two paths must agree: the Gen
+    tab shows the badge this list names, and a queued job's start takes the
+    same set). A drained gen slot yields; a busy gen slot or any LLM
+    instance never does (the start fails as before — the shortage named,
+    the holders in the GPUs view). The stops come back only when they would
+    actually cover the lane (slot_status state down-idle-stops): a lane the
+    yield can't cover (a busy holder, a fenced card, a pool short even after
+    the yield) is NOT stopped into — the stop would free cards the grab
+    still can't take, and the engine's tick makes the same call.
+
+    The lane: for a gen slot, slot_status's — the saved set when usable,
+    else the FREE-GRAB lane (a start without a usable saved set grabs the
+    lowest free set, topped up by the idle yield — so a start of an
+    UNASSIGNED slot yields its idle neighbours too, instead of failing on a
+    pool the yield would cover). For any other instance (an LLM),
+    start_preference's set instead: the saved set when it is shape-valid,
+    EVEN while held (stopping those holders is exactly what makes
+    plan_start take the saved set back — the coupling to plan_start's
+    selection rule is documented in start_preference), else the free set,
+    whose cards are free by construction and hold nothing stoppable."""
     if gpu_pool.is_running(live, service):
         return []
-    try:
-        # The stop target is plan_start's PREFERENCE, not its fallback — the
-        # saved set when it is shape-valid, even while held; the coupling to
-        # plan_start's selection rule is documented in start_preference.
-        target = gpu_pool.start_preference(ledger, defs, live, cards_total, service)
-    except ValueError:
-        return []  # not a fleet instance — nothing to stop (plan_start said so)
+    if gpu_pool.cards_needed(defs, service) is None:
+        return []  # not a fleet instance — nothing to stop (plan_start would say so)
     holds = gpu_pool.live_holds(live)
     slots = gen_jobs.build_slots(gen_jobs.build_instances(defs, live, ledger, {}))
+    if service in slots:
+        st = gen_jobs.slot_status(
+            slots, gen_jobs.load_jobs()["jobs"], holds, cards_total, ledger["reserved"]
+        ).get(service)
+        if st is None or st["state"] != "down-idle-stops":
+            return []
+        return list(st["stops"])
+    target = gpu_pool.start_preference(ledger, defs, live, cards_total, service)
     jobs = gen_jobs.load_jobs()["jobs"]
     out: list[str] = []
     for c in target:
@@ -1960,9 +1981,13 @@ def gpus_start(body: GpuServiceBody, _admin: Optional[str] = Depends(require_adm
     free set — never a raw `docker start`, which would reuse the create-time
     env and could resurrect cards another instance now owns. A conflict with
     an IDLE gen slot yields to the start (that slot is stopped — it is idle,
-    no job is in flight on it, nothing is lost); a busy gen slot or an LLM
-    instance holds as before and the start fails with the shortage named (the
-    GPUs view names the holders)."""
+    no job is in flight on it, nothing is lost): the yield lane is the
+    engine's (slot_status's — the slot's saved set, or the FREE-GRAB lane
+    when it has no usable one, so a start of an unassigned slot yields its
+    idle neighbours the same way a queued job's start does); a lane the
+    yield can't cover (a busy holder, an LLM occupant, a fenced card, a
+    short pool) is not stopped into — the start fails with the shortage
+    named (the GPUs view names the holders)."""
     _check_gpu_name(body.service)
     user = _admin
     stopped: list[str] = []
@@ -1971,12 +1996,19 @@ def gpus_start(body: GpuServiceBody, _admin: Optional[str] = Depends(require_adm
             _ledger, gpus = _gpus_plan_start_checked(body.service)
             break
         except ValueError as e:
-            # Conflict path: are the conflicting cards held ONLY by idle gen
-            # slots? Then the Gen section's lazy-stop rule applies to this
-            # explicit start — stop them and re-plan once. A SECOND conflict
-            # (e.g. a set held by an idle gen slot AND an LLM instance) is
-            # not stopped into: fail as before (the shortage is named; the
-            # GPUs view names the holders).
+            # Conflict path: does the yield cover the lane (slot_status
+            # down-idle-stops — every blocking card held by an IDLE gen
+            # slot)? Then the Gen section's lazy-stop rule applies to this
+            # explicit start — stop them and re-plan once (the freed cards
+            # cover the grab, so the re-plan is the lane, not a lucky set).
+            # A lane the yield can't cover (a busy holder, an LLM occupant,
+            # a fenced card, a short pool) is not stopped into: fail as
+            # before (the shortage is named; the GPUs view names the
+            # holders). Each stop is FRESH-RECHECKED per holder (a docker
+            # stop takes seconds, and a claim can land on a still-idle
+            # holder in the window — _gen_free_slot makes the same call);
+            # a holder that went busy is left up, and the re-plan is the
+            # arbiter (it fails as before when the lane no longer covers).
             with gpu_pool.gpu_lock():
                 ledger = gpu_pool.load_ledger()
                 defs = _fleet_defs()
@@ -1985,8 +2017,16 @@ def gpus_start(body: GpuServiceBody, _admin: Optional[str] = Depends(require_adm
             if not stops or attempt == 1:
                 raise HTTPException(400, str(e)) from e
             for st in stops:
+                # Per-holder FRESH check, like the engine's _gen_free_slot:
+                # a claim can land on a still-idle holder between the
+                # snapshot above and this stop (docker stops take seconds)
+                # — a busy holder is not stopped; the re-plan is the
+                # arbiter.
+                if gen_jobs.flights_on_slot(gen_jobs.load_jobs()["jobs"], st):
+                    continue
                 _panel_do_checked("gpu-stop", [st], user)  # audited as the admin's start
-            stopped += [s for s in stops if s not in stopped]
+                if st not in stopped:
+                    stopped.append(st)
     _panel_do_checked("gpu-apply", [body.service], user)
     _audit(user, "gpu-start", [body.service, ",".join(map(str, gpus))] + [f"stopped-idle-gen:{s}" for s in stopped], 0)
     return _gpu_pool_now()
@@ -2197,6 +2237,11 @@ def _gen_world() -> dict[str, Any]:
     slots = gen_jobs.build_slots(instances)
     store = gen_jobs.load_jobs()
     holds = gpu_pool.live_holds(live)
+    # The lane math needs the pool (0 in dev — no /sys, and the engine is
+    # off there) + the reservation fence (a card reserved for another
+    # service is not free for a grab — slot_status's free-grab lane mirrors
+    # gpu_pool.free_cards, fence AND own-first ordering).
+    cards_total = 0 if DEV_MODE else len(amd_gpus())
     return {
         "defs": defs,
         "live": live,
@@ -2207,7 +2252,7 @@ def _gen_world() -> dict[str, Any]:
         "store": store,
         "jobs": store["jobs"],
         "holds": holds,
-        "status": gen_jobs.slot_status(slots, store["jobs"], holds),
+        "status": gen_jobs.slot_status(slots, store["jobs"], holds, cards_total, ledger["reserved"]),
         "enhance_target": _gen_enhance_target(gen_jobs.load_settings(), instances),
     }
 
@@ -2400,14 +2445,18 @@ async def _gen_wait_instance_health(name: str, jid: str, budget_s: float) -> str
 
 async def _gen_free_slot(sname: str) -> bool:
     """Stop the IDLE gen slots holding ``sname``'s lane cards (the lazy-stop
-    rule in action — the holder is idle, nothing in flight is lost) and
-    re-verify the slot is then startable. The stop is the engine's one
+    rule in action — the holder is idle, nothing in flight is lost). The
+    lane is slot_status's: the slot's saved set, or the FREE-GRAB lane when
+    the slot has no usable one (an unassigned slot still yields its idle
+    neighbours — the queued job needs the cards the grab would take). Re-
+    verify the slot is then startable. The stop is the engine's one
     preemption, and it only ever touches gen slots with no in-flight job —
     re-checked against a FRESH read at stop time, because the caller's tick
     world is a snapshot taken before this tick's own claims: an earlier claim
     in the same tick may have just landed a job on a holder that looked idle,
     and stopping it would kill that job (the admin-start path does the same
-    fresh check).
+    per-holder fresh check in gpus_start, for the same reason — its docker
+    stops take seconds, a window a claim can land in).
     """
     w = await asyncio.to_thread(_gen_world)
     st = w["status"].get(sname)
@@ -2782,7 +2831,7 @@ async def _gen_run_job(jid: str, slot: str) -> None:
         if not base_ip:
             return
         base = f"http://{base_ip}:8000"
-        await _gen_mark(jid, error=None)  # a re-queue's wait reason is stale now
+        await _gen_mark(jid, error=None)  # backstop — the claim already cleared the wait reason
         # 2. the prompt — the enhanced one, if the enhance phase ran it
         #    (off-slot, on the settings' enhance target, BEFORE this phase:
         #    a different card, so neither phase waited on the other).
@@ -2932,15 +2981,20 @@ async def _gen_tick() -> None:
             break
         else:
             # no candidate admitted it this tick. The transient reasons (the
-            # gen-phase cap, a blocked lane, a stop that didn't land) are the
-            # normal queue — no say-so. The structural one (a config drift
-            # since the job was queued: its model is no longer hosted) would
-            # otherwise wait forever in silence: mark it on the record's
-            # error column (queued-only — a cancel that landed in the window
-            # wins; a later claim clears the error on progress). The enhance
+            # gen-phase cap, a stop that didn't land) are the normal queue —
+            # no say-so. The waits that would otherwise run in silence get
+            # marked on the record's error column (queued-only — a cancel
+            # that landed in the window wins; a later claim clears the
+            # error — claim_job): a config drift since the job was queued
+            # (its model is no longer hosted), or a lane EVERY hosting slot
+            # is blocked on — an LLM occupant, or a pool that can't cover
+            # the slot even after the idle yield (structural — an admin
+            # clears it), or a busy holder that drains on its own
+            # (transient — the mark rides until the claim, see
+            # queue_wait_reason). The enhance
             # target's structural reasons are marked up front in the enhance
             # branch above — a pending-enhance job never gets here.
-            reason = gen_jobs.queue_wait_reason(job, slots)
+            reason = gen_jobs.queue_wait_reason(job, slots, status)
             if reason:
                 def _m(j, _r=reason):
                     if j.get("state") == gen_jobs.QUEUED:

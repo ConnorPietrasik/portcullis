@@ -666,9 +666,16 @@ mkdir -p /models/llm /models/image /models/video
                                #    mount moved to the class subpath: one model reload each)
 # 4. GPUs view → reserve tile 4 for gpu-writer (note "PCIe5 x8" — the auto-grab
 #    then never hands it to another instance, and the writer's own grab lands on it
-#    first: no "lowest free card" pitfall), then assign the lane (5 → gpu-gentp1a,
-#    6 → gpu-gentp1b), then Gen tab → slots → start both (the writer comes up on
-#    demand — or start it to warm it).
+#    first: no "lowest free card" pitfall), then assign the lane while the slots are
+#    still down (5 → gpu-gentp1a, 6 → gpu-gentp1b, 5,6 → gpu-gentp2 — an explicit
+#    assign refuses a card a running instance holds; the tp2 set overlaps the tp1
+#    ones on purpose — that overlap IS the lane), then Gen tab → slots → start both
+#    tp1 slots (the writer comes up on demand — or start it to warm it).
+#    The tp2 assignment is what makes the tp2 slot's status read `down · yields 2`
+#    while the tp1 slots hold the lane (smoke below); without it the engine still
+#    yields the lane for the video job (its start auto-grabs the lowest free set,
+#    and the idle yield covers that grab) — but it would record whatever it takes
+#    (e.g. [2,5] if a card is down), off the x16 lane.
 #    Also re-assign gpu-27b-2 (auto): its saved set still names the OLD lane tiles
 #    (4,5 pre-7th-card) — after the renumbering that includes tile 4, now reserved
 #    for the writer. The fence makes its next start fall back to a free set anyway,
@@ -707,11 +714,16 @@ mkdir -p /models/llm /models/image /models/video
   headroom, without a slot being claimed or started (a different card: the gen phase never waits
   for the enhancement, and the enhancement never waits for the lane). A job that
   needs a down slot starts it (its assigned cards, or the lowest free set, exactly like the GPUs
-  view's *start*); a start that hits a conflict (a card gets held between the claim and the attempt
-  — e.g. a job queued in the same tick as its neighbour's) re-queues the job with the reason in its
-  error column and the next tick retries: the slot then reads blocked (wait for the holder),
-  down-idle-stops (the holder gets stopped), or free (it starts). A permanent conflict (the lane is
-  short, docker down) re-queues with the same reason until it clears. A config drift after a job is
+  view's *start* — and the same idle-yield covers that free set: a slot with NO usable assigned
+  set stops the idle gen slots holding the cards the grab would take, instead of flapping a start
+  the pool can't cover); a start that hits a conflict (a card gets held between the claim and the
+  attempt — e.g. a job queued in the same tick as its neighbour's) re-queues the job with the
+  reason in its error column and the next tick retries: the slot then reads blocked (wait for
+  the holder — or lane short: the pool can't cover the slot even after stopping every idle gen
+  slot, and the job's error column carries that reason — it names what holds the gap (a busy
+  gen slot that drains on its own, an LLM occupant to stop, a fenced card to unreserve) — until
+  it clears), down-idle-stops (the holder gets stopped), or free (it starts). A permanent
+  conflict (the lane is short, docker down) re-queues with the same reason until it clears. A config drift after a job is
   queued (the model vanished, or its enhance target became misconfigured while the job wants
   enhance) says so in the error column instead of the job waiting in silence. A stop
   only lands on a drained slot from the Gen tab (its stop button stays disabled while a job is in

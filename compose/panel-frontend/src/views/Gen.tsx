@@ -308,7 +308,7 @@ function SlotsCard({ o, busy, act }: { o: GenOverview; busy: boolean; act: (k: s
                 ) : (
                   <button
                     disabled={busy}
-                    title={s.status.blockers.length ? s.status.blockers.join(' · ') : 'start (on its assigned cards when free)'}
+                    title={s.status.blockers.length ? s.status.blockers.join(' · ') : 'start (on its assigned cards when free, else the lowest free set)'}
                     onClick={() => act(`gen-start:${s.name}`, () => api('/gpus/start', { method: 'POST', body: JSON.stringify({ service: s.name }) }))}
                   >
                     start
@@ -327,10 +327,11 @@ function SlotsCard({ o, busy, act }: { o: GenOverview; busy: boolean; act: (k: s
         </tbody>
       </table>
       <p className="muted">
-        A slot keeps running after its in-flight jobs finish (lazy stop) — it yields its cards only
-        when a queued job needs them, to an explicit start/stop here (or the GPU view), or on reboot.
-        Its gen model is the only entry and stays resident — prompt enhancement runs off-slot, on the
-        enhance target above.
+        A slot keeps running after its in-flight jobs finish (lazy stop — the gen model stays
+        resident, so the next job pays no disk load). It yields its cards only when (a) a queued
+        job needs them — a drained slot stops automatically to free the lane, (b) you stop it
+        here or in the GPU view, or (c) a reboot. Its gen model is the only entry — prompt
+        enhancement runs off-slot, on the enhance target above.
       </p>
     </div>
   )
@@ -444,7 +445,11 @@ function JobRow({
       <td>
         <ArtifactCell job={job} />
       </td>
-      <td className="muted">{relTime(Date.now(), inFlight ? job.created_at : job.finished_at ?? job.created_at)}</td>
+      <td className="muted">
+        {/* the job timestamps are epoch SECONDS (Python time.time()); relTime
+            wants ms — feeding seconds straight in reads ~56 years "ago" */}
+        {relTime(Date.now(), (inFlight ? job.created_at : job.finished_at ?? job.created_at) * 1000)}
+      </td>
       <td className="btns">
         <button
           className="danger"
