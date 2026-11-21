@@ -206,117 +206,119 @@ export default function Gpus({ intervalMs }: { intervalMs: number }) {
           </div>
         )}
 
-        {(reservedCards.length > 0 || reserving) && (
-          <div className="reservations">
-            {reservedCards.map((p) => {
-              const r = p.reserved!
-              const inst = instance(r.for)
-              return (
-                <div key={p.index} className="reservation">
-                  <span className="cardchip">{p.index}</span>
-                  {r.note && <span className="muted">{r.note}</span>}
-                  <span className="muted">→</span>
-                  <span>
-                    {inst?.display ?? r.for}
-                    {inst && <span className="muted"> {r.for}</span>}
-                  </span>
-                  {p.holder && <span className="badge ok">held by {holderDisplay(p.holder)}</span>}
-                  <button
-                    className="danger"
-                    disabled={busy !== null}
-                    title="unreserve — the card rejoins the auto-grab pool for everyone"
-                    onClick={() =>
-                      act(`unreserve:${p.index}`, () =>
-                        api<GpuPool>('/gpus/unreserve', {
-                          method: 'POST',
-                          body: JSON.stringify({ card: p.index }),
-                        })
-                      )
-                    }
-                  >
-                    unreserve
-                  </button>
-                </div>
-              )
-            })}
-            {!reserving ? (
-              <button
-                disabled={busy !== null || data.instances.length === 0}
-                onClick={() => {
-                  setResCard(null)
-                  setResFor(data.instances[0]?.name ?? '')
-                  setResNote('')
-                  setReserving(true)
-                }}
-              >
-                reserve a card…
-              </button>
-            ) : (
-              <div className="reservation form">
-                <span className="muted">card</span>
-                {data.pool
-                  .filter((p) => p.reserved == null || p.reserved!.for === resFor)
-                  .map((p) => {
-                    const owner = p.reserved?.for ?? null
-                    const reRecord = owner != null && owner === resFor
-                    const title = owner
-                      ? reRecord
-                        ? `already reserved for ${holderDisplay(owner) ?? owner} — applying re-records its BDF`
-                        : `reserved for ${holderDisplay(owner) ?? owner} — select that instance to re-record, or unreserve first`
-                      : p.holder
-                        ? `card ${p.index} — held by ${holderDisplay(p.holder)} (reserving it for that holder is allowed)`
-                        : `card ${p.index}`
-                    return (
-                      <label key={p.index} className="pick" title={title}>
-                        <input
-                          type="radio"
-                          name="reserve-card"
-                          checked={resCard === p.index}
-                          onChange={() => setResCard(p.index)}
-                        />
-                        <span className="cardchip">{p.index}</span>
-                      </label>
-                    )
-                  })}
-                <span className="muted">for</span>
-                <select value={resFor} onChange={(e) => setResFor(e.target.value)}>
-                  {data.instances.map((i) => (
-                    <option key={i.name} value={i.name}>
-                      {i.display} ({i.name})
-                    </option>
-                  ))}
-                </select>
-                <input
-                  type="text"
-                  value={resNote}
-                  maxLength={200}
-                  placeholder="why — e.g. PCIe5 x8"
-                  onChange={(e) => setResNote(e.target.value)}
-                />
+        {/* Always rendered (not gated on reservedCards.length): with zero
+            reservations the only entry point to create the first one would be
+            this button — gating it on existing reservations is a chicken-and-
+            egg dead end. */}
+        <div className="reservations">
+          {reservedCards.map((p) => {
+            const r = p.reserved!
+            const inst = instance(r.for)
+            return (
+              <div key={p.index} className="reservation">
+                <span className="cardchip">{p.index}</span>
+                {r.note && <span className="muted">{r.note}</span>}
+                <span className="muted">→</span>
+                <span>
+                  {inst?.display ?? r.for}
+                  {inst && <span className="muted"> {r.for}</span>}
+                </span>
+                {p.holder && <span className="badge ok">held by {holderDisplay(p.holder)}</span>}
                 <button
-                  disabled={busy !== null || resCard == null || !resFor}
-                  onClick={() => {
-                    const card = resCard!
-                    const forSvc = resFor
-                    const note = resNote
-                    setReserving(false)
-                    void act(`reserve:${card}`, () =>
-                      api<GpuPool>('/gpus/reserve', {
+                  className="danger"
+                  disabled={busy !== null}
+                  title="unreserve — the card rejoins the auto-grab pool for everyone"
+                  onClick={() =>
+                    act(`unreserve:${p.index}`, () =>
+                      api<GpuPool>('/gpus/unreserve', {
                         method: 'POST',
-                        body: JSON.stringify({ card, for: forSvc, note }),
+                        body: JSON.stringify({ card: p.index }),
                       })
                     )
-                  }}
+                  }
                 >
-                  apply
-                </button>
-                <button disabled={busy !== null} onClick={() => setReserving(false)}>
-                  cancel
+                  unreserve
                 </button>
               </div>
-            )}
-          </div>
-        )}
+            )
+          })}
+          {!reserving ? (
+            <button
+              disabled={busy !== null || data.instances.length === 0}
+              onClick={() => {
+                setResCard(null)
+                setResFor(data.instances[0]?.name ?? '')
+                setResNote('')
+                setReserving(true)
+              }}
+            >
+              reserve a card…
+            </button>
+          ) : (
+            <div className="reservation form">
+              <span className="muted">card</span>
+              {data.pool
+                .filter((p) => p.reserved == null || p.reserved!.for === resFor)
+                .map((p) => {
+                  const owner = p.reserved?.for ?? null
+                  const reRecord = owner != null && owner === resFor
+                  const title = owner
+                    ? reRecord
+                      ? `already reserved for ${holderDisplay(owner) ?? owner} — applying re-records its BDF`
+                      : `reserved for ${holderDisplay(owner) ?? owner} — select that instance to re-record, or unreserve first`
+                    : p.holder
+                      ? `card ${p.index} — held by ${holderDisplay(p.holder)} (reserving it for that holder is allowed)`
+                      : `card ${p.index}`
+                  return (
+                    <label key={p.index} className="pick" title={title}>
+                      <input
+                        type="radio"
+                        name="reserve-card"
+                        checked={resCard === p.index}
+                        onChange={() => setResCard(p.index)}
+                      />
+                      <span className="cardchip">{p.index}</span>
+                    </label>
+                  )
+                })}
+              <span className="muted">for</span>
+              <select value={resFor} onChange={(e) => setResFor(e.target.value)}>
+                {data.instances.map((i) => (
+                  <option key={i.name} value={i.name}>
+                    {i.display} ({i.name})
+                  </option>
+                ))}
+              </select>
+              <input
+                type="text"
+                value={resNote}
+                maxLength={200}
+                placeholder="why — e.g. PCIe5 x8"
+                onChange={(e) => setResNote(e.target.value)}
+              />
+              <button
+                disabled={busy !== null || resCard == null || !resFor}
+                onClick={() => {
+                  const card = resCard!
+                  const forSvc = resFor
+                  const note = resNote
+                  setReserving(false)
+                  void act(`reserve:${card}`, () =>
+                    api<GpuPool>('/gpus/reserve', {
+                      method: 'POST',
+                      body: JSON.stringify({ card, for: forSvc, note }),
+                    })
+                  )
+                }}
+              >
+                apply
+              </button>
+              <button disabled={busy !== null} onClick={() => setReserving(false)}>
+                cancel
+              </button>
+            </div>
+          )}
+        </div>
       </div>
 
       {data.warnings.length > 0 && (
