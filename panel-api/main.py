@@ -30,9 +30,10 @@ from typing import Any, Callable, Optional
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field
 
+import gen_jobs
 import gpu_pool
 
 PANEL_TOKEN = os.environ.get("PANEL_TOKEN", "")
@@ -51,6 +52,7 @@ if DEV_MODE:  # local development: keep the file in the checkout, not /opt
 
 MANAGE_LABEL = "panel.manage"
 CATEGORY_LABEL = "panel.category"  # Services view group (collapsible); absent → "Other"
+PRIVATE_LABEL = "gpu.private"  # fleet instance with NO public host (invariant 6; value "true")
 CONTAINER_VERBS = frozenset({"start", "stop", "restart"})
 CID_RE = re.compile(r"^[0-9a-f]{12}$")  # mirrors panel-do's containerIDRe
 ARG_RE = re.compile(r"^[ -~]{1,128}$")  # mirrors panel-do's base arg validation
@@ -65,7 +67,7 @@ if DEV_MODE:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     """Owns the LLM router's shared httpx client + background health probe."""
-    global _llm_http
+    global _gen_http, _llm_http
     # GPU pool: seed the state files (ledger + override) before the boot
     # oneshot or a compose render can want them. 02/03 already create them
     # at install time; this is the belt-and-braces for a hand-removed file.
@@ -76,16 +78,25 @@ async def lifespan(_app: FastAPI):
     # it, and the passive cooldown + /health probe steer the next request
     # down the list. connect capped at 5 s.
     _llm_http = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=5.0, read=300.0, pool=5.0))
+    # Gen section: its own client (a render can sit 30+ min on the read — the
+    # LLM client's 300 s ceiling would cut it off), stale-flight reap after a
+    # restart, and the engine task (see the Gen section).
+    _gen_http = httpx.AsyncClient(timeout=httpx.Timeout(1800.0, connect=5.0, read=1800.0, pool=5.0))
+    _gen_reap_stale()
     probe = asyncio.create_task(_llm_probe_loop())
+    gen_engine = asyncio.create_task(_gen_engine_loop())
     try:
         yield
     finally:
         probe.cancel()
-        try:
-            await probe  # let the in-flight cycle finish cancelling before closing its client
-        except asyncio.CancelledError:
-            pass
+        gen_engine.cancel()
+        for t in (probe, gen_engine):
+            try:
+                await t  # let the in-flight cycle finish cancelling before closing its client
+            except asyncio.CancelledError:
+                pass
         await _llm_http.aclose()
+        await _gen_http.aclose()
 
 
 app = FastAPI(title="panel-api", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
@@ -244,7 +255,7 @@ def amd_gpus() -> list[dict[str, Any]]:
     host CPU node skipped) — the same files the ROCm runtime reads, so
     _rocr_indexes() returns the exact order, not a proxy. The sysfs card NAME
     is NOT that index: a non-GPU drm device can take a card slot (on this
-    host card0, so the six R9700s are card1..card6 — joining the pool on the
+    host card0, so the seven R9700s are card1..card7 — joining the pool on the
     name was off by one: tile 0 had no readings and every tile showed the
     PREVIOUS card's). When the topology is unavailable or can't be fully
     mapped, the index falls back to card-number order (probe order — the same
@@ -633,10 +644,20 @@ def uptime_s() -> Optional[float]:
 def metrics(_admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
     mi = _meminfo()
     uname = os.uname()
+    gpus = amd_gpus()
+    # The pool's reservations, joined on rocr_index — the Overview marks the
+    # dedicated card at a glance (the GPU view carries the full form + the
+    # controls). Read-only under the ledger lock, like every view poll.
+    with gpu_pool.gpu_lock():
+        reserved = gpu_pool.load_ledger()["reserved"]
+    for e in gpus:
+        r = reserved.get(e["rocr_index"])
+        e["reserved_for"] = r["for"] if r else None
+        e["reserved_note"] = r["note"] if r else None
     return {
         "ts": int(time.time()),
         "host": {"hostname": uname.nodename, "kernel": uname.release},
-        "gpus": amd_gpus(),
+        "gpus": gpus,
         "cpu": cpu_block(),
         "ram": ram(mi),
         "swap": swap(mi),
@@ -693,6 +714,9 @@ def _container_view(x: dict[str, Any]) -> dict[str, Any]:
         "service": _cli_label_get(x.get("Labels") or "", "com.docker.compose.service"),
         # Services view group (panel.category label); None/"" render as "Other".
         "category": _cli_label_get(x.get("Labels") or "", CATEGORY_LABEL),
+        # gpu.private=true — no public host: the Services view must not render
+        # its dashboard link (the <sub>.pietrasik.top/open host does not exist).
+        "private": _cli_label_get(x.get("Labels") or "", PRIVATE_LABEL) == "true",
         "image": x.get("Image", ""),
         "state": x.get("State", "unknown"),
         "status": x.get("Status", ""),
@@ -1728,14 +1752,22 @@ def _live_fleet() -> list[dict[str, Any]]:
 
 
 def _gpu_pool_view(
-    cards_total: int,
+    gpus: list[dict[str, Any]],
     defs: list[dict[str, Any]],
     live: list[dict[str, Any]],
     ledger: dict[str, Any],
 ) -> dict[str, Any]:
-    """The GPU view's shape: pool (live holds) + instances (ledger ∪ live).
-    `assigned` (ledger) and `holding` (live) are shown separately — drift
-    between them means an apply failed or a hand-run compose diverged."""
+    """The GPU view's shape: pool (live holds + reservations) + instances
+    (ledger ∪ live). `assigned` (ledger) and `holding` (live) are shown
+    separately — drift between them means an apply failed or a hand-run
+    compose diverged. ``gpus`` is amd_gpus(): its len is the pool size and
+    its per-tile BDFs feed the reservation drift warning."""
+    cards_total = len(gpus)
+    bdf_by_index = {
+        e["rocr_index"]: e["pci_slot"]
+        for e in gpus
+        if e.get("rocr_index") is not None and e.get("pci_slot")
+    }
     holds = gpu_pool.live_holds(live)
     state_by_service: dict[str, str] = {}
     for row in live:
@@ -1766,12 +1798,26 @@ def _gpu_pool_view(
                 "autostart": name in ledger["autostart"],
             }
         )
+    reserved = ledger["reserved"]
     return {
         "cards": cards_total,
-        "pool": [{"index": c, "holder": holds.get(c)} for c in range(cards_total)],
+        "pool": [
+            {
+                "index": c,
+                "holder": holds.get(c),
+                "reserved": (
+                    {"for": r["for"], "note": r["note"]} if (r := reserved.get(c)) else None
+                ),
+            }
+            for c in range(cards_total)
+        ],
         "instances": instances,
         "autostart": list(ledger["autostart"]),
-        "warnings": gpu_pool.autostart_warnings(ledger) + gpu_pool.assignment_warnings(defs, ledger),
+        "warnings": (
+            gpu_pool.autostart_warnings(ledger)
+            + gpu_pool.assignment_warnings(defs, ledger)
+            + gpu_pool.reservation_warnings(defs, ledger, cards_total, holds, bdf_by_index)
+        ),
     }
 
 
@@ -1783,7 +1829,7 @@ def _gpu_pool_now() -> dict[str, Any]:
     with gpu_pool.gpu_lock():
         ledger = gpu_pool.load_ledger()
         gpu_pool.sync_override(ledger, {d["name"] for d in defs if isinstance(d.get("name"), str)})
-    return _gpu_pool_view(len(amd_gpus()), defs, live, ledger)
+    return _gpu_pool_view(amd_gpus(), defs, live, ledger)
 
 
 def _panel_do_checked(name: str, args: list[str], user: Optional[str]) -> None:
@@ -1812,6 +1858,51 @@ def _check_gpu_name(service: str) -> None:
         raise HTTPException(400, f"bad instance name {service!r} (want gpu-<name>)")
 
 
+def _gpus_plan_start_checked(service: str) -> tuple[dict[str, Any], list[int]]:
+    """The locked plan + save + override-sync of a GPU-aware start (the
+    shared core of gpus_start and its idle-stop retry). Raises ValueError
+    (user-ready) on conflict, like gpu_pool.plan_start."""
+    with gpu_pool.gpu_lock():
+        ledger = gpu_pool.load_ledger()
+        defs = _fleet_defs()
+        live = _live_fleet()
+        ledger, gpus = gpu_pool.plan_start(ledger, defs, live, len(amd_gpus()), service)
+        gpu_pool.save_ledger(ledger)
+        gpu_pool.sync_override(ledger, {d["name"] for d in defs if isinstance(d.get("name"), str)})
+    return ledger, gpus
+
+
+def _gen_idle_conflict_stops(
+    defs: list[dict[str, Any]],
+    live: list[dict[str, Any]],
+    ledger: dict[str, Any],
+    cards_total: int,
+    service: str,
+) -> list[str]:
+    """The IDLE gen slots whose cards would block this start — the Gen
+    section's lazy-stop rule applied to an admin's explicit start: a drained
+    gen slot yields, a busy gen slot or any LLM instance never does (the
+    start fails as before — the shortage named, the holders in the GPUs view)."""
+    if gpu_pool.is_running(live, service):
+        return []
+    try:
+        # The stop target is plan_start's PREFERENCE, not its fallback — the
+        # saved set when it is shape-valid, even while held; the coupling to
+        # plan_start's selection rule is documented in start_preference.
+        target = gpu_pool.start_preference(ledger, defs, live, cards_total, service)
+    except ValueError:
+        return []  # not a fleet instance — nothing to stop (plan_start said so)
+    holds = gpu_pool.live_holds(live)
+    slots = gen_jobs.build_slots(gen_jobs.build_instances(defs, live, ledger, {}))
+    jobs = gen_jobs.load_jobs()["jobs"]
+    out: list[str] = []
+    for c in target:
+        holder = holds.get(c)
+        if holder and holder in slots and not gen_jobs.flights_on_slot(jobs, holder) and holder not in out:
+            out.append(holder)
+    return sorted(out)
+
+
 @app.get("/api/gpus")
 def gpus_view(_admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
     defs = _fleet_defs()
@@ -1822,7 +1913,7 @@ def gpus_view(_admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
         # a no-op write when already in sync.
         ledger = gpu_pool.load_ledger()
         gpu_pool.sync_override(ledger, {d["name"] for d in defs if isinstance(d.get("name"), str)})
-    return _gpu_pool_view(len(amd_gpus()), defs, live, ledger)
+    return _gpu_pool_view(amd_gpus(), defs, live, ledger)
 
 
 class GpuAssignBody(BaseModel):
@@ -1867,21 +1958,37 @@ def gpus_start(body: GpuServiceBody, _admin: Optional[str] = Depends(require_adm
     """GPU-aware start (also the "create + start" path for a
     container-less instance): the saved set when it is free, else the lowest
     free set — never a raw `docker start`, which would reuse the create-time
-    env and could resurrect cards another instance now owns."""
+    env and could resurrect cards another instance now owns. A conflict with
+    an IDLE gen slot yields to the start (that slot is stopped — it is idle,
+    no job is in flight on it, nothing is lost); a busy gen slot or an LLM
+    instance holds as before and the start fails with the shortage named (the
+    GPUs view names the holders)."""
     _check_gpu_name(body.service)
     user = _admin
-    with gpu_pool.gpu_lock():
-        ledger = gpu_pool.load_ledger()
-        defs = _fleet_defs()
-        live = _live_fleet()
+    stopped: list[str] = []
+    for attempt in range(2):  # at most one idle-gen-stop + re-plan
         try:
-            ledger, gpus = gpu_pool.plan_start(ledger, defs, live, len(amd_gpus()), body.service)
+            _ledger, gpus = _gpus_plan_start_checked(body.service)
+            break
         except ValueError as e:
-            raise HTTPException(400, str(e)) from e
-        gpu_pool.save_ledger(ledger)
-        gpu_pool.sync_override(ledger, {d["name"] for d in defs if isinstance(d.get("name"), str)})
+            # Conflict path: are the conflicting cards held ONLY by idle gen
+            # slots? Then the Gen section's lazy-stop rule applies to this
+            # explicit start — stop them and re-plan once. A SECOND conflict
+            # (e.g. a set held by an idle gen slot AND an LLM instance) is
+            # not stopped into: fail as before (the shortage is named; the
+            # GPUs view names the holders).
+            with gpu_pool.gpu_lock():
+                ledger = gpu_pool.load_ledger()
+                defs = _fleet_defs()
+                live = _live_fleet()
+            stops = _gen_idle_conflict_stops(defs, live, ledger, len(amd_gpus()), body.service)
+            if not stops or attempt == 1:
+                raise HTTPException(400, str(e)) from e
+            for st in stops:
+                _panel_do_checked("gpu-stop", [st], user)  # audited as the admin's start
+            stopped += [s for s in stops if s not in stopped]
     _panel_do_checked("gpu-apply", [body.service], user)
-    _audit(user, "gpu-start", [body.service, ",".join(map(str, gpus))], 0)
+    _audit(user, "gpu-start", [body.service, ",".join(map(str, gpus))] + [f"stopped-idle-gen:{s}" for s in stopped], 0)
     return _gpu_pool_now()
 
 
@@ -1916,3 +2023,1154 @@ def gpus_autostart(body: GpuAutostartBody, _admin: Optional[str] = Depends(requi
         gpu_pool.save_ledger(ledger)
     _audit(_admin, "gpu-autostart", [body.service, "on" if body.enabled else "off"], 0)
     return _gpu_pool_now()
+
+
+class GpuReserveBody(BaseModel):
+    """Dedicate a card to one instance (the physically-odd card — e.g. the
+    PCIe5 x8 one — that must never be mixed into the others' pool): the
+    auto-grab never hands it to another instance, an explicit assign of it
+    by another is refused, and the owner's own grab lands on it first.
+    ``for`` is an alias (reserved word)."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    card: int
+    for_service: str = Field(alias="for")
+    note: str = ""
+
+
+@app.post("/api/gpus/reserve")
+def gpus_reserve(body: GpuReserveBody, _admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
+    """Reserve a card for one instance (GPU view). The BDF is captured at
+    reserve time: the view WARNS when the tile's BDF later moves — a card
+    add/remove renumbers the tiles, so an un-warned reservation could point
+    at the wrong physical card. Re-reserving the same owner re-records it."""
+    _check_gpu_name(body.for_service)
+    note = body.note.strip()[:200]
+    gpus = amd_gpus()
+    if not (0 <= body.card < len(gpus)):
+        raise HTTPException(400, f"card {body.card} is out of range (the pool is 0-{len(gpus) - 1})")
+    with gpu_pool.gpu_lock():
+        ledger = gpu_pool.load_ledger()
+        holder = gpu_pool.live_holds(_live_fleet()).get(body.card)
+        # reserving the card the owner already runs on is the natural
+        # "make it official" case; a card held by ANYONE ELSE is not
+        # reserved out from under it — stop the holder first.
+        if holder and holder != body.for_service:
+            raise HTTPException(400, f"card {body.card} is held by {holder} — stop it first")
+        cur = ledger["reserved"].get(body.card)
+        if cur and cur["for"] != body.for_service:
+            raise HTTPException(400, f"card {body.card} is reserved for {cur['for']} — unreserve it first")
+        bdf = next(
+            (e["pci_slot"] for e in gpus if e.get("rocr_index") == body.card and e.get("pci_slot")),
+            None,
+        )
+        ledger["reserved"][body.card] = {"for": body.for_service, "note": note, "bdf": bdf}
+        gpu_pool.save_ledger(ledger)
+    _audit(_admin, "gpu-reserve", [str(body.card), body.for_service, note], 0)
+    return _gpu_pool_now()
+
+
+class GpuUnreserveBody(BaseModel):
+    card: int
+
+
+@app.post("/api/gpus/unreserve")
+def gpus_unreserve(body: GpuUnreserveBody, _admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
+    """Remove a reservation — the card rejoins the auto-grab pool for everyone."""
+    with gpu_pool.gpu_lock():
+        ledger = gpu_pool.load_ledger()
+        cur = ledger["reserved"].get(body.card)
+        if cur is None:
+            raise HTTPException(400, f"card {body.card} is not reserved")
+        del ledger["reserved"][body.card]
+        gpu_pool.save_ledger(ledger)
+    _audit(_admin, "gpu-unreserve", [str(body.card), cur["for"]], 0)
+    return _gpu_pool_now()
+
+
+# ───────────────────────────── Gen (image/video) ─────────────────────────────
+# The panel's own generation section (panel tab "Gen"): one FIFO of jobs,
+# served by the GEN SLOTS — gpu-* instances whose radiance config hosts an
+# image/video model (gen_jobs.py discovers them from the deployed configs;
+# they are the gpu.private instances: no router, reachable by container IP
+# only, like the LLM router talks to the fleet). Each slot is gen-ONLY: its
+# gen model is the sole config entry and stays resident — prompt ENHANCEMENT
+# runs off-slot, on the settings' enhance target (default: the gpu-writer
+# instance's "writer" model — a PUBLIC chat instance on the 7th card; the
+# engine reaches it by container IP over the edge network, exactly like the
+# slots, and starts it via the same panel-do gpu-apply when needed).
+#
+# Internal-only by construction for the SLOTS: they have no public host
+# (make doctor asserts it), and every endpoint here rides the same admin
+# gate as the rest of the panel. V2 exposes the SAME job API to the servitor
+# agent on /machine/gen/* behind the LLM bearer key — no second queue.
+#
+# The engine is one background task (a ~2 s tick, the single scheduler) plus
+# one asyncio task per in-flight job. Every state transition goes through
+# gen_jobs (flock + atomic file), so a panel-api restart loses nothing: a
+# video with a radiance id re-attaches to its poll (radiance kept the job);
+# a pre-request flight (starting/enhancing/loading — the gen request never
+# reached the slot) is re-queued and resumes; only a RUNNING request in
+# flight (an image, or a video whose id was never recorded) fails.
+#
+# Radiance contract (upstream, ref/radiance): images — synchronous
+# POST /v1/images/generations, response_format b64_json ONLY (url is refused);
+# videos — POST /v1/videos → {id, status}, GET /v1/videos/{id} →
+# status(queued|in_progress|completed|failed)+progress(0-100),
+# GET /v1/videos/{id}/content → the MP4 (?variant=thumbnail → first frame),
+# DELETE /v1/videos/{id} → cancel. Cancel has a second, connection-level path:
+# an ABNORMALLY CLOSED response sets the ticket's cancel flag (upstream's
+# on_close handler — the same flag the video DELETE sets), so dropping an
+# in-flight request retires the render at the next pass boundary;
+# _gen_await_request uses this for the synchronous calls.
+# Auth: Bearer LLM_API_KEY — the slots' and the writer's RADIANCE_API_KEY is
+# the same fleet key (one rotation, zero plumbing).
+#
+# Admission (two caps — see gen_jobs): per slot, at most GEN_CAP jobs in
+# the GEN PHASE (one in progress + one queued in radiance — the model's own
+# sequencing; a starting flight consumes no headroom); system-wide, at most
+# GEN_ENHANCE_CAP enhancements in flight on the enhance target. Enhancement
+# runs BEFORE the slot phase and OFF-SLOT (a different card): a queued job
+# enhances as soon as there is enhance headroom, without a slot being
+# claimed or started.
+
+GEN_ARTIFACT_DIR = Path(
+    os.environ.get("GEN_ARTIFACT_DIR")
+    or ("/models/gen-output" if not DEV_MODE else "gen-output")
+)
+GEN_GC_INTERVAL_S = 6 * 3600  # artifact age-GC pass (the age itself: gc_days)
+GEN_SLOT_START_TIMEOUT_S = 600.0  # container start + engine boot budget per job
+GEN_VIDEO_POLL_S = 5.0
+GEN_CANCEL_POLL_S = 2.0  # how fast an in-flight radiance request notices a cancel (drop → the slot's ticket cancel)
+# Request budgets vs the slot's LOAD: radiance's /health is 200 from PROCESS
+# start (a stuck device is the only 503), so a request to a freshly
+# (re)started slot can sit out its entry load — warm-up is still loading from
+# disk and the request is held until its entry is resident, up to the slot's
+# scheduler.load-timeout (300 s on the tp1 slots, 600 s on gpu-gentp2, the
+# fleet's largest). Every budget below is that load wait + headroom, never a
+# cap on the work itself (the image call's 1800 s is load + a 30+ min render).
+GEN_SLOT_LOAD_WAIT_S = 600.0  # the fleet's largest scheduler.load-timeout (gpu-gentp2)
+GEN_ENHANCE_TIMEOUT_S = GEN_SLOT_LOAD_WAIT_S + 300.0
+GEN_VIDEO_SUBMIT_TIMEOUT_S = GEN_SLOT_LOAD_WAIT_S + 300.0
+
+_gen_http: Optional[httpx.AsyncClient] = None  # created in lifespan
+_gen_tasks: dict[str, asyncio.Task] = {}  # job id → in-flight task
+_gen_gc_at: float = 0.0
+_gen_dev_logged: bool = False
+
+
+class _GenError(Exception):
+    """User-ready job failure — the message lands in the job record."""
+
+
+class _JobCanceled(Exception):
+    """The job was canceled (or deleted) while its radiance request was in
+    flight — the request task was dropped. Not a failure: the record is
+    already canceled (terminal-sticky), and the video tail — the only caller
+    that holds a radiance id to retire — does its own cleanup."""
+
+
+def _gen_auth() -> dict[str, str]:
+    return {"authorization": f"Bearer {LLM_API_KEY}"} if LLM_API_KEY else {}
+
+
+def _gen_world() -> dict[str, Any]:
+    """defs + live + ledger + ips + instances + slots + jobs + holds +
+    per-slot status + the enhance target, in one pass. Sync (panel-do
+    spawns) — endpoints run in the threadpool, the engine awaits it via
+    asyncio.to_thread.
+
+    DEV_MODE has no panel-do: defs come from the repo's compose file (the
+    same gpu.cards/labels panel-do gpu-fleet reads on the server), live and
+    ips are empty — slots then show down/unreachable, and the engine stays
+    off, so the endpoints + state files are fully exercisable locally."""
+    if DEV_MODE:
+        defs, live, ips = _fleet_defs_dev(), [], {}
+    else:
+        defs = _fleet_defs()
+        live = _live_fleet()
+        ips = _edge_ips()
+    with gpu_pool.gpu_lock():
+        ledger = gpu_pool.load_ledger()
+    instances = gen_jobs.build_instances(defs, live, ledger, ips)
+    slots = gen_jobs.build_slots(instances)
+    store = gen_jobs.load_jobs()
+    holds = gpu_pool.live_holds(live)
+    return {
+        "defs": defs,
+        "live": live,
+        "ledger": ledger,
+        "ips": ips,
+        "instances": instances,
+        "slots": slots,
+        "store": store,
+        "jobs": store["jobs"],
+        "holds": holds,
+        "status": gen_jobs.slot_status(slots, store["jobs"], holds),
+        "enhance_target": _gen_enhance_target(gen_jobs.load_settings(), instances),
+    }
+
+
+def _gen_enhance_target(settings: dict[str, Any], instances: dict[str, Any]) -> dict[str, Any]:
+    """The settings' enhance target resolved against the current fleet: the
+    (instance, model) the engine runs prompts through (default: the
+    gpu-writer instance's "writer" entry). ``ok`` False carries a user-ready
+    reason — create 400s on it, and a queued enhance job rides it as its
+    structural wait reason (a config drift, like a vanished model)."""
+    e = settings.get("enhance") or {}
+    inst = e.get("instance") or "gpu-writer"
+    model = e.get("model") or "writer"
+    out: dict[str, Any] = {"instance": inst, "model": model, "running": False, "ip": "", "ok": False, "reason": ""}
+    row = instances.get(inst)
+    if row is None:
+        out["reason"] = f"enhance target {inst!r} is not a deployed gpu-* instance (Gen settings)"
+        return out
+    out["running"], out["ip"] = row["running"], row["ip"]
+    if model not in row["llms"]:
+        hosted = ", ".join(row["llms"]) or "none"
+        out["reason"] = f"{inst} hosts no llm model {model!r} (its llm entries: {hosted} — Gen settings)"
+        return out
+    out["ok"] = True
+    return out
+
+
+def _fleet_defs_dev() -> list[dict[str, Any]]:
+    """DEV_MODE fleet defs: the repo's compose gpu-* blocks (name +
+    gpu.cards + panel.manage) — the local stand-in for panel-do gpu-fleet,
+    which needs the server's sudo."""
+    import re as _re
+
+    try:
+        text = Path("compose/docker-compose.yml").read_text()
+    except OSError:
+        return []
+    out: list[dict[str, Any]] = []
+    for m in _re.finditer(r"^  (gpu-[a-z0-9][a-z0-9-]*):\n((?:^    .*(?:\n|$))*)", text, _re.M):
+        name, block = m.group(1), m.group(2)
+        cards = _re.search(r"gpu\.cards=(\d+)", block)
+        manage = _re.search(r"panel\.manage=([^\n#]+)", block)
+        out.append(
+            {
+                "name": name,
+                "cards": int(cards.group(1)) if cards else 1,
+                "display": manage.group(1).strip() if manage else name,
+            }
+        )
+    return out
+
+
+async def _gen_mark(jid: str, **fields: Any) -> Optional[dict[str, Any]]:
+    """Set fields on a job. Terminal states are sticky — a late task can't
+    overwrite canceled/completed/failed (a cancel racing a finish keeps the
+    cancel only if it landed first; the UI polls either way). Async: the
+    state file is sync file IO — the engine's tasks never touch it on the
+    event loop (the endpoints do, running in the threadpool)."""
+
+    def _m(job: dict[str, Any]) -> None:
+        if job["state"] in gen_jobs.TERMINAL_STATES:
+            return
+        job.update(fields)
+
+    return await asyncio.to_thread(gen_jobs.update_job, jid, _m)
+
+
+def _gen_requeue(jid: str, reason: str) -> None:
+    """Back to QUEUED without its slot claim — the slot start conflicted (a
+    card got held between the tick's claim and this attempt), which is a
+    lane condition, not a job fault: the next tick re-evaluates (the slot's
+    status then says blocked — wait for the holder — or the lane is free).
+    A permanent conflict (docker down, cards short) re-queues with the same
+    reason every tick; the reason rides the record's error field so the job
+    row says why it waits. Terminal-sticky like _gen_mark (a cancel that
+    landed first wins; the record stays)."""
+
+    def _m(job: dict[str, Any]) -> None:
+        if job["state"] in gen_jobs.TERMINAL_STATES:
+            return
+        job["state"] = gen_jobs.QUEUED
+        job["slot"] = None  # the next tick re-picks a candidate (another slot may host the model)
+        job["started_at"] = None
+        job["error"] = reason
+
+    gen_jobs.update_job(jid, _m)
+
+
+def _gen_reap_stale() -> None:
+    """Startup: no in-flight tasks exist in this process. A RUNNING job with
+    a radiance id survives (the tick re-attaches its poll — radiance kept
+    the video); the pre-request in-flight states (STARTING/ENHANCING/
+    LOADING — the gen request never reached the slot) are lossless to re-run
+    → back to QUEUED, slot claim released (the slot start is idempotent, the
+    enhancement simply runs again); only a RUNNING request that was in flight
+    in the dead process (an image, or a video whose submit had not recorded
+    its id — an orphan on the slot) → failed, with a say-so."""
+    now = time.time()
+    with gen_jobs.gen_lock():
+        store = gen_jobs.load_jobs()
+        changed = False
+        for job in store["jobs"].values():
+            state = job.get("state")
+            if state not in gen_jobs.IN_FLIGHT_STATES:
+                continue
+            if state == gen_jobs.RUNNING:
+                if job.get("radiance_video_id"):
+                    continue  # the tick re-attaches its poll (radiance kept the video)
+                job["state"] = gen_jobs.FAILED
+                job["error"] = "panel-api restarted mid-job"
+                job["finished_at"] = now
+            else:
+                # STARTING / ENHANCING / LOADING: nothing irrevocable was
+                # sent (the enhance is off-slot and simply runs again; the
+                # gen request never reached the slot) — re-run it, don't
+                # fail it.
+                job["state"] = gen_jobs.QUEUED
+                job["slot"] = None  # the next tick re-picks a candidate
+                job["started_at"] = None
+                job["error"] = "panel-api restarted before the gen request — re-queued"
+            changed = True
+        if changed:
+            gen_jobs.save_jobs(store)
+
+
+# ── instance start (engine-driven, the GPU view's start without the admin) ──
+
+
+def _gen_start_instance(service: str) -> None:
+    """GPU-aware start of ANY gpu-* instance the engine needs — a gen slot
+    (its lane cards) or the enhance target (its own card): the saved set
+    when free, else the lowest free — then gpu-apply (idempotent: a no-op
+    on an already-up container, so the admin/engine race can't
+    double-start). Raises RuntimeError (user-ready) on conflict — the job
+    records it."""
+    try:
+        _gpus_plan_start_checked(service)
+    except ValueError as e:
+        raise RuntimeError(str(e)) from e
+    try:
+        _panel_do_checked("gpu-apply", [service], "gen-engine")  # audited as the engine
+    except HTTPException as e:
+        raise RuntimeError(str(e.detail)) from e
+
+
+def _gen_instance_up(name: str) -> tuple[bool, str]:
+    """(running, edge IP) for ONE instance — the health-wait's poll. gpu-live
+    (one panel-do spawn) + the cached edge-ips, not the full world (fleet
+    defs + every slot's config): a cold-load wait polls this every 3 s, and
+    N concurrent waiters would otherwise N× the tick's two-spawn world
+    build."""
+    row = next(
+        (
+            r
+            for r in _live_fleet()
+            if r.get("service") == name and r.get("state") in gpu_pool.HOLDING_STATES
+        ),
+        None,
+    )
+    if row is None:
+        return False, ""
+    return True, _edge_ips().get(row.get("container") or "", "")
+
+
+async def _gen_wait_instance_health(name: str, jid: str, budget_s: float) -> str:
+    """Poll a fleet instance's /health until up; returns its edge IP.
+    RuntimeError (user-ready) on budget exhaustion — the job fails with it.
+    Returns "" when the job left in-flight while waiting
+    (canceled/deleted) — the caller re-checks the record and drops out; a
+    canceled job shouldn't pay out the full 10 min for an instance that no
+    longer needs to be up."""
+    deadline = time.monotonic() + budget_s
+    last = "waiting for the container"
+    while time.monotonic() < deadline:
+        running, ip = await asyncio.to_thread(_gen_instance_up, name)
+        job = await asyncio.to_thread(gen_jobs.get_job, jid)
+        if job is None or job["state"] in gen_jobs.TERMINAL_STATES:
+            return ""
+        if running and ip:
+            try:
+                r = await _gen_http.get(f"http://{ip}:8000/health", timeout=5.0)
+                if r.status_code == 200:
+                    return ip
+                last = f"/health → {r.status_code}"
+            except httpx.HTTPError as e:
+                last = type(e).__name__
+        await asyncio.sleep(3.0)
+    raise RuntimeError(f"{name} did not become healthy in {budget_s:.0f}s ({last})")
+
+
+async def _gen_free_slot(sname: str) -> bool:
+    """Stop the IDLE gen slots holding ``sname``'s lane cards (the lazy-stop
+    rule in action — the holder is idle, nothing in flight is lost) and
+    re-verify the slot is then startable. The stop is the engine's one
+    preemption, and it only ever touches gen slots with no in-flight job —
+    re-checked against a FRESH read at stop time, because the caller's tick
+    world is a snapshot taken before this tick's own claims: an earlier claim
+    in the same tick may have just landed a job on a holder that looked idle,
+    and stopping it would kill that job (the admin-start path does the same
+    fresh check).
+    """
+    w = await asyncio.to_thread(_gen_world)
+    st = w["status"].get(sname)
+    if st is None:
+        return False
+    if st["state"] == "down-idle-stops":
+        for holder in st["stops"]:
+            if gen_jobs.flights_on_slot((await asyncio.to_thread(gen_jobs.load_jobs))["jobs"], holder):
+                return False  # busy now — the next tick picks it up once drained
+            try:
+                await asyncio.to_thread(_panel_do_checked, "gpu-stop", [holder], "gen-engine")
+            except HTTPException:
+                return False  # failed — the next tick retries
+    # a fresh world again: the stops (or an admin) may have moved the lane
+    w2 = await asyncio.to_thread(_gen_world)
+    row = w2["slots"].get(sname)
+    st2 = w2["status"].get(sname)
+    if row is None or st2 is None:
+        return False
+    return bool(row["running"] and row["ip"]) or st2["state"] == "down"
+
+
+# ── radiance calls (the slot's HTTP surface, bearer LLM_API_KEY) ──
+
+
+async def _gen_await_request(coro, jid: str) -> Any:
+    """Await a long radiance request, dropping it when the job is canceled or
+    deleted in the meantime (re-checked every GEN_CANCEL_POLL_S — the record
+    read hops to a thread, like the poll loops). The drop closes the connection, and
+    radiance treats an abnormally closed response as a cancel (the ticket's
+    flag), so the slot retires the render at its next pass boundary instead of
+    burning it out. Raises _JobCanceled on the drop; the request's own errors
+    propagate unchanged (the caller's terminal-sticky mark makes them no-ops
+    after a racing cancel).
+
+    NOT used for the video submit: the tail's poll loop DELETEs the radiance
+    side within GEN_VIDEO_POLL_S of a cancel — dropping the submit itself
+    would orphan a video radiance registered before the connection dropped
+    (its id would never be known). A canceled submit simply lands, records
+    its id, and the next poll tick retires it (its timeout carries the same
+    cold-load wait as the other budgets — it is quick once the entry is
+    resident)."""
+    task = asyncio.ensure_future(coro)
+    try:
+        while True:
+            await asyncio.wait({task}, timeout=GEN_CANCEL_POLL_S)
+            if task.done():
+                return task.result()
+            job = await asyncio.to_thread(gen_jobs.get_job, jid)
+            if job is None or job["state"] == gen_jobs.CANCELED:
+                break  # dropped below; the raise after the finally is the drop's exit
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await task  # let the connection teardown finish (no "destroyed pending" tasks)
+            except BaseException:  # noqa: B902 — the drop (or our own cancel) IS the point
+                pass
+        elif not task.cancelled():
+            task.exception()  # the done-with-error race: retrieve, so it isn't reported un-retrieved
+    raise _JobCanceled()
+
+
+async def _gen_enhance_call(base: str, model: str, user_prompt: str, instruction: str) -> str:
+    """One non-streaming chat completion against the enhance target (the
+    settings' instance + model — default: the writer's "writer" entry). The
+    per-gen-model ``instruction`` is the admin's enhancement prompt (Gen
+    settings); the result replaces the user prompt for the gen request."""
+    if not model:
+        raise _GenError("no enhance model configured (Gen settings)")
+    r = await _gen_http.post(
+        f"{base}/v1/chat/completions",
+        headers=_gen_auth(),
+        json={
+            "model": model,
+            "messages": [
+                {"role": "system", "content": instruction},
+                {"role": "user", "content": user_prompt},
+            ],
+        },
+        timeout=GEN_ENHANCE_TIMEOUT_S,
+    )
+    if r.status_code >= 400:
+        raise _GenError(f"enhancement failed: HTTP {r.status_code}: {r.text[:300]}")
+    try:
+        out = r.json()["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError, ValueError):
+        raise _GenError("enhancement: unexpected response shape") from None
+    if not out:
+        raise _GenError("enhancement: empty response")
+    return out
+
+
+async def _gen_image_call(base: str, job: dict[str, Any], final_prompt: str) -> bytes:
+    """The synchronous image POST — b64_json only (radiance refuses url)."""
+    body: dict[str, Any] = {
+        "model": job["model"],
+        "prompt": final_prompt,
+        "response_format": "b64_json",
+    }
+    if job["params"].get("size"):
+        body["size"] = job["params"]["size"]
+    if job["params"].get("seed") is not None:
+        body["seed"] = job["params"]["seed"]
+    r = await _gen_http.post(f"{base}/v1/images/generations", headers=_gen_auth(), json=body, timeout=1800.0)
+    if r.status_code >= 400:
+        raise _GenError(f"image generation failed: HTTP {r.status_code}: {r.text[:300]}")
+    try:
+        b64 = r.json()["data"][0]["b64_json"]
+    except (KeyError, IndexError, ValueError):
+        raise _GenError("image generation: unexpected response shape") from None
+    try:
+        return base64.b64decode(b64)
+    except Exception as e:  # noqa: BLE001
+        raise _GenError(f"image generation: bad b64 payload ({type(e).__name__})") from e
+
+
+async def _gen_video_submit(base: str, job: dict[str, Any], final_prompt: str) -> str:
+    body: dict[str, Any] = {"model": job["model"], "prompt": final_prompt}
+    p = job["params"]
+    if p.get("seconds") is not None:
+        body["seconds"] = str(p["seconds"])
+    if p.get("size"):
+        body["size"] = p["size"]
+    if p.get("seed") is not None:
+        body["seed"] = p["seed"]
+    r = await _gen_http.post(f"{base}/v1/videos", headers=_gen_auth(), json=body, timeout=GEN_VIDEO_SUBMIT_TIMEOUT_S)
+    if r.status_code >= 400:
+        raise _GenError(f"video submit failed: HTTP {r.status_code}: {r.text[:300]}")
+    try:
+        return r.json()["id"]
+    except (KeyError, ValueError):
+        raise _GenError("video submit: unexpected response shape") from None
+
+
+async def _gen_video_status(base: str, vid: str) -> dict[str, Any]:
+    r = await _gen_http.get(f"{base}/v1/videos/{vid}", headers=_gen_auth(), timeout=30.0)
+    if r.status_code >= 400:
+        why = "radiance lost the job (slot restarted?)" if r.status_code == 404 else f"HTTP {r.status_code}"
+        raise _GenError(f"video poll: {why}")
+    d = r.json()
+    return {"status": str(d.get("status", "unknown")), "progress": d.get("progress"), "error": d.get("error")}
+
+
+async def _gen_video_content(base: str, vid: str) -> tuple[bytes, Optional[bytes]]:
+    """(MP4, thumbnail) — the MP4 is required, the thumbnail best-effort
+    (a failed thumb never fails the job)."""
+    r = await _gen_http.get(f"{base}/v1/videos/{vid}/content", headers=_gen_auth(), timeout=1800.0)
+    if r.status_code >= 400:
+        raise _GenError(f"video download: HTTP {r.status_code}")
+    mp4 = r.content
+    thumb: Optional[bytes] = None
+    try:
+        t = await _gen_http.get(
+            f"{base}/v1/videos/{vid}/content?variant=thumbnail", headers=_gen_auth(), timeout=60.0
+        )
+        if t.status_code == 200:
+            thumb = t.content
+    except httpx.HTTPError:
+        pass
+    return mp4, thumb
+
+
+async def _gen_video_cancel(base: str, vid: str) -> None:
+    try:
+        await _gen_http.delete(f"{base}/v1/videos/{vid}", headers=_gen_auth(), timeout=30.0)
+    except httpx.HTTPError:
+        pass  # best effort — the slot may already be gone
+
+
+def _gen_write_artifact(job: dict[str, Any], data: bytes, thumb: Optional[bytes]) -> dict[str, Any]:
+    """Write under GEN_ARTIFACT_DIR (this host service's artifact dir, user
+    panel; the same dir is ro on panel-web at /gen — the UI's static URLs).
+    Sync (file IO) — callers await it via asyncio.to_thread. Files are pinned
+    0644: panel-web's nginx reads them as a NON-panel user, so the mode must
+    not ride panel's umask (a 077 umask would 403 every artifact in the UI)."""
+
+    def put(path: Path, payload: bytes) -> None:
+        path.write_bytes(payload)
+        path.chmod(0o644)
+
+    GEN_ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    if job["kind"] == "video":
+        put(GEN_ARTIFACT_DIR / f"{job['id']}.mp4", data)
+        art: dict[str, Any] = {"url": f"/gen/{job['id']}.mp4", "mime": "video/mp4", "size": len(data), "thumb": None}
+        if thumb:
+            put(GEN_ARTIFACT_DIR / f"{job['id']}-thumb.webp", thumb)
+            art["thumb"] = f"/gen/{job['id']}-thumb.webp"
+    else:
+        ext, mime = gen_jobs.sniff(data)
+        put(GEN_ARTIFACT_DIR / f"{job['id']}{ext}", data)
+        art = {"url": f"/gen/{job['id']}{ext}", "mime": mime, "size": len(data), "thumb": None}
+    return art
+
+
+def _gen_delete_artifacts(job: dict[str, Any]) -> None:
+    art = job.get("artifact") or {}
+    for key in ("url", "thumb"):
+        u = art.get(key)
+        if not u:
+            continue
+        try:
+            (GEN_ARTIFACT_DIR / u.rsplit("/", 1)[-1]).unlink()
+        except OSError:
+            pass
+
+
+# ── the job runner (one asyncio task per in-flight job) ──
+
+
+async def _gen_video_tail(jid: str, base: str, final_prompt: str) -> None:
+    """Submit (if not done) → poll → download → complete. Also the re-attach
+    path after a restart (radiance_video_id already set → straight to the
+    poll)."""
+    job = await asyncio.to_thread(gen_jobs.get_job, jid)
+    if job is None:
+        return
+    vid = job.get("radiance_video_id")
+    if not vid:
+        vid = await _gen_video_submit(base, job, final_prompt)
+        await _gen_mark(jid, radiance_video_id=vid)
+    while True:
+        job_now = await asyncio.to_thread(gen_jobs.get_job, jid)
+        if job_now is None or job_now["state"] == gen_jobs.CANCELED:
+            await _gen_video_cancel(base, vid)
+            return
+        try:
+            v = await _gen_video_status(base, vid)
+        except _GenError as e:
+            await _gen_mark(jid, state=gen_jobs.FAILED, error=str(e)[:500], finished_at=time.time())
+            return
+        except httpx.HTTPError as e:
+            # the slot itself died (connection refused/reset): the video lived
+            # in radiance's memory — it's gone, and the job says so plainly
+            await _gen_mark(
+                jid,
+                state=gen_jobs.FAILED,
+                error=f"lost the slot mid-render ({type(e).__name__}) — the video was lost",
+                finished_at=time.time(),
+            )
+            return
+        if v["status"] == "completed":
+            break
+        if v["status"] == "failed":
+            await _gen_mark(
+                jid,
+                state=gen_jobs.FAILED,
+                error=f"render failed: {v.get('error') or 'radiance reported failure'}"[:500],
+                finished_at=time.time(),
+            )
+            return
+        if isinstance(v["progress"], (int, float)):
+            await _gen_mark(jid, progress=v["progress"])
+        await asyncio.sleep(GEN_VIDEO_POLL_S)
+    try:
+        mp4, thumb = await _gen_await_request(_gen_video_content(base, vid), jid)
+    except _JobCanceled:
+        await _gen_video_cancel(base, vid)  # the render is done — retire it from radiance's store
+        return
+    job_now = await asyncio.to_thread(gen_jobs.get_job, jid)
+    if job_now is None or job_now["state"] == gen_jobs.CANCELED:
+        await _gen_video_cancel(base, vid)
+        return
+    art = await asyncio.to_thread(_gen_write_artifact, job_now, mp4, thumb)
+    await _gen_mark(jid, state=gen_jobs.COMPLETED, artifact=art, finished_at=time.time())
+
+
+async def _gen_enhance_phase(jid: str) -> None:
+    """One job's ENHANCEMENT — off-slot, on the settings' enhance target:
+    bring the target up if needed (part of this phase) → the rewrite → back
+    to QUEUED with enhanced_prompt set (the gen phase then claims its slot
+    in the next tick, in the job's own FIFO position). No slot is claimed or
+    started: the target is a different card, so the enhancement neither
+    waits for the lane nor holds one. A target lane condition (its card
+    held, docker down) or a settings drift re-queues with the reason (the
+    tick's structural check marks it again until fixed); a cancel while here
+    is already terminal (the marks below are no-ops)."""
+    try:
+        job = await asyncio.to_thread(gen_jobs.get_job, jid)
+        if job is None or job["state"] != gen_jobs.ENHANCING:
+            return
+        settings = await asyncio.to_thread(gen_jobs.load_settings)
+        instruction = (settings["enhance"].get("prompts") or {}).get(job["model"], "")
+        if not instruction:
+            # The door refuses it at create; this is a settings drift since
+            # the claim — re-queue (the tick's structural check marks the
+            # reason again until the prompt is back).
+            await asyncio.to_thread(
+                _gen_requeue, jid, f"no enhancement prompt configured for {job['model']!r} (Gen settings)"
+            )
+            return
+        w = await asyncio.to_thread(_gen_world)
+        et = w["enhance_target"]
+        if not et["ok"]:
+            # Structural (the target drifted out of the fleet since the
+            # claim) — re-queue with the reason; the tick's structural
+            # check marks it again until the settings are fixed.
+            await asyncio.to_thread(_gen_requeue, jid, f"enhance target unavailable: {et['reason']}")
+            return
+        if not (et["running"] and et["ip"]):
+            try:
+                await asyncio.to_thread(_gen_start_instance, et["instance"])
+            except RuntimeError as e:
+                # Its card is held / docker down — a lane condition, not a
+                # job fault: re-queue; the next tick retries.
+                await asyncio.to_thread(_gen_requeue, jid, f"waiting for the enhance target: {e}")
+                return
+        et_ip = await _gen_wait_instance_health(et["instance"], jid, GEN_SLOT_START_TIMEOUT_S)
+        j = await asyncio.to_thread(gen_jobs.get_job, jid)
+        if j is None or j["state"] in gen_jobs.TERMINAL_STATES:
+            return  # canceled while the target came up — nothing to send
+        if not et_ip:
+            return
+        final_prompt = await _gen_await_request(
+            _gen_enhance_call(f"http://{et_ip}:8000", et["model"], job["prompt"], instruction), jid
+        )
+
+        def _m(job2: dict[str, Any]) -> None:
+            if job2["state"] in gen_jobs.TERMINAL_STATES:
+                raise RuntimeError("terminal")
+            job2["state"] = gen_jobs.QUEUED
+            job2["slot"] = None  # the gen phase re-picks its slot
+            job2["enhanced_prompt"] = final_prompt
+            job2["error"] = None  # any wait reason (a re-queue, a structural mark) is stale now
+
+        try:
+            await asyncio.to_thread(gen_jobs.update_job, jid, _m)
+        except RuntimeError:
+            return  # went terminal (a racing cancel) — the prompt is moot
+    except _JobCanceled:
+        return  # the record is already canceled — the dropped call is the point
+    except _GenError as e:
+        await _gen_mark(jid, state=gen_jobs.FAILED, error=str(e)[:500], finished_at=time.time())
+    except Exception as e:  # noqa: BLE001 — a job failure, never a loop crash
+        await _gen_mark(jid, state=gen_jobs.FAILED, error=f"internal: {type(e).__name__}: {e}"[:500], finished_at=time.time())
+    finally:
+        _gen_tasks.pop(jid, None)
+
+
+async def _gen_run_job(jid: str, slot: str) -> None:
+    """One job's gen-phase flight on ``slot``: (re)start the slot if needed
+    → the gen request (with the enhanced prompt, if the enhance phase ran
+    it — that ran OFF-SLOT, on the settings' enhance target, BEFORE this
+    phase) → the artifact. State is durable (gen_jobs); a failure lands in
+    the record, never in this task's exit."""
+    try:
+        job = await asyncio.to_thread(gen_jobs.get_job, jid)
+        if job is None:
+            return
+        # 1. the slot up + healthy (it may have come up since the claim — an
+        #    admin start — in which case the start below is a no-op)
+        w = await asyncio.to_thread(_gen_world)
+        row = w["slots"].get(slot) or {}
+        if not (row.get("running") and row.get("ip")):
+            try:
+                await asyncio.to_thread(_gen_start_instance, slot)
+            except RuntimeError as e:
+                w = await asyncio.to_thread(_gen_world)
+                row = w["slots"].get(slot) or {}
+                if not (row.get("running") and row.get("ip")):
+                    # Start conflict (a card got held between the tick's claim
+                    # and this attempt, or the lane is short) — not a job
+                    # fault: re-queue it. The next tick re-evaluates through
+                    # the slot status (blocked → wait; idle holder → it gets
+                    # stopped; free → it starts). A transient docker failure
+                    # rides the same path and simply retries.
+                    await asyncio.to_thread(_gen_requeue, jid, f"waiting for the lane: {e}")
+                    return
+        base_ip = await _gen_wait_instance_health(slot, jid, GEN_SLOT_START_TIMEOUT_S)
+        if (j := await asyncio.to_thread(gen_jobs.get_job, jid)) is None or j["state"] in gen_jobs.TERMINAL_STATES:
+            return  # canceled while the slot came up — no request to send
+        if not base_ip:
+            return
+        base = f"http://{base_ip}:8000"
+        await _gen_mark(jid, error=None)  # a re-queue's wait reason is stale now
+        # 2. the prompt — the enhanced one, if the enhance phase ran it
+        #    (off-slot, on the settings' enhance target, BEFORE this phase:
+        #    a different card, so neither phase waited on the other).
+        final_prompt = job.get("enhanced_prompt") or job["prompt"]
+        # 3. gen-phase admission (the per-slot cap on the GEN PHASE — a
+        #    second gen flight on the same slot is admitted and gens in
+        #    parallel; radiance sequences the model's work)
+        while True:
+            j = await asyncio.to_thread(gen_jobs.get_job, jid)
+            if j is None or j["state"] == gen_jobs.CANCELED:
+                return
+            ok, _why = gen_jobs.admission((await asyncio.to_thread(gen_jobs.load_jobs))["jobs"], slot, jid)
+            if ok:
+                break
+            if j["state"] != gen_jobs.LOADING:
+                await _gen_mark(jid, state=gen_jobs.LOADING)
+            await asyncio.sleep(2.0)
+        _started = (await asyncio.to_thread(gen_jobs.get_job, jid) or {}).get("started_at")
+        await _gen_mark(jid, state=gen_jobs.RUNNING, started_at=_started or time.time())
+        # 4. the request + the artifact
+        if job["kind"] == "image":
+            try:
+                data = await _gen_await_request(_gen_image_call(base, job, final_prompt), jid)
+            except httpx.HTTPError as e:
+                # the slot itself died (connection refused/reset): the image
+                # lived in radiance's memory — it's gone, and the job says so
+                # plainly (the video tail's poll has its own copy of this)
+                raise _GenError(f"lost the slot mid-render ({type(e).__name__}) — the image was lost") from e
+            if (j := await asyncio.to_thread(gen_jobs.get_job, jid)) is None or j["state"] == gen_jobs.CANCELED:
+                return
+            art = await asyncio.to_thread(_gen_write_artifact, j, data, None)
+            await _gen_mark(jid, state=gen_jobs.COMPLETED, artifact=art, finished_at=time.time())
+        else:
+            await _gen_video_tail(jid, base, final_prompt)
+    except _JobCanceled:
+        return  # the record is already canceled — nothing to mark, no artifact to drop
+    except _GenError as e:
+        await _gen_mark(jid, state=gen_jobs.FAILED, error=str(e)[:500], finished_at=time.time())
+    except Exception as e:  # noqa: BLE001 — a job failure, never a loop crash
+        await _gen_mark(jid, state=gen_jobs.FAILED, error=f"internal: {type(e).__name__}: {e}"[:500], finished_at=time.time())
+    finally:
+        _gen_tasks.pop(jid, None)
+
+
+async def _gen_resume_video(jid: str) -> None:
+    """Re-attach to a video poll after a panel restart (radiance kept the
+    job — its id is in the record). The slot must still be up: if it went
+    down, the in-memory video is gone and the job says so."""
+    try:
+        job = await asyncio.to_thread(gen_jobs.get_job, jid)
+        if job is None or not job.get("radiance_video_id"):
+            return
+        slot = job.get("slot") or ""
+        w = await asyncio.to_thread(_gen_world)
+        row = w["slots"].get(slot) or {}
+        if not (row.get("running") and row.get("ip")):
+            await _gen_mark(
+                jid,
+                state=gen_jobs.FAILED,
+                error="panel-api restarted and the slot is down — the in-progress video was lost",
+                finished_at=time.time(),
+            )
+            return
+        await _gen_video_tail(jid, f"http://{row['ip']}:8000", job.get("enhanced_prompt") or job["prompt"])
+    except Exception as e:  # noqa: BLE001
+        await _gen_mark(jid, state=gen_jobs.FAILED, error=f"internal: {type(e).__name__}: {e}"[:500], finished_at=time.time())
+    finally:
+        _gen_tasks.pop(jid, None)
+
+
+# ── the engine (the single scheduler) ──
+
+
+async def _gen_tick() -> None:
+    w = await asyncio.to_thread(_gen_world)
+    slots, status = w["slots"], w["status"]
+    # 1. re-attach orphaned video polls (a restart kept the jobs; radiance
+    #    kept the videos)
+    for jid, job in w["jobs"].items():
+        if job.get("state") == gen_jobs.RUNNING and job.get("radiance_video_id") and jid not in _gen_tasks:
+            _gen_tasks[jid] = asyncio.create_task(_gen_resume_video(jid))
+    # 2. claim queued jobs (FIFO — the order list is oldest first). The
+    # state view is reloaded PER JOB: a claim made earlier in this tick must
+    # be visible to the next job's admission check, or a cap would be
+    # over-admitted within one tick. Two phases per job: the enhancement
+    # first (off-slot, the global enhance cap — no slot claimed or started;
+    # a different card, so the gen lane neither waits for it nor blocks
+    # it), then the gen phase (the slot's gen-phase cap).
+    prompts = (await asyncio.to_thread(gen_jobs.load_settings))["enhance"].get("prompts") or {}
+    for jid in w["store"]["order"]:
+        jobs = (await asyncio.to_thread(gen_jobs.load_jobs))["jobs"]
+        job = jobs.get(jid)
+        if not job or job["state"] != gen_jobs.QUEUED or jid in _gen_tasks:
+            continue
+        # PHASE 1 — the enhancement (off-slot, before any slot is claimed or
+        # started). A job that can't be enhanced right now (target broken,
+        # or its prompt cleared) can't run at all — claiming it would just
+        # re-queue in a flap: mark the structural reason up front and wait
+        # for the settings.
+        if job["enhance"] and not job.get("enhanced_prompt"):
+            et = w["enhance_target"]
+            reason = None
+            if not et["ok"]:
+                reason = (
+                    f"the enhance target is unavailable: {et['reason'] or 'unknown'} "
+                    f"(fix the enhance target in Gen settings, or queue the job without enhance)"
+                )
+            elif not prompts.get(job["model"]):
+                reason = (
+                    f"no enhancement prompt configured for {job['model']!r} "
+                    f"(Gen settings — set it, or queue the job without enhance)"
+                )
+            else:
+                ok, _why = gen_jobs.enhance_admission(jobs)
+                if not ok:
+                    continue  # the target is at its cap — the normal queue
+                if (await asyncio.to_thread(gen_jobs.claim_enhance, jid)) is not None:
+                    _gen_tasks[jid] = asyncio.create_task(_gen_enhance_phase(jid))
+                continue  # claimed — or lost the claim (canceled in the window)
+            _r = reason
+
+            def _m(j, _r=_r):
+                if j.get("state") == gen_jobs.QUEUED:
+                    j["error"] = _r
+
+            await asyncio.to_thread(gen_jobs.update_job, jid, _m)
+            continue
+        # PHASE 2 — the gen phase (the per-slot gen-phase cap).
+        for sname, _why in gen_jobs.job_candidates(jobs, slots, job["model"]):
+            srow = slots[sname]
+            ok, _why = gen_jobs.admission(jobs, sname, jid)
+            if not ok:
+                continue
+            st = status[sname]
+            if not (srow["running"] and srow["ip"]):
+                if st["state"] not in ("down", "down-idle-stops"):
+                    continue  # blocked by something the engine must not touch
+                if st["state"] == "down-idle-stops" and not await _gen_free_slot(sname):
+                    continue  # a stop failed or the world moved — next tick
+                ok, _why = gen_jobs.admission((await asyncio.to_thread(gen_jobs.load_jobs))["jobs"], sname, jid)
+                if not ok:
+                    continue  # a stop freed nothing the admission wanted
+            claimed = await asyncio.to_thread(gen_jobs.claim_job, jid, sname, gen_jobs.STARTING, True)
+            if claimed is None:
+                continue  # lost the claim (canceled between load and claim)
+            _gen_tasks[jid] = asyncio.create_task(_gen_run_job(jid, sname))
+            break
+        else:
+            # no candidate admitted it this tick. The transient reasons (the
+            # gen-phase cap, a blocked lane, a stop that didn't land) are the
+            # normal queue — no say-so. The structural one (a config drift
+            # since the job was queued: its model is no longer hosted) would
+            # otherwise wait forever in silence: mark it on the record's
+            # error column (queued-only — a cancel that landed in the window
+            # wins; a later claim clears the error on progress). The enhance
+            # target's structural reasons are marked up front in the enhance
+            # branch above — a pending-enhance job never gets here.
+            reason = gen_jobs.queue_wait_reason(job, slots)
+            if reason:
+                def _m(j, _r=reason):
+                    if j.get("state") == gen_jobs.QUEUED:
+                        j["error"] = _r
+
+                await asyncio.to_thread(gen_jobs.update_job, jid, _m)
+
+
+async def _gen_engine_loop() -> None:
+    """~2 s tick + the age-GC. Never dies — a bad tick is logged, not raised
+    (a dead engine wedges every queued job)."""
+    global _gen_gc_at, _gen_dev_logged
+    while True:
+        await asyncio.sleep(2.0)
+        if DEV_MODE:
+            if not _gen_dev_logged:
+                _gen_dev_logged = True
+                print(
+                    "gen engine: disabled (PANEL_DEV=1 — no panel-do): endpoints + state files work, jobs stay queued",
+                    flush=True,
+                )
+            continue
+        try:
+            # Idle fast-path: a tick builds the fleet world (two panel-do
+            # spawns) — with the queue empty and nothing in flight there is
+            # nothing to claim or re-attach, so a local state-file read skips
+            # the tick. In-flight counts even with an empty queue: the
+            # re-attach pass (a restart's orphans) runs only in a tick.
+            # Deliberately NOT a `continue` — the age-GC below runs on idle
+            # ticks too: a drained queue is exactly when stale artifacts
+            # would otherwise sit un-GC'd until the next job (or forever
+            # once gen goes unused).
+            if gen_jobs.has_work((await asyncio.to_thread(gen_jobs.load_jobs))["jobs"]):
+                await _gen_tick()
+        except Exception as e:  # noqa: BLE001
+            print(f"gen engine tick failed: {type(e).__name__}: {e}", flush=True)
+        now = time.monotonic()
+        if now >= _gen_gc_at:
+            _gen_gc_at = now + GEN_GC_INTERVAL_S
+            try:
+                days = (await asyncio.to_thread(gen_jobs.load_settings))["gc_days"]
+                # Artifacts of jobs still in the store are KEPT: a record the
+                # UI still shows must not point at a deleted file — those go
+                # when the record is trimmed (the count cap) or deleted.
+                keep = frozenset((await asyncio.to_thread(gen_jobs.load_jobs))["jobs"])
+                removed = await asyncio.to_thread(gen_jobs.gc_old_artifacts, GEN_ARTIFACT_DIR, days, keep)
+                if removed:
+                    _audit(None, "gen-gc", [f"{len(removed)} file(s) older than {days}d"], 0, " ".join(removed)[:200])
+            except Exception as e:  # noqa: BLE001
+                print(f"gen artifact GC failed: {type(e).__name__}: {e}", flush=True)
+
+
+# ── endpoints (admin-gated like the rest of the panel) ──
+
+
+class GenJobBody(BaseModel):
+    model: str  # a purpose key ("image"/"video") or an exact model name
+    prompt: str
+    enhance: Optional[bool] = None  # None → the settings' global toggle
+    params: dict[str, Any] = {}  # image: size, seed · video: seconds, size, seed
+
+
+def _gen_validate_params(kind: str, params: dict[str, Any]) -> dict[str, Any]:
+    """Param SHAPE checks only — radiance is the authority on what the model
+    takes (its 400, e.g. an out-of-range seconds, lands in the job record).
+    Malformed values are refused HERE, at submission, because a job that can
+    never be valid would still cost a slot start the user didn't expect."""
+    out: dict[str, Any] = {}
+    allowed = {"size", "seed"} if kind == "image" else {"seconds", "size", "seed"}
+    for k, v in (params or {}).items():
+        if k not in allowed:
+            raise HTTPException(
+                400, f"params.{k}: not a field for a {kind} job (allowed: {', '.join(sorted(allowed))})"
+            )
+        if k == "size":
+            if not isinstance(v, str) or not gen_jobs.SIZE_RE.match(v):
+                raise HTTPException(400, 'params.size: want "WIDTHxHEIGHT" like 1344x768')
+            out["size"] = v
+        elif k == "seed":
+            if not isinstance(v, int) or isinstance(v, bool) or v < -1:
+                raise HTTPException(400, "params.seed: want an integer ≥ -1 (-1 = random)")
+            out["seed"] = v
+        elif k == "seconds":
+            # Shape only (a positive number) — the model's own range (its
+            # chunks) is radiance's: its 400 "between X and Y seconds" is the
+            # failure the job records.
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not float(v) > 0:
+                raise HTTPException(400, "params.seconds: want a positive number of seconds")
+            out["seconds"] = float(v)
+    return out
+
+
+@app.get("/api/gen")
+def gen_overview(_admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
+    w = _gen_world()
+    settings = gen_jobs.load_settings()
+    queued = [w["jobs"][i] for i in w["store"]["order"] if i in w["jobs"] and w["jobs"][i]["state"] == gen_jobs.QUEUED]
+    recent = [w["jobs"][i] for i in reversed(w["store"]["order"]) if i in w["jobs"]][:30]
+    return {
+        "slots": [{**row, "status": w["status"][row["name"]]} for row in sorted(w["slots"].values(), key=lambda r: r["name"])],
+        # the whole fleet (the settings' enhance-target picks an instance +
+        # one of its llm models from here)
+        "instances": [row for row in w["instances"].values() if row["llms"]],
+        "enhance_target": w["enhance_target"],
+        "queue": queued,
+        "jobs": recent,
+        "models": gen_jobs.known_models(w["slots"]),
+        "purposes": settings["purposes"],
+        "enhance": settings["enhance"],
+        "gc_days": settings["gc_days"],
+    }
+
+
+@app.post("/api/gen/jobs", status_code=201)
+def gen_job_create(body: GenJobBody, _admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
+    prompt = (body.prompt or "").strip()
+    if not prompt:
+        raise HTTPException(400, "prompt is required")
+    # No length cap: the per-model token cap is radiance's, and its
+    # submit-time 400 is the "too big" mark the job records.
+    w = _gen_world()
+    slots = w["slots"]
+    settings = gen_jobs.load_settings()
+    try:
+        model, kind = gen_jobs.resolve_model(body.model, settings, slots)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    enhance = body.enhance if body.enhance is not None else settings["enhance"]["enabled"]
+    if enhance and not (settings["enhance"].get("prompts") or {}).get(model, ""):
+        if body.enhance is True:
+            raise HTTPException(400, f"enhancement on but no prompt configured for {model!r} (Gen settings)")
+        enhance = False  # the settings' default is on, no prompt: skip (the plan's rule)
+    et = w["enhance_target"]
+    if enhance and not et["ok"]:
+        raise HTTPException(400, et["reason"])
+    params = _gen_validate_params(kind, body.params)
+    with gen_jobs.gen_lock():
+        job = gen_jobs.create_job(model, kind, prompt, enhance, params, _admin)
+    _audit(_admin, "gen-job-create", [job["id"], model, kind], 0)
+    return job
+
+
+@app.get("/api/gen/jobs")
+def gen_jobs_list(limit: int = 50, _admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
+    store = gen_jobs.load_jobs()
+    limit = max(1, min(limit, 200))
+    out = [store["jobs"][i] for i in reversed(store["order"]) if i in store["jobs"]][:limit]
+    return {"jobs": out}
+
+
+@app.get("/api/gen/jobs/{jid}")
+def gen_job_get(jid: str, _admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
+    job = gen_jobs.get_job(jid)
+    if not job:
+        raise HTTPException(404, "no such job")
+    return job
+
+
+@app.delete("/api/gen/jobs/{jid}")
+def gen_job_delete(jid: str, _admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
+    job = gen_jobs.get_job(jid)
+    if not job:
+        raise HTTPException(404, "no such job")
+    if job["state"] in gen_jobs.CANCELLABLE_STATES:
+        # Queued or in flight: mark canceled — the task (when one exists)
+        # checks the state at every checkpoint (≤5 s between poll ticks) and
+        # cancels the radiance video when it holds an id; a queued job has no
+        # task — the mark is the whole cancel. Either way the record stays
+        # (history) until deleted.
+        # The check lives INSIDE the mutation (one critical section): a
+        # terminal transition (a finish, or a first cancel) that lands between
+        # the read above and this mark wins — the job is simply done (its
+        # artifact, if any, stands) and the UI's re-poll shows it; a raw
+        # overwrite would turn a completed job into a canceled one. A
+        # re-queue in that window does NOT drop the cancel — queued is still
+        # cancellable, so the mark applies.
+        def _m(j: dict[str, Any]) -> None:
+            if j["state"] in gen_jobs.TERMINAL_STATES:
+                raise RuntimeError(f"{jid} is {j['state']}, terminal")
+            j.update({"state": gen_jobs.CANCELED, "error": "canceled", "finished_at": time.time()})
+
+        try:
+            gen_jobs.update_job(jid, _m)
+        except RuntimeError:
+            return {"ok": True}  # went terminal while canceling — nothing to cancel
+        _audit(_admin, "gen-job-cancel", [jid], 0)
+    else:
+        # Terminal: delete the record + its artifact files (the GC would take
+        # them by age anyway; this is the "clear from history" path).
+        gen_jobs.remove_job(jid)
+        _gen_delete_artifacts(job)
+        _audit(_admin, "gen-job-delete", [jid], 0)
+    return {"ok": True}
+
+
+@app.get("/api/gen/jobs/{jid}/content")
+def gen_job_content(jid: str, _admin: Optional[str] = Depends(require_admin)):
+    """The artifact bytes (image or video — one endpoint, as settled). V2
+    re-exposes this under /machine/gen/* behind the bearer key. Served inline
+    (no Content-Disposition): the UI displays via the /gen/ static twin, and
+    a machine consumer takes the bytes regardless of the header."""
+    job = gen_jobs.get_job(jid)
+    if not job or not job.get("artifact"):
+        raise HTTPException(404, "no artifact for this job")
+    name = job["artifact"]["url"].rsplit("/", 1)[-1]
+    path = GEN_ARTIFACT_DIR / name
+    if not path.is_file():
+        raise HTTPException(410, "artifact removed (GC)")
+    return FileResponse(path, media_type=job["artifact"].get("mime") or "application/octet-stream")
+
+
+class GenSettingsBody(BaseModel):
+    purposes: dict[str, str] = {}
+    enhance: dict[str, Any] = {}
+    gc_days: int = 14
+
+
+@app.get("/api/gen/settings")
+def gen_settings_get(_admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
+    w = _gen_world()
+    return {"settings": gen_jobs.load_settings(), "models": gen_jobs.known_models(w["slots"])}
+
+
+@app.put("/api/gen/settings")
+def gen_settings_put(body: GenSettingsBody, _admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
+    w = _gen_world()
+    clean, errors = gen_jobs.validate_settings(body.model_dump(), w["slots"], w["instances"])
+    if errors:
+        raise HTTPException(400, "; ".join(errors[:5]))
+    with gen_jobs.gen_lock():
+        gen_jobs.save_settings(clean)
+    _audit(_admin, "gen-settings-put", [json.dumps(clean, sort_keys=True)[:200]], 0)
+    return {"settings": clean}

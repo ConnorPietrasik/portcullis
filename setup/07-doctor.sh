@@ -139,13 +139,36 @@ fi
 # The gpu.cards label is the GPU pool's ONLY source of the instance's card
 # need (radiance 2.x: no --tp left in the command to fall back to) — a
 # missing label is checked here, not left to panel-do's runtime error.
+# gpu.private=true marks a fleet instance WITHOUT a public host (gen slots):
+# no router pair, no fleet-open host — reachable only via the edge network
+# (panel-api talks to it by container IP, like the LLM router). The flag
+# asserts no-host BOTH ways: a router on a private service is drift.
 fleet_routes() { # <compose.yml> <gpu.yml> <label>
-  local comp="$1" routes="$2" label="$3" svc sub orph cards cfg tp
-  local -a svcs
+  local comp="$1" routes="$2" label="$3" svc sub orph cards cfg tp priv block
+  local -a svcs=() priv_svs=()
   mapfile -t svcs < <(grep -oE '^  gpu-[a-z0-9][a-z0-9-]*:' "$comp" | sed 's/^  //; s/:$//' | sort -u)
   for svc in "${svcs[@]}"; do
     sub="${svc#gpu-}"
-    if ! grep -q "^    ${svc}:" "$routes"; then
+    # The block's own lines: from its key to the next top-level service.
+    block="$(awk -v start="  ${svc}:" 'index($0, start) == 1 {f=1; next} f && /^  [a-z0-9]/ {f=0} f' "$comp")"
+    # gpu.private=true — the no-host class; read BEFORE the router check,
+    # because it decides what "correct" looks like for this service. Anchored
+    # to the label-line form (- gpu.private=true...), like the gen-slot check
+    # below: a comment mentioning the flag in prose (the gen section header,
+    # which sits INSIDE the previous service's block) must not classify it.
+    priv=""
+    if grep -qE '^[[:space:]]*- gpu\.private=true([[:space:]]|$)' <<<"$block"; then
+      priv=1
+      priv_svs+=("$svc")
+    fi
+    if [[ -n $priv ]]; then
+      if grep -q "^    ${svc}:" "$routes"; then
+        bad "$label: $svc is gpu.private but has a router entry in gpu.yml"
+        hint "private instances have no public host — remove the router + service pair (one block each)"
+      else
+        ok "$label: $svc is private (no router, no fleet-open host — by design)"
+      fi
+    elif ! grep -q "^    ${svc}:" "$routes"; then
       bad "$label: $svc (compose) has no router entry in gpu.yml"
       hint "the container would run but ${sub}.pietrasik.top would 404 — add the router + service pair (one block each)"
     elif ! grep -qF "Host(\`${sub}.pietrasik.top\`)" "$routes"; then
@@ -157,9 +180,6 @@ fleet_routes() { # <compose.yml> <gpu.yml> <label>
     else
       ok "$label: $svc ↔ ${sub}.pietrasik.top (router + Host + url)"
     fi
-    # The block's own lines: from its key to the next top-level service.
-    local block
-    block="$(awk -v start="  ${svc}:" 'index($0, start) == 1 {f=1; next} f && /^  [a-z0-9]/ {f=0} f' "$comp")"
     # gpu.cards — the pool's card-need source (panel-do gpu-fleet errors
     # without it, taking the whole GPUs view red with it).
     cards="$(printf '%s\n' "$block" | grep -oE 'gpu\.cards=[0-9]+' | head -n1 | cut -d= -f2)"
@@ -197,7 +217,8 @@ fleet_routes() { # <compose.yml> <gpu.yml> <label>
   # The fleet-open list — the one copy of instance names that is not a
   # router/service pair: the shared key-bootstrap router routes to the
   # panel-api service (no compose service to pair), but its host list must
-  # still name EVERY instance. A missing host leaves that instance's
+  # still name EVERY public instance (private ones have no host to name). A
+  # missing host leaves that instance's
   # dashboard link dead: /open falls through to the instance's bare-Host
   # router (no forward-auth there), and radiance's API-key gate — which
   # covers every path but GET / /health /dashboard /ping — answers the
@@ -205,7 +226,7 @@ fleet_routes() { # <compose.yml> <gpu.yml> <label>
   # IS the page the user sees. A stale host is harmless clutter (warn
   # only). Empty fleet → nothing to compare.
   if (( ${#svcs[@]} )); then
-    local open_hosts inst_hosts missing stale add h badhost
+    local open_hosts inst_hosts missing stale stale_priv stale_pub add h badhost
     # Syntax canary: Traefik v3's Host() takes ONE value. The v2 multi-value
     # form is a rule parse error — and traefik SWALLOWS it (logs the error,
     # drops just that router, keeps serving the rest of the file): the
@@ -219,8 +240,23 @@ fleet_routes() { # <compose.yml> <gpu.yml> <label>
     open_hosts="$(awk '/^  routers:/{f=1;next} f && /^  [a-z]/{f=0} f && /^    fleet-open:$/{g=1;next} f && g && /^    [a-z]/{g=0;next} f && g{print}' "$routes" \
       | sed 's/#.*$//' \
       | { grep -oE 'Host\([^)]*\)' || true; } | { grep -oE '`[^`]+`' || true; } | tr -d '`' | LC_ALL=C sort -u)"
-    inst_hosts="$(for svc in "${svcs[@]}"; do printf '%s\n' "${svc#gpu-}.pietrasik.top"; done | LC_ALL=C sort -u)"
-    if [[ -z $open_hosts ]]; then
+    # Private instances have no host: exempt them from the fleet-open set.
+    local all_hosts priv_hosts
+    all_hosts="$(for svc in "${svcs[@]}"; do printf '%s\n' "${svc#gpu-}.pietrasik.top"; done | LC_ALL=C sort -u)"
+    if (( ${#priv_svs[@]} )); then
+      priv_hosts="$(for svc in "${priv_svs[@]}"; do printf '%s\n' "${svc#gpu-}.pietrasik.top"; done | LC_ALL=C sort -u)"
+      inst_hosts="$(LC_ALL=C comm -23 <(printf '%s\n' "$all_hosts") <(printf '%s\n' "$priv_hosts"))"
+    else
+      inst_hosts="$all_hosts"
+    fi
+    if [[ -z $inst_hosts ]]; then
+      # Fleet is all private: the fleet-open list must be empty.
+      if [[ -n $open_hosts ]]; then
+        warn "$label: fleet-open rule lists $(tr '\n' ' ' <<<"$open_hosts" | sed 's/ *$//') but every instance is private — trim the list"
+      else
+        ok "$label: no public instance hosts (fleet all private) — fleet-open list empty"
+      fi
+    elif [[ -z $open_hosts ]]; then
       bad "$label: no hosts parseable from the fleet-open rule in gpu.yml — every dashboard link 401s 'invalid api key'"
       hint "restore the fleet-open router block (key bootstrap → panel-api; see its comment in gpu.yml)"
     else
@@ -235,8 +271,18 @@ fleet_routes() { # <compose.yml> <gpu.yml> <label>
         bad "$label: fleet-open rule missing $(tr '\n' ' ' <<<"$missing" | sed 's/ *$//') — its dashboard link(s) 401 'invalid api key'"
         hint "add ${add} to the fleet-open rule (between the parens): gpu.yml → fleet-open → rule"
       fi
-      [[ -n $stale ]] && warn "$label: fleet-open rule lists $(tr '\n' ' ' <<<"$stale" | sed 's/ *$//') with no compose service (instance deleted?) — trim the list"
-      [[ -z $missing && -z $stale ]] && ok "$label: fleet-open Host() list ↔ ${#svcs[@]} instance host(s)"
+      # A stale host of a PRIVATE instance is a different drift than a
+      # deleted one: the service exists — it simply has no host by design.
+      if [[ -n $stale && -n ${priv_hosts:-} ]]; then
+        stale_priv="$(LC_ALL=C comm -12 <(printf '%s\n' "$stale") <(printf '%s\n' "$priv_hosts"))"
+        stale_pub="$(LC_ALL=C comm -23 <(printf '%s\n' "$stale") <(printf '%s\n' "$priv_hosts"))"
+      else
+        stale_priv=""
+        stale_pub="$stale"
+      fi
+      [[ -n $stale_priv ]] && warn "$label: fleet-open rule lists private instance host(s) $(tr '\n' ' ' <<<"$stale_priv" | sed 's/ *$//') — private instances have no host by design; trim the list"
+      [[ -n $stale_pub ]] && warn "$label: fleet-open rule lists $(tr '\n' ' ' <<<"$stale_pub" | sed 's/ *$//') with no compose service (instance deleted?) — trim the list"
+      [[ -z $missing && -z $stale ]] && ok "$label: fleet-open Host() list ↔ $(grep -c . <<<"$inst_hosts") public instance host(s)"
     fi
   fi
   return 0
@@ -813,6 +859,61 @@ if systemctl is-enabled --quiet gpu-autostart 2>/dev/null; then
   ok "gpu-autostart.service enabled (fleet boot autostart)"
 else
   warn "gpu-autostart.service not enabled — the fleet won't auto-start on boot"; hint "make api (installs + enables it)"
+fi
+# Gen section state (job queue + settings: the same 0600-panel-owned pattern
+# as the GPU ledger; missing files are legal — panel-api reads defaults and
+# creates them on first write).
+for f in gen-jobs.json gen-settings.json; do
+  if [[ -f "/opt/panel-api/$f" ]]; then
+    m="$(stat -c %a "/opt/panel-api/$f" 2>/dev/null || true)"
+    if [[ "$m" == 600 ]]; then ok "$f (gen state) mode 600"
+    else warn "$f mode ${m:-unreadable} (want 600)"; hint "sudo chown panel:panel && sudo chmod 600 /opt/panel-api/$f"; fi
+  else
+    skip "$f absent (panel-api creates it on first write — defaults until then)"
+  fi
+done
+# Gen artifacts: the rw dir panel-api writes into, ro-served by panel-web at
+# /gen. Ownership panel (the writer) — docker auto-creates a missing bind
+# source as root:root, which would silently break every job's artifact write.
+if [[ ! -d /models ]]; then
+  skip "gen artifacts (/models/gen-output — /models absent: GPU fleet phase pending)"
+elif [[ ! -d /models/gen-output ]]; then
+  bad "/models/gen-output missing"; hint "make api (creates it panel-owned 755) — until then docker auto-creates it root-owned on the next panel-web start"
+else
+  go_owner="$(stat -c %U /models/gen-output 2>/dev/null || true)"
+  go_mode="$(stat -c %a /models/gen-output 2>/dev/null || true)"
+  if [[ "$go_owner" == panel ]]; then
+    ok "/models/gen-output panel-owned (mode $go_mode)"
+  else
+    bad "/models/gen-output owned by ${go_owner:-?} (panel-api can't write artifacts)"; hint "sudo chown panel:panel /models/gen-output && sudo chmod 755 (make api does both)"
+  fi
+fi
+# The gen slots: gpu.private instances whose radiance config actually hosts an
+# image/video model (that IS the slot — panel-api discovers slots from the
+# configs, so a private instance without gen models is a dead slot). Read from
+# the deployed copy (the running truth); skipped before the GPU fleet phase.
+if [[ -f /opt/panel/docker-compose.yml ]]; then
+  # last-seen gpu-* service line + a LABEL-line gpu.private=true inside its
+  # block (anchored: the header comment mentions the flag in prose)
+  gen_svcs="$(awk '/^  gpu-[a-z0-9][a-z0-9-]*:$/{svc=$0} $0 ~ /^[[:space:]]*- gpu\.private=true([[:space:]]|$)/{gsub(/^  |:$/, "", svc); print svc}' /opt/panel/docker-compose.yml)" || true
+  if [[ -z $gen_svcs ]]; then
+    skip "gen slots (none deployed yet — GPU fleet phase)"
+  else
+    while IFS= read -r gs; do
+      cfg="/opt/panel/gpu-configs/${gs}.yaml"
+      if [[ ! -f $cfg ]]; then
+        bad "gen slot $gs: config ${cfg##*/} missing"; continue
+      fi
+      # Anchored to the active line: a COMMENTED-OUT gen model must not pass
+      # (the engine's parser strips comments — such a config is not a slot,
+      # and a doctor pass here would hide that drift).
+      if grep -qE '^[[:space:]]*model:[[:space:]]+/models/(image|video)/' "$cfg"; then
+        ok "gen slot $gs hosts image/video models"
+      else
+        bad "gen slot $gs is gpu.private but its config hosts no image/video model — panel-api would never see it"; hint "a slot needs ≥1 model under /models/image/ or /models/video/ (see compose/gpu-configs/ in the repo)"
+      fi
+    done <<<"$gen_svcs"
+  fi
 fi
 code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://172.17.0.1:8010/api/metrics 2>/dev/null)"
 if [[ "$code" == 401 ]]; then

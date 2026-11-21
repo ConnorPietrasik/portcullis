@@ -200,9 +200,17 @@ export function Pill({ tone = 'muted', children, title }: { tone?: Tone; childre
 }
 
 /** Tiny monospace tag: a PCI id, a mount, a device name. Reads as metadata. */
-export function Chip({ children, title }: { children: ReactNode; title?: string }) {
+export function Chip({
+  children,
+  title,
+  className,
+}: {
+  children: ReactNode
+  title?: string
+  className?: string
+}) {
   return (
-    <span className="chip" title={title}>
+    <span className={`chip${className ? ` ${className}` : ''}`} title={title}>
       {children}
     </span>
   )

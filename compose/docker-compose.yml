@@ -61,11 +61,11 @@ x-gpu-base: &gpu-base
   # (radiance --config FILE; the key reference is `radiance --help`, upstream
   # docs/MULTIMODEL.md §4). Each block mounts its own
   # compose/gpu-configs/<instance>.yaml — and YAML <<: merges SHALLOW, so a
-  # block's volumes list REPLACES this one: every block re-lists the /models
-  # mount below (the same trap as labels).
+  # block's volumes list REPLACES this one: every block re-lists its
+  # class-dir mount below (the same trap as labels).
   command: ["--config", "/etc/radiance/radiance.yaml"]
   volumes:
-    - /models/llm:/models:ro
+    - /models/llm:/models/llm:ro
     # only if a model needs a CUSTOM chat template (rare — the .rad carries
     # its own): mount the .jinja in the block and set override-chat-template
     # in that instance's radiance config
@@ -139,6 +139,13 @@ services:
       test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/"]
     labels: ["panel.manage=true", "panel.category=Panel"] # routed via traefik/dynamic/panel.yml
     networks: [edge]
+    volumes:
+      # Gen artifacts (image/video outputs): panel-api (a host service, user
+      # panel) writes them into /models/gen-output; the UI serves them
+      # statically at /gen/* (ro — the web container never writes). A missing
+      # host dir is auto-created by docker as root:root — `make api` / the
+      # doctor's gen check goes red until ownership is fixed.
+      - /models/gen-output:/gen:ro
 
   # Public portfolio site (bare domain — Authelia bypass rule for pietrasik.top
   # already lives in configuration.yml). Placeholder page for now; replace
@@ -167,12 +174,17 @@ services:
   # grab sizes off it. The display name (panel.manage) has no card set in it
   # (the set moves — and no commas: docker ps encodes labels comma-joined).
   # restart "no" so a reboot never resurrects the set you chose; the boot
-  # autostart list (GPU view) is what comes back. Model files:
-  # /models/llm/*.rad (ro-mounted at /models; dir name predates the llm-* →
-  # gpu-* rename and now holds every fleet model). New instance (including a
-  # second copy of a model, e.g. gpu-27b-1): copy the block + the router pair
-  # (RUNBOOK → GPU fleet; make doctor checks all six name references match),
-  # make update, then assign cards in the GPU view.
+  # autostart list (GPU view) is what comes back. Model files by class:
+  # /models/llm/ (chat LLMs), /models/image/ + /models/video/ (gen models —
+  # mounted only by the gen slots below). Every block ro-mounts its class
+  # dir AT that subpath: the gen section's config parser takes the model's
+  # kind from the 2nd path component (/models/{llm,image,video}/...), so the
+  # mount target is the class subdir, not the bare /models — an instance's
+  # llm entries are discoverable (e.g. as Gen enhance targets) only that way.
+  # New instance (including a second copy of a model, e.g. gpu-27b-1): copy
+  # the block + its router pair (RUNBOOK → GPU fleet; make doctor checks all
+  # six name references match), make update, then assign cards in the GPU
+  # view.
   gpu-27b:
     <<: *gpu-base
     environment:
@@ -183,9 +195,10 @@ services:
       # radiance config, so the key never sits in argv (ps / docker inspect)
       RADIANCE_LOG: "warn" # per-request INFO lines (tok/s, cache, ttft) are chatty — radiance docs §6.5
     volumes:
-      # replaces the anchor's list (shallow <<): re-lists /models, adds this
-      # instance's radiance config (2.x takes no flags — RUNBOOK → GPU fleet)
-      - /models/llm:/models:ro
+      # replaces the anchor's list (shallow <<): re-lists the /models/llm
+      # class-subpath mount, adds this instance's radiance config
+      # (2.x takes no flags — RUNBOOK → GPU fleet)
+      - /models/llm:/models/llm:ro
       - ./gpu-configs/gpu-27b.yaml:/etc/radiance/radiance.yaml:ro
     labels:
       - panel.manage=Qwen 27B IQ6R-S-V4 # Services view name (no card set — it moves)
@@ -199,7 +212,7 @@ services:
       RADIANCE_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env}
       RADIANCE_LOG: "warn"
     volumes:
-      - /models/llm:/models:ro # shallow <<: this list replaces the anchor's
+      - /models/llm:/models/llm:ro # shallow <<: this list replaces the anchor's
       - ./gpu-configs/gpu-27b-1.yaml:/etc/radiance/radiance.yaml:ro
     labels:
       - panel.manage=Qwen 27B IQ6R-S-V4 1
@@ -208,11 +221,11 @@ services:
   gpu-27b-2:
     <<: *gpu-base
     environment:
-      ROCR_VISIBLE_DEVICES: "4,5"
+      ROCR_VISIBLE_DEVICES: "5,6" # its physical cards (tiles 5,6 since the 7th card took tile 4)
       RADIANCE_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env}
       RADIANCE_LOG: "warn"
     volumes:
-      - /models/llm:/models:ro # shallow <<: this list replaces the anchor's
+      - /models/llm:/models/llm:ro # shallow <<: this list replaces the anchor's
       - ./gpu-configs/gpu-27b-2.yaml:/etc/radiance/radiance.yaml:ro
     labels:
       - panel.manage=Qwen 27B IQ6R-S-V4 2
@@ -226,12 +239,105 @@ services:
       RADIANCE_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env}
       RADIANCE_LOG: "warn"
     volumes:
-      - /models/llm:/models:ro # shallow <<: this list replaces the anchor's
+      - /models/llm:/models/llm:ro # shallow <<: this list replaces the anchor's
       - ./gpu-configs/gpu-flashnext.yaml:/etc/radiance/radiance.yaml:ro
     labels:
       - panel.manage=Qwen Flash-Next # Services view name (no card set — it moves)
       - panel.category=LLM
       - gpu.cards=4 # the pool's auto-grab size (== tp in gpu-configs/gpu-flashnext.yaml)
+
+  # The writer (the 7th card, the odd one out): PCIe5 x8 instead of x16 —
+  # the LOAD traffic is ~half speed, but inference is VRAM-bandwidth-bound,
+  # so the always-resident chat models live here (the swapping gen slots
+  # keep the x16 cards). Multi-model config = radiance's router: "writer"
+  # (hemmingway) + "uncensored" (gemma), picked by the /v1 `model` name.
+  # The Gen section routes prompt enhancement at the "writer" entry (Gen
+  # settings → enhance target; the engine talks by container IP over the
+  # edge network, like the gen slots). Disk-park only (rare swaps; pinned
+  # host RAM is the scarce shared resource). Public instance: standard six
+  # references (RUNBOOK → GPU fleet). Card index: tile 4, MEASURED (the x8
+  # PCIE6 card trained at position 4 in the KFD order, pushing the old tiles
+  # 4,5 → 5,6 — PCIe slot order != enumeration order; the GPU view + the
+  # Overview's per-tile BDF chips are the map — re-derive after any card
+  # add/remove); the fallback below is a fallback (the GPU view's override wins).
+  gpu-writer:
+    <<: *gpu-base
+    environment:
+      ROCR_VISIBLE_DEVICES: "4" # fallback default (override wins) — the x8 card (tile 4, measured)
+      RADIANCE_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env}
+      RADIANCE_LOG: "warn"
+    volumes:
+      # class-subpath mount like every fleet block: the gen section's config
+      # parser takes the model's class from the 2nd path component
+      # — /models/llm/... → llm — and the enhance target must be discoverable
+      # as llm entries
+      - /models/llm:/models/llm:ro
+      - ./gpu-configs/gpu-writer.yaml:/etc/radiance/radiance.yaml:ro
+    labels:
+      - panel.manage=Writer (hemmingway + gemma) # Services view name (no card set — it moves)
+      - panel.category=LLM
+      - gpu.cards=1 # == tp in gpu-configs/gpu-writer.yaml (doctor cross-checks)
+
+  # ── Gen slots (private fleet instances) — image/video gen, edge-only ──────
+  # gpu.private=true: no router pair, no fleet-open host, no subdomain — the
+  # panel's Gen section (panel-api) is the consumer, and it talks to the slot
+  # by container IP (a router is never in the data path). make doctor asserts
+  # no-host BOTH ways (a router here = drift) and exempts the fleet-open host
+  # check; gpu.cards/config/tp checks still apply. The LANE is cards 5,6 by
+  # card overlap (the 7th card took tile 4 — see gpu-writer above): the tp2
+  # slot takes both, the two tp1 slots one each (disjoint → parallel). The
+  # Gen section owns the queue (one FIFO, lazy stop, idle-yield, one
+  # preemption rule — RUNBOOK → Gen); the GPU view still assigns
+  # cards + autostart, and start/stop are the same panel-do gpu-apply/gpu-stop
+  # (override included — invariant 7). Each slot is gen-ONLY (its gen model is
+  # the sole config entry, resident): prompt enhancement runs off-slot, on
+  # the writer instance (Gen settings → enhance target).
+  gpu-gentp1a:
+    <<: *gpu-base
+    environment:
+      ROCR_VISIBLE_DEVICES: "5" # fallback default (override wins) — lane card 5
+      RADIANCE_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env}
+      RADIANCE_LOG: "warn"
+    volumes:
+      # shallow <<: replaces the anchor's list — the slot mounts its class
+      # subdir at a subpath like every fleet block; it is gen-only, so no
+      # /models/llm mount (enhancement is off-slot)
+      - /models/image:/models/image:ro
+      - ./gpu-configs/gpu-gentp1a.yaml:/etc/radiance/radiance.yaml:ro
+    labels:
+      - panel.manage=Gen image krea-2 (tp1a) # Services view name (no card set — it moves)
+      - gpu.cards=1 # == tp in gpu-configs/gpu-gentp1a.yaml (doctor cross-checks)
+      - gpu.private=true # no public host — the Gen section is the consumer
+      - panel.category=Gen # Services view group (non-LLM model classes get their own)
+  gpu-gentp1b:
+    <<: *gpu-base
+    environment:
+      ROCR_VISIBLE_DEVICES: "6" # lane card 6 — disjoint from tp1a, so both run
+      # in parallel (the queue never serializes them)
+      RADIANCE_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env}
+      RADIANCE_LOG: "warn"
+    volumes:
+      - /models/image:/models/image:ro # shallow <<: this list replaces the anchor's
+      - ./gpu-configs/gpu-gentp1b.yaml:/etc/radiance/radiance.yaml:ro
+    labels:
+      - panel.manage=Gen image krea-2 (tp1b) # Services view name (no card set — it moves)
+      - gpu.cards=1 # == tp in gpu-configs/gpu-gentp1b.yaml
+      - gpu.private=true
+      - panel.category=Gen # Services view group (non-LLM model classes get their own)
+  gpu-gentp2:
+    <<: *gpu-base
+    environment:
+      ROCR_VISIBLE_DEVICES: "5,6" # fallback default (override wins) — the whole lane
+      RADIANCE_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env}
+      RADIANCE_LOG: "warn"
+    volumes:
+      - /models/video:/models/video:ro # shallow <<: this list replaces the anchor's
+      - ./gpu-configs/gpu-gentp2.yaml:/etc/radiance/radiance.yaml:ro
+    labels:
+      - panel.manage=Gen video minimax-h3 (tp2) # Services view name (no card set — it moves)
+      - gpu.cards=2 # == tp in gpu-configs/gpu-gentp2.yaml
+      - gpu.private=true
+      - panel.category=Gen # Services view group (non-LLM model classes get their own)
 
   # ── SearXNG — web search for agents + private browser UI ──────────────────
   # Image floats on latest — declared OUTSIDE the declared-line policy (the

@@ -6,10 +6,11 @@
 #
 # LLM-SCOPED on purpose, and stays here (not in gpu.yml): it routes chat
 # /v1, and only chat-LLM instances belong in its order — image/video
-# generators (same fleet, /v1/images + /v1/videos on their own hosts) are
-# out of scope for the fallback and would 501 on it. The per-instance
-# routers of the whole fleet live in gpu.yml; fleet-* marks the shared
-# routers there (make doctor's orphan check assumes gpu- = instance).
+# generators (same fleet, /v1/images + /v1/videos) are the hostless
+# gpu.private gen slots: no public host at all, so they can never enter
+# this order (and would 501 on it). The per-instance routers of the whole
+# fleet live in gpu.yml; fleet-* marks the shared routers there (make
+# doctor's orphan check assumes gpu- = instance).
 
 http:
   routers:

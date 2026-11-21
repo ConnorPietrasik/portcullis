@@ -289,6 +289,7 @@ Mechanics in `setup/08-update.sh` (shared helpers in `setup/common.sh`):
   `make deploy` gates on it too, and `make doctor` checks both trees).
 - **Snapshot** = `/opt/panel/.update-snapshot-<ts>` (state in `/opt/panel/.update-state`): the exact *image IDs* of what is running
   (tags move, IDs don't), re-tagged `portcullis-rollback/<svc>:<ts>`; **the deployed config tree** (`/opt/panel`: docker-compose.yml,
+  gpu-configs/ (the radiance configs — coupled to the compose that mounts them, so they roll back with it),
   traefik/, portfolio/, searxng/, the authelia configs, panel-frontend, `.env`, the reduced env files — a tarball; runtime data like
   `db.sqlite3` excluded); an **exact copy of `/opt/panel-api` (venv included)**; and the npm files about to be bumped. A failed npm
   bump, config sync, or pull stops the run *before* any container is touched.
@@ -472,7 +473,8 @@ re-pins itself automatically as part of `make update` (see Updates).
 
 ## GPU fleet (Radiance instances)
 
-[Radiance](https://codeberg.org/StillDeadcode/radiance) instances on 6 shared R9700s; start/stop and GPU assignment from the panel
+[Radiance](https://codeberg.org/StillDeadcode/radiance) instances on 7 shared R9700s (six at
+x16 + the 7th at x8 — see **The writer** below); start/stop and GPU assignment from the panel
 (Services view for the containers, **GPUs view** for the cards — see **GPU pool** below).
 Machine APIs, not browser apps: no Authelia — the gate is the server's own API key (`Authorization: Bearer`) behind the
 wildcard cert; clients use `base_url=https://<name>.pietrasik.top/v1` + key, exactly like OpenAI. No rate-limit middleware
@@ -497,15 +499,14 @@ of silently grabbing one card). Everything else in
 **Radiance config (2.x):** radiance 2.x takes NO command-line flags — the container's command is
 `radiance --config /etc/radiance/radiance.yaml` (in `x-gpu-base`), and every setting is a YAML key in
 `compose/gpu-configs/<instance>.yaml`, mounted per block (a block's `volumes` list REPLACES the
-anchor's — YAML `<<:` is shallow — so each block re-lists the `/models` mount). A key is the pre-2.x
+anchor's — YAML `<<:` is shallow — so each block re-lists its class-dir mount
+(`/models/llm`, `/models/image` or `/models/video` at that subpath — see **Models** below)). A key is the pre-2.x
 flag minus its dashes, at its level: `server:` holds `host` / `port` / `api-key(-env)`, `memory:` holds
 `gpu-headroom-mib`, the rest (`model`, `tp`, `max-num-seqs`, `max-model-len`, `prefix-cache-mib`,
 `checkpoint-policy`, ...) sit under the one entry in `models:` (upstream `docs/MULTIMODEL.md` §4;
 key reference: `radiance --help`). The API key reaches the server through `RADIANCE_API_KEY` in the
-block's environment (`api-key-env` in the file) — never written into the file itself. Validate a config
-without serving: `RADIANCE_API_KEY=<key> docker run --rm --entrypoint radiance
-stilldeadcode/radiance:latest --config /dev/stdin --check < compose/gpu-configs/<instance>.yaml`.
-A config edit syncs with `make update` but recreates NOTHING (the mount path is unchanged) — radiance
+block's environment (`api-key-env` in the file) — never written into the file itself. A config edit
+syncs with `make update` but recreates NOTHING (the mount path is unchanged) — radiance
 reads it once at start, so restart the instance from the GPUs view to apply it. Model containers:
 2.x REFUSES block-FP8 / MXFP4 / M2XFP4 / ParoQuant weights at startup (by the first such weight's
 name) — a refused model takes its int8/bf16 container (upstream README → Models).
@@ -577,8 +578,184 @@ model. A new build that is *healthy but behavior-breaking* is different — the 
 returns just the instances to the pre-update build (re-gated on the same budget), and the next `make update` re-anchors the snapshot
 on it.
 
-**Models:** `/models/llm/*.rad` (self-contained; ro-mounted at `/models` — the dir name predates the `llm-*` → `gpu-*` rename and now holds every fleet model). If `/models` is btrfs with compression, keep `.rad` files
-uncompressed (`chattr +C`) — direct-I/O n-gram reads degrade otherwise.
+**Models:** by class dir — `/models/llm/*.rad` (chat LLMs; the dir name predates the `llm-*` → `gpu-*` rename), `/models/image/*.rad`, `/models/video/*.rad` (gen models — see **Gen slots** below). Every instance ro-mounts its class dir AT that subpath (configs address models by container path, so the mount target is the class subdir, not the bare `/models`): the gen section's config parser takes the model's kind from the 2nd path component, so an instance's LLM entries stay discoverable (e.g. as Gen enhance targets) only under `/models/llm/`. If `/models` is btrfs with compression, keep `.rad` files uncompressed (`chattr +C`) — direct-I/O n-gram reads degrade otherwise. Artifacts land in `/models/gen-output` (panel-owned, served read-only at `panel.pietrasik.top/gen/*`).
+
+**Gen slots (image/video)** — the panel's own generators: three `gpu.private=true` fleet instances on the
+lane cards (5,6 today — the 7th card took tile 4), no router pair, no host, no subdomain — the only thing that talks to them is
+panel-api, by container IP over the edge network. They join the same GPU pool (assign/start/stop from
+the **GPUs** view, or directly from the **Gen** tab), same ledger, same override, same lazy-stop
+semantics; what differs is the surface (internal, so `make doctor` exempts them from the
+router/Host/fleet-open checks and FAILs them if a router ever appears) and the config shape. The Gen
+section also talks to the **writer** instance (below) by container IP — but that one is a normal
+PUBLIC fleet instance, reached for prompt enhancement only by panel-api.
+
+**Config shape:** each gen config hosts ONE model — its generator (an image OR a video model, its
+kind taken from the container path: `/models/image/…` → image, `/models/video/…` → video). Gen-ONLY:
+the in-slot enhancer is GONE — prompt enhancement runs off-slot, on the writer instance (below), so
+the gen model is the sole entry and simply stays resident (no `ttl:`, no swap partner, `warm-up: true`
+absorbs the one load into boot). A slot is a gen slot IFF its config hosts at least one image/video
+model — an LLM-only config (its entries parse as `llm` kind, not
+image/video) makes it a plain instance.
+
+| slot | cards | lane fallback | generator | host-mib |
+|---|---|---|---|---|
+| `gpu-gentp1a` | 1 | 5 | `krea-2-raw-iq8r` (16.4 GiB, image) | 24576 |
+| `gpu-gentp1b` | 1 | 6 | `krea-2-raw-iq8r` (16.4 GiB, image) | 24576 |
+| `gpu-gentp2` | 2 | 5,6 | `minimax-h3-i8` (62.7 GiB, video) | 73728 |
+
+Both tp1 slots are identical and run concurrently (disjoint cards, same config — one krea-2 job each).
+`minimax-h3-i8` is 98% of the pair as a FILE — it fits only because of
+`vision-tower-placement: ram` (the ViT towers sit in host RAM, which `host-mib` budgets — the value
+in the config file, not the container env). No pre-flight check: if it doesn't
+fit, the first boot fails and says so.
+
+**The writer (the 7th card):** `writer.pietrasik.top` — a standard PUBLIC fleet instance on the new
+card (PCIe5 **x8**, the odd one out: load traffic ~half speed, inference unaffected — so the
+chat models live here, and the swapping gen slots keep the x16 cards). Its config hosts TWO
+models, both `tp: 1`, disk-park only (`park: {ram: never}` — pinned host RAM is the scarce shared
+resource). Only ONE of the two fits the card's VRAM at a time; there is deliberately NO
+`priority` on either entry (neither "always wins"): a model at work keeps its cards (its demand
+waits for the other to finish — a switch is bounded by the config's `drain-timeout`), and between
+sessions the cheaper-to-reload one (writer) yields first. Listing `writer` FIRST makes it the
+resident one right after boot (the warm-up loads later-in-file entries first and the last loaded
+parks the earlier one — see the config's header):
+
+| entry (the /v1 `model` name) | file (`/models/llm/`) | role |
+|---|---|---|
+| `writer` | `hemmingway-1.5-iq4r-s-tool-tail-mtp-gptq.rad` | the Gen section's prompt enhancement (listed first → loads last in the warm-up → resident after boot) |
+| `uncensored` | `gemma4-31b-heretic-ara-a4.rad` | unfiltered chat (100k ceiling, thinking on by default) |
+
+Standard six name references (RUNBOOK → GPU fleet: compose block, config, router pair, fleet-open
+host). `panel.category=LLM`, so it is also eligible for the `llm.pietrasik.top` fallback order (LLM
+settings — your call). The Gen section's ENHANCE TARGET (Gen settings) names the instance + model by
+default (`gpu-writer` / `writer`); the engine reaches it by container IP over the edge network, starts
+it via the same `gpu-apply` when a job needs it, and the target can be repointed at ANY chat-capable
+instance in the settings (e.g. `uncensored` on the same instance, or a 27b instance) — a misconfigured
+target shows in the Gen tab and 400s at the door.
+
+**Card index (MEASURED — re-derive after any card add/remove):** the pool is ROCR-index based and
+`amd_gpus()` reads sysfs, so a card appears in the GPUs view automatically — but the PCIe slot
+order is NOT the enumeration order. The 7th card (PCIE6, the x8 slot — ~29 GB/s vs ~57 GB/s in a
+pinned-RAM↔VRAM memcpy) trained at **tile 4**, inserting itself mid-order and pushing the old
+tiles 4,5 to 5,6 (the lane's physical cards); tiles 0–3 are unchanged. The compose fallbacks match
+this (writer `4`, lane `5,6`). The stable per-card identity is the PCI BDF — the Overview's
+`GPU-N` headers show each tile's BDF chip; record that map after any hardware change (the BDFs
+themselves are slot-stable; it's the tile→BDF mapping that moves). The GPU view's assignment —
+the override — wins anyway, so the fallbacks only matter for a start without an assignment.
+The pool makes the dedication durable too: the x8 card is **reserved** for `gpu-writer`
+(GPUs view → *reserve a card…*, note `PCIe5 x8`) — the auto-grab then never hands tile 4 to
+another instance, and the reservation records the card's BDF (`bc:00`) at reserve time: if the
+tile→BDF map ever moves (a card add/remove), the GPUs view's **warnings** say so, so the
+dedication can't silently re-point at a different physical card. The Overview's `GPU-N`
+header shows the same mark at a glance (its note chip).
+
+**Deploy (first landing):**
+
+```bash
+# 0. the 7th card is in the PCIE6 slot (x8). MEASURED: it landed at tile 4
+#    (old tiles 4,5 shifted to 5,6) — verify on your boot the same way (GPUs
+#    view + the Overview's per-tile BDF chips; a pinned-RAM↔VRAM memcpy on a
+#    tile shows ~29 GB/s on the x8 card vs ~57 on the x16 ones).
+# 1. the .rad files (their sizes above; chattr +C on btrfs) into the class dirs:
+mkdir -p /models/llm /models/image /models/video
+#    krea-2-raw-iq8r.rad             → /models/image/  minimax-h3-i8.rad   → /models/video/
+#    hemmingway-1.5-iq4r-s-tool-tail-mtp-gptq.rad → /models/llm/  gemma4-31b-heretic-ara-a4.rad → /models/llm/
+# 2. free the lane: stop gpu-27b-2 from the panel (GPUs view → stop). It stays stopped across updates.
+# 3. git commit; make update   # deploys the 3 slots + the writer + panel-api + the UI, leaves
+                               #    them down — and recreates the four LLM instances (their /models
+                               #    mount moved to the class subpath: one model reload each)
+# 4. GPUs view → reserve tile 4 for gpu-writer (note "PCIe5 x8" — the auto-grab
+#    then never hands it to another instance, and the writer's own grab lands on it
+#    first: no "lowest free card" pitfall), then assign the lane (5 → gpu-gentp1a,
+#    6 → gpu-gentp1b), then Gen tab → slots → start both (the writer comes up on
+#    demand — or start it to warm it).
+#    Also re-assign gpu-27b-2 (auto): its saved set still names the OLD lane tiles
+#    (4,5 pre-7th-card) — after the renumbering that includes tile 4, now reserved
+#    for the writer. The fence makes its next start fall back to a free set anyway,
+#    but the stale set would keep showing as assigned (the GPUs view's warnings name
+#    it); re-assigning (auto) refreshes it to the cards it actually takes.
+#    gpu-gentp2 is NOT started by default: it needs BOTH lane cards, so it can only run while the
+#    two tp1 slots are down (a queued video job stops them itself; see below).
+# 5. smoke: queue a small image job (model `image`) and a ~5 s video job
+#    (model `video`). The video needs the tp2 slot — with the tp1 slots holding
+#    5 and 6, its status shows `down · yields 2` and it starts only after they drain + stop.
+#    A job with enhance on should log a chat completion on the writer (its RADIANCE_LOG lines).
+```
+
+**Day-2 — the Gen tab:** one FIFO, three slots.
+
+- **Job = model + prompt + (video: seconds) + (both: size, seed).** `model` is a purpose key
+  (`image` / `video` — mapped to exact models in the tab's settings, admin-editable) or an exact
+  model name. Enhancement (the enhance target — default: the writer's `writer` model — rewrites the
+  prompt first, off-slot) is per-job, defaulted by the settings' global toggle; a model without a
+  configured prompt can't be enhanced (the checkbox says so), and the server refuses `enhance: true`
+  for one — it is not a silent skip at the door.
+- **Cancel:** the record is marked canceled immediately, and the in-flight request's connection is
+  dropped within ~2 s — radiance treats an abnormally closed response as its own cancel (the
+  ticket's flag, the same one the video's `DELETE` sets), so the render retires at the next pass
+  boundary instead of burning out; a video render in progress is additionally `DELETE`d by its
+  poll within ~5 s. No half-artifact ever lands (the state is re-checked before every write).
+- **Lanes:** a running slot owns its cards exclusively; a job becomes eligible when all of its
+  slot's cards are free or held by an idle gen slot, and among the eligible slots it is claimed on
+  the LEAST-LOADED one that hosts its model (a model on two slots spreads one-each — not two on
+  the first). Per slot: at most 2 jobs in the GEN PHASE — one in progress + one queued in
+  radiance, which sequences the model's work itself (the video model runs one denoise + one
+  conditioning at a time); a starting flight (the slot booting) consumes no gen headroom.
+  Enhancement has its OWN cap — 8 concurrent rewrites system-wide (the enhance target is one
+  entry; its `max-num-seqs` carries it): it runs OFF-SLOT (the engine starts the target if it is
+  down) and BEFORE the slot phase, so a queued job enhances as soon as there is enhance
+  headroom, without a slot being claimed or started (a different card: the gen phase never waits
+  for the enhancement, and the enhancement never waits for the lane). A job that
+  needs a down slot starts it (its assigned cards, or the lowest free set, exactly like the GPUs
+  view's *start*); a start that hits a conflict (a card gets held between the claim and the attempt
+  — e.g. a job queued in the same tick as its neighbour's) re-queues the job with the reason in its
+  error column and the next tick retries: the slot then reads blocked (wait for the holder),
+  down-idle-stops (the holder gets stopped), or free (it starts). A permanent conflict (the lane is
+  short, docker down) re-queues with the same reason until it clears. A config drift after a job is
+  queued (the model vanished, or its enhance target became misconfigured while the job wants
+  enhance) says so in the error column instead of the job waiting in silence. A stop
+  only lands on a drained slot from the Gen tab (its stop button stays disabled while a job is in
+  flight); the GPUs view's stop does not wait — in-flight jobs on it fail (`lost the slot
+  mid-render`).
+- **Lazy stop:** a drained slot STAYS UP (the gen model is resident; the next job is fast). It
+  yields its cards only when (a) a queued job needs them — the slot stops automatically (only when
+  drained — nothing in flight is lost), (b) you stop it (Gen tab or GPUs view), or (c) a reboot. An explicit
+  start of ANY instance may stop idle gen slots holding the cards it wants — server-side, with no
+  UI confirmation: the audit log records it (`stopped-idle-gen:<slot>` on the `gpu-start` entry).
+  LLM instance occupants are NEVER auto-stopped (their traffic is not panel-visible, so idleness
+  can't be proven): a conflicting start fails with the shortage (`not enough free cards: …
+  only N free (…)`) — the GPUs view names the holders; stop them there and retry.
+- **Artifacts:** written to `/models/gen-output/job-<n>.(png|jpg|mp4)` (+ `-thumb.webp` for videos)
+  when a job completes — the job is `completed` only after the file is on disk (the full download
+  is awaited before the write; a slot that dies mid-transfer fails the job before anything is
+  written). Served at
+  `https://panel.pietrasik.top/gen/<file>` (ro bind into panel-web, nginx allowlisted to the
+  `job-*` names) and via `GET /api/gen/jobs/{id}/content` (the API shape the servitor agent will use
+  in V2). No size cap; an age GC (settings, default 14 days) sweeps the dir
+  every 6 hours — it skips the artifacts of jobs still in the store (a record
+  the tab still shows keeps its file even past gc_days). Deleting a terminal
+  job removes its files with the record; a record trimmed past the 500-job
+  history cap orphans its files, and this pass takes them on the first sweep
+  after they age past gc_days.
+- **Settings** (Gen tab, or `PUT /api/gen/settings`): the purpose→model map, the global enhance
+toggle, the per-model enhancement prompts, the ENHANCE TARGET (instance + model — default
+`gpu-writer` / `writer`), the GC age. State lives in `/opt/panel-api/gen-settings.json`
+(panel 0600) + `/opt/panel-api/gen-jobs.json` (queue + jobs, 0600) — both in the update snapshot,
+like the LLM router's settings.
+- **V2 (servitor):** the same endpoints re-exposed under `/machine/gen/*` with the bearer
+`LLM_API_KEY` (no Authelia) — one handler set, two gates. Not in this release.
+
+**Troubleshooting:** `make doctor` checks the gen state-file modes, the `/models/gen-output`
+ownership (panel:panel — a docker-created root-owned dir turns the check red), and that each private
+slot's config actually hosts an image/video model (a typo'd path silently makes it a plain instance
+— no gen tab, no error). Video jobs poll every 5 s; a panel-api restart mid-render re-attaches to
+the recorded radiance video id while the slot is still up (the video lives in radiance's memory — a
+slot that went down with it fails the job saying so); a restart before the gen request (a job still
+starting/enhancing/loading) re-queues it — it resumes on the next tick — and a cancel DELETEs the
+radiance side within one poll. A slot that never becomes healthy within 10 min fails its jobs with the
+reason — check `docker logs panel-gpu-gentp*` first (model file missing, OOM on the tp2 pair without
+the vision-tower-ram placement, or a `.rad` radiance refuses — 2.x's int8/bf16 container rule,
+see **Radiance config** above).
 
 **Fallback router (`llm.pietrasik.top`):** one base URL for clients that just want the best model
 currently serving — agents, defaults, anything that shouldn't pin an instance. Set the priority
@@ -609,14 +786,17 @@ registry carries `edge-ips` (catches the stale binary).
 
 **GPU pool** — per-instance card sets, auto-grab, boot autostart.
 
-The panel's **GPUs** tab is the control surface: a tile per card (free / held by whom, temp, VRAM,
-utilisation) and one row per fleet instance with its **assigned** set (the ledger's intent), its
-**holding** set (the live truth — drift between the two means a failed apply or a hand-run compose),
-start/stop, an **auto** button (grab the lowest free cards, sized by the instance's `gpu.cards` label),
-a **pick…** row for exact card sets, and a **boot** checkbox.
+The panel's **GPUs** tab is the control surface: a tile per card (free / held by whom /
+reserved for whom, temp, VRAM, utilisation) and one row per fleet instance with its **assigned**
+set (the ledger's intent), its **holding** set (the live truth — drift between the two means a
+failed apply or a hand-run compose), start/stop, an **auto** button (grab the lowest free cards,
+sized by the instance's `gpu.cards` label — a card reserved for that instance comes first),
+a **pick…** row for exact card sets, a **boot** checkbox, and a **reserve a card…** form
+(the dedicated-card fence — see the bullet below).
 
 - **State:** the LEDGER `/opt/panel-api/gpu-pool.json` (panel-owned 0600) holds `allocations`
-  (instance → card set) + `autostart` (ordered list). The OVERRIDE `/opt/panel-api/gpu-pool-override.yml`
+  (instance → card set) + `autostart` (ordered list) + `reserved` (card → {for, note, bdf} — the
+  dedicated-card fence, see below). The OVERRIDE `/opt/panel-api/gpu-pool-override.yml`
   (0644) is its compose projection — `ROCR_VISIBLE_DEVICES` per instance — and is included in EVERY
   compose render (`COMPOSE_STACK` in setup/common.sh, panel-do `gpu-apply`/`gpu-stop`/`start-service`): a `make update`
   recreate (radiance floats on `latest`) therefore keeps the assignment instead of reverting to the
@@ -624,9 +804,31 @@ a **pick…** row for exact card sets, and a **boot** checkbox.
   both ride the update snapshot — `make rollback` restores them.
 - **Live holds** are read from the running containers' env (panel-do `gpu-live`), never from the
   ledger: a stopped instance holds nothing, and `assigned`/`holding` are shown separately.
+- **Reservations fence a card** — dedicate it to one instance (the physically-odd card, e.g. the
+  PCIe5 x8 one, that must never be mixed into the others' pool): GPUs view → *reserve a card…*
+  (card + instance + a note, e.g. `PCIe5 x8`). Then every auto-grab path (the **auto** button, a
+  GPU-aware start, the boot planner, the Gen engine's instance starts) treats the card as not free
+  for anyone but the owner, an explicit **pick…** of it by another instance is refused with the
+  owner + note named, and the OWNER's own grab lands on its reserved cards first (a first start of
+  the writer takes tile 4, not tile 0). The owner may still take other free cards; the reservation
+  holds nothing itself and is never written to the OVERRIDE — it is a constraint in the LEDGER,
+  audited like every other mutation (`gpu-reserve` / `gpu-unreserve` in journald). A SAVED set
+  that predates a reservation is fenced the same way: if the dedication lands on a card another
+  instance's saved set already names (a card add renumbers the tiles under it), that instance's
+  next start/boot does NOT take the saved set — it falls back to the reservation-aware grab — so
+  the fence can't be bypassed by a set saved before the card was reserved. The BDF is
+  captured at reserve time and re-verified on every view: the warnings section names a stale
+  reservation — the card left the pool, its BDF moved (a card add/remove renumbers the tiles, so
+  the dedication may now point at the wrong physical card), the owner left the fleet, a
+  hand-run compose pinned a foreign instance on it, or another instance's saved set still names
+  it. A stale reservation keeps fencing the card
+  (safer than opening it to the auto-grab) until you unreserve it; re-reserving the same owner
+  re-records the BDF. Unreserving = the card rejoins the auto-grab pool for everyone. The same ops
+  as JSON: `POST /api/gpus/reserve {card, for, note}` / `POST /api/gpus/unreserve {card}`.
 - **Assigning cards (re)creates the container** — GPU env only exists at create time — so "set cards"
   and "run on them" are one operation (brief downtime + model reload on a running instance). Conflicts
-  (a card held by another RUNNING instance, wrong count for the instance's `gpu.cards`, out-of-range index) are refused
+  (a card held by another RUNNING instance, a card reserved for another instance, wrong count for the
+  instance's `gpu.cards`, out-of-range index) are refused
   with the reason; the instance's own current cards are allowed (a move or a no-op recreate).
 - **Count drift is warned, not silently run:** a saved set whose count no longer matches the instance's
   `gpu.cards` (e.g. after a config edit without a re-assign) shows in the panel's warnings — a

@@ -9,10 +9,6 @@
 # The API key reaches the server through RADIANCE_API_KEY in the block's
 # environment (api-key-env) — it is never written into this file.
 #
-# Validate without serving:
-#   RADIANCE_API_KEY=<key> docker run --rm --entrypoint radiance \
-#     stilldeadcode/radiance:latest --config /dev/stdin --check < this-file
-#
 # NOTE: a config edit syncs to /opt/panel on `make update` but recreates
 # NOTHING (the mount path is unchanged) — radiance reads it once at start;
 # restart the instance from the panel's GPUs view to apply it.
@@ -33,7 +29,7 @@ memory:
   gpu-headroom-mib: 96
 models:
   Qwen3.8-Flash-Next:
-    model: /models/qwen3.8-next-flash-iqr-v4.rad
+    model: /models/llm/qwen3.8-next-flash-iqr-v4.rad
     aliases: [default]           # model-less requests land here
     tp: 4                        # == the block's gpu.cards (doctor cross-checks)
     max-num-seqs: 8

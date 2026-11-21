@@ -29,7 +29,7 @@ when you change the behavior they explain.
 |---|---|
 | `setup/` | idempotent bash, numeric run order; `11-autoupdate.sh` installs the auto-update timer (disabled by default)
 | `compose/` | edge stack → `/opt/panel`: `docker-compose.yml` (traefik, authelia, panel-web, portfolio, `gpu-*` fleet via the `x-gpu-base` anchor), `gpu-configs/` (per-instance radiance 2.x settings YAML — the server runs on `--config` only, no flags), `traefik/dynamic/*.yml` (routes — file provider, hot-reloaded), `authelia/configuration.yml` (+ `users_database.yml.example`), `panel-frontend/` (React+TS+Vite UI, multi-stage Dockerfile), `portfolio/` |
-| `panel-api/` | FastAPI host service → `/opt/panel-api`, user `panel`, binds `172.17.0.1:8010` (docker0 gateway): `main.py` (metrics, containers, actions, LLM fallback router), `gpu_pool.py` (GPU pool: ledger/override/allocation), `gpu_autostart.py` (boot oneshot), `panel-api.service` + `gpu-autostart.service` |
+| `panel-api/` | FastAPI host service → `/opt/panel-api`, user `panel`, binds `172.17.0.1:8010` (docker0 gateway): `main.py` (metrics, containers, actions, LLM fallback router, gen job engine + `/api/gen/*`), `gpu_pool.py` (GPU pool: ledger/override/allocation + card reservations — the dedicated-card fence, e.g. the x8 card), `gen_jobs.py` (gen queue/settings logic: the gen-phase cap (per slot) + the enhance cap (on the target), slot discovery from radiance configs, the off-slot enhance target — default `gpu-writer`'s `writer` entry — artifact GC), `gpu_autostart.py` (boot oneshot), `panel-api.service` + `gpu-autostart.service` |
 | `panel-do/` | Go whitelist dispatcher → `/usr/local/libexec/panel-do` — the ONLY privileged path (`sudo -n panel-do`) |
 | `ddns/` | stdlib-only Python + systemd timer/service → NameSilo apex A record |
 | `tools/panel-hosts.sh` | client-side /etc/hosts pin of routed names (no-hairpin workaround) |
@@ -50,7 +50,12 @@ change, not a refactor. The "why" for each is in `docs/ARCHITECTURE.md`.
    `X-Panel-Token` (overwriting anything a client sends) + Authelia
    forward-auth replaces `Remote-*` headers. `panel-api` re-verifies both
    (`secrets.compare_digest`, `admins` group). The LLM `/v1/*` router is
-   gated by the bearer `LLM_API_KEY`.
+   gated by the bearer `LLM_API_KEY`. The gen endpoints (`/api/gen/*`) ride
+   the same admin double gate — no new route/host/DNS/firewall line — and
+   gen artifacts are served only from the panel host (`/gen/*`, ro bind into
+   panel-web, nginx allowlisted to the `job-*` names); the V2 machine
+   surface (`/machine/gen/*`, bearer-gated) is the sanctioned public shape
+   for machine consumers — V2.
 4. **Secrets**: one `.env` is the source of truth, feeding compose and
    the derived reduced env files (`/opt/panel/.panel-api.env`,
    `.panel-ddns.env` — root-owned 0600, regenerated every deploy, never
@@ -64,9 +69,16 @@ change, not a refactor. The "why" for each is in `docs/ARCHITECTURE.md`.
 6. **Fleet naming contract**: `gpu-<name>` is 1:1 across traefik router,
    compose service, and container — any model class the pool serves (chat
    LLMs, image/video gen): the prefix names the POOL, not the workload.
-   Shared/non-instance routers are `fleet-*`,
-   never `gpu-*` (`make doctor`'s orphan check assumes that prefix).
-   `gpuServiceRe` (panel-do) and `GPU_NAME_RE` (panel-api) must stay
+   **Exception: a service carrying `gpu.private=true` is a fleet instance with
+   NO public host** (gen slots): no router pair, no fleet-open host; reachable
+   only via the edge network (panel-api talks to it by container IP, like the
+   LLM router). The label asserts no-host both ways: `make doctor` fails a
+   private service that HAS a router (drift) and exempts it from the
+   router/fleet-open checks otherwise; gpu.cards/config/tp checks still apply.
+   The exemption is the LABEL, not the workload — any future internal
+   GPU-holding service rides the same class. Shared/non-instance routers are
+   `fleet-*`, never `gpu-*` (`make doctor`'s orphan check assumes that
+   prefix). `gpuServiceRe` (panel-do) and `GPU_NAME_RE` (panel-api) must stay
    identical. (The LLM fallback router, `LLM_API_KEY` and the `panel.category=LLM`
    label are LLM-scoped and keep their names.)
 7. **Every compose render that can create/recreate a `gpu-*` container must
@@ -112,7 +124,9 @@ change, not a refactor. The "why" for each is in `docs/ARCHITECTURE.md`.
   its router pair in `traefik/dynamic/gpu.yml` + an `|| Host(...)` clause in the `fleet-open` rule —
   six name references total; `make doctor` flags any that drift (it also flags the
   v2-style multi-value `Host(a, b)` that Traefik v3 drops silently, and
-  cross-checks `gpu.cards` against the config's `tp`). →
+  cross-checks `gpu.cards` against the config's `tp`). A private slot
+  (`gpu.private=true` — invariant 6) is the same block + config with NO router pair and NO
+  fleet-open clause — four references, and `make doctor` fails it if a router ever appears. →
   `make update`. RUNBOOK → "GPU fleet".
 - **Servitor VM (day-2)**: four `servitor-*` panel actions (status/vm-
   restart/sync/doctor); the route (`traefik/dynamic/servitor.yml`, raw VM IP

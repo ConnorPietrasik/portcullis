@@ -180,8 +180,9 @@ export default function Services({ intervalMs }: { intervalMs: number }) {
                       </td>
                       <td className="muted">{c.status}</td>
                       <td className="btns">
-                        {/* running only — while the instance is down the /open bounce lands on a 502 */}
-                        {c.state === 'running' && c.service?.startsWith('gpu-') && (
+                        {/* running only — while the instance is down the /open bounce lands on a 502;
+                            private (gpu.private=true) instances have no host at all — no link */}
+                        {c.state === 'running' && c.service?.startsWith('gpu-') && !c.private && (
                           <a
                             href={`https://${c.service.slice(4)}.pietrasik.top/open`}
                             target="_blank"

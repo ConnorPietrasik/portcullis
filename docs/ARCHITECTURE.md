@@ -92,6 +92,40 @@ everything else on any subdomain requires a logged-in user. Rule order matters (
 **AMD GPUs without ROCm.** Everything glanceable lives in sysfs: `/sys/class/drm/card*/device` (busy %, VRAM) and its `hwmon`
 (edge/junction/mem temps, power, fan). No `amd-smi` needed; revisit only for per-process VRAM or fan control.
 
+**Private fleet instances.** The `gpu-<name>` naming contract (router, compose service and container share the name 1:1) has one
+documented exception: a service carrying `gpu.private=true` is a fleet instance **without a public host** — the gen slots.
+No router pair, no fleet-open host, no subdomain; reachable only via the edge network, and panel-api talks to it by container
+IP exactly like the LLM fallback router — the router is never in the data path, so there is no public surface to gate. The
+label asserts no-host in both directions: `make doctor` fails a private service that HAS a router (drift), and exempts a
+private one from the router/fleet-open checks otherwise, while gpu.cards, the radiance config mount and the tp cross-check
+still apply. The exemption is deliberately the LABEL, not the workload: any future internal GPU-holding service (not just
+gen) rides the same class rather than a second special case.
+
+**Gen: internal slots, one job engine, artifacts behind the existing panel host.** The gen feature
+adds no public surface of its own: no new router, host, DNS record, firewall line, or bind for the
+SLOTS — they are `gpu.private` fleet instances, reachable only via the edge network (invariant 6). The admin
+UI is a tab on `panel.pietrasik.top` (the existing double gate, re-checked as always), and
+`/api/gen/*` sits behind it like every other admin endpoint. The data path is panel-api → the gen
+slots' container IPs over the edge network — the exact pattern of the LLM fallback router — with
+the fleet's own `LLM_API_KEY` as bearer (no new key: a slot is a fleet instance, and the accepted
+edge-network property — any edge container can reach a slot's :8000 unkeyed — is the same class as
+the LLM instances'. A key is the gate; the segment is trusted by construction, as everywhere else
+on the bridge). Prompt enhancement is OFF-SLOT: the engine runs it on the settings' ENHANCE TARGET
+(default: the `gpu-writer` instance's `writer` entry — a standard PUBLIC fleet instance, the 7th
+card, `writer.pietrasik.top`, with the normal six name references and the same bearer gate as every
+fleet host) over the same container-IP data path, starting it via the same `gpu-apply` when needed;
+the target (instance + model) is a Gen setting, repointable at any chat-capable instance, and a
+misconfigured target 400s at the door and shows in the Gen tab. The job engine is a background task
+inside panel-api: state in
+`/opt/panel-api/gen-jobs.json` / `gen-settings.json` (panel 0600, in the update snapshot, same as
+the LLM router's settings), no new privileged path — slot AND enhance-target start/stop reuses the
+existing panel-do `gpu-apply`/`gpu-stop`, because both are `gpu-*` fleet instances. Artifacts are written by
+panel-api to `/models/gen-output` (panel-owned) and served read-only from panel-web at `/gen/*` —
+nginx allowlists the URI to the `job-*` artifact names — so artifact delivery rides the panel host's
+existing Authelia gate; the `GET /api/gen/jobs/{id}/content` twin exists so the V2 machine surface
+(`/machine/gen/*`, the fleet key as bearer — no Authelia, the servitor is an agent, not a browser)
+needs no second artifact path.
+
 **Secrets.** One `.env` (chmod 600) is the single source of truth: it feeds compose, and deploy derives the reduced env files the
 panel-uid systemd units load — `/opt/panel/.panel-api.env` (0600; `PANEL_TOKEN`, `PANEL_DEV`, `PANEL_DISK_MOUNTS` +
 `LLM_API_KEY` — the one deliberately non-PANEL key) and `/opt/panel/.panel-ddns.env` (0600, only `NAMESILO_API_KEY` + optional

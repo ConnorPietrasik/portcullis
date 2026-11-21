@@ -26,6 +26,11 @@ llm-settings.json
 gpu-pool.json
 gpu-pool-override.yml
 .gpu-pool.lock
+# gen section dev-mode state (same: PANEL_DEV=1 writes them in the CWD)
+gen-settings.json
+gen-jobs.json
+.gen-jobs.lock
+gen-output/
 
 # runtime artifacts that may appear if the repo lives on the server
 *.sqlite3

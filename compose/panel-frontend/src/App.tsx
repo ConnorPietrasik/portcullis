@@ -6,10 +6,11 @@ import { Suspense, lazy, useState } from 'react'
 const Overview = lazy(() => import('./views/Overview'))
 const Services = lazy(() => import('./views/Services'))
 const Gpus = lazy(() => import('./views/Gpus'))
+const Gen = lazy(() => import('./views/Gen'))
 const Actions = lazy(() => import('./views/Actions'))
 const Settings = lazy(() => import('./views/Settings'))
 
-const TABS = ['Overview', 'Services', 'GPUs', 'Actions', 'Settings'] as const
+const TABS = ['Overview', 'Services', 'GPUs', 'Gen', 'Actions', 'Settings'] as const
 type Tab = (typeof TABS)[number]
 
 const INTERVAL_KEY = 'panel.intervalMs'
@@ -46,6 +47,7 @@ export default function App() {
           {tab === 'Overview' && <Overview intervalMs={intervalMs} />}
           {tab === 'Services' && <Services intervalMs={intervalMs} />}
           {tab === 'GPUs' && <Gpus intervalMs={intervalMs} />}
+          {tab === 'Gen' && <Gen intervalMs={intervalMs} />}
           {tab === 'Actions' && <Actions intervalMs={intervalMs} />}
           {tab === 'Settings' && <Settings intervalMs={intervalMs} onChange={changeInterval} />}
         </Suspense>

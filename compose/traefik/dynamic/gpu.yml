@@ -1,6 +1,8 @@
-# GPU fleet — one router per INSTANCE (any model class the pool serves:
-# chat LLMs, image/video generators). TLS terminates here (wildcard cert,
-# DNS-01); auth is the server's own API key (Authorization: Bearer), NOT
+# GPU fleet — one router per instance WITH a public host (any model class
+# the pool serves — chat LLMs today; the image/video gen slots are
+# gpu.private: no router here, panel-api reaches them by container IP —
+# see their compose header). TLS terminates here (wildcard cert, DNS-01);
+# auth is the server's own API key (Authorization: Bearer), NOT
 # Authelia — forward-auth is cookie-based and can't serve API clients that
 # only speak bearer tokens. These routers deliberately omit auth-chain@file,
 # so plain OpenAI clients work with
@@ -44,6 +46,11 @@ http:
       middlewares: [sec-headers@file]
       service: gpu-flashnext
 
+    gpu-writer:
+      rule: "Host(`writer.pietrasik.top`)"
+      middlewares: [sec-headers@file]
+      service: gpu-writer
+
     # Key bootstrap for the radiance dashboards (panel Services view → the
     # "dashboard ↗" link per instance). The dashboard HTML is public on every
     # instance host; its data calls need the bearer key, which the page only
@@ -69,7 +76,7 @@ http:
     # Hosts are OR'd with || and kept inside (): a top-level rule is one
     # (possibly OR-ed) conjunction.
     fleet-open:
-      rule: "(Host(`27b.pietrasik.top`) || Host(`27b-1.pietrasik.top`) || Host(`27b-2.pietrasik.top`) || Host(`flashnext.pietrasik.top`)) && PathPrefix(`/open`)"
+      rule: "(Host(`27b.pietrasik.top`) || Host(`27b-1.pietrasik.top`) || Host(`27b-2.pietrasik.top`) || Host(`flashnext.pietrasik.top`) || Host(`writer.pietrasik.top`)) && PathPrefix(`/open`)"
       middlewares: [auth-chain@file]
       service: panel-api
 
@@ -93,6 +100,11 @@ http:
       loadBalancer:
         servers:
           - url: "http://gpu-flashnext:8000"
+
+    gpu-writer:
+      loadBalancer:
+        servers:
+          - url: "http://gpu-writer:8000"
 
     # (fleet-fallback and fleet-open route to the panel-api service in
     # panel.yml — same file provider; not redefined here.)

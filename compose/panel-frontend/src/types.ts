@@ -23,6 +23,10 @@ export interface Gpu {
   fan_rpm: number | null
   clock_mhz: number | null
   mem_clock_mhz: number | null
+  /** GPU pool reservation: this card is dedicated to that instance (the
+   *  auto-grab never hands it to another instance) — null when unreserved */
+  reserved_for: string | null
+  reserved_note: string | null
 }
 
 export interface Host {
@@ -107,6 +111,8 @@ export interface ContainerInfo {
   service?: string
   /** panel.category compose label — the Services view's group (null/"" → Other) */
   category?: string | null
+  /** gpu.private=true — a fleet instance with no public host: no dashboard link */
+  private?: boolean
   image: string
   state: string
   status: string
@@ -151,6 +157,8 @@ export interface GpuPoolCard {
   index: number
   /** the instance holding this card right now (live container env), or null */
   holder: string | null
+  /** card dedication: auto-grab never hands it to another instance */
+  reserved: { for: string; note: string } | null
 }
 
 export interface LlmGpuInstance {
@@ -230,6 +238,116 @@ export interface PreviewChange {
   old: string
   new: string
   change: UpdateChange
+}
+
+// ── Gen (panel tab "Gen"; see panel-api/gen_jobs.py) ────────────────────
+// One FIFO of image/video jobs served by the gen slots (gpu.private
+// fleet instances discovered from their radiance configs).
+
+export interface GenArtifact {
+  /** static URL on panel-web (the /models/gen-output ro bind) */
+  url: string
+  mime: string
+  size: number
+  thumb: string | null
+}
+
+export type GenState =
+  | 'queued'
+  | 'starting'
+  | 'enhancing'
+  | 'loading'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'canceled'
+
+export interface GenJob {
+  id: string
+  model: string
+  kind: 'image' | 'video'
+  prompt: string
+  enhance: boolean
+  params: Record<string, unknown>
+  user: string | null
+  state: GenState
+  slot: string | null
+  enhanced_prompt: string | null
+  /** 0-100 while a video renders (null otherwise) */
+  progress: number | null
+  error: string | null
+  artifact: GenArtifact | null
+  radiance_video_id: string | null
+  created_at: number
+  started_at: number | null
+  finished_at: number | null
+}
+
+export interface GenSlotStatus {
+  state: 'running' | 'down' | 'down-idle-stops' | 'blocked'
+  /** idle gen slots that would have to stop to free this slot's lane cards */
+  stops: string[]
+  blockers: string[]
+  /** a job is in flight on this slot */
+  busy: boolean
+}
+
+export interface GenSlot {
+  name: string
+  display: string
+  cards: number
+  assigned: number[] | null
+  holding: number[] | null
+  running: boolean
+  ip: string
+  /** entry name → class (a gen slot's config is gen-only — no llm entry) */
+  models: Record<string, 'llm' | 'image' | 'video' | null>
+  llm: string | null
+  status: GenSlotStatus
+}
+
+/** a fleet instance that hosts llm entries — an enhance-target candidate */
+export interface GenInstance {
+  name: string
+  display: string
+  cards: number
+  running: boolean
+  ip: string
+  /** llm entry names (the enhance-target model choices) */
+  llms: string[]
+}
+
+/** the settings' enhance target resolved against the current fleet */
+export interface GenEnhanceTarget {
+  instance: string
+  model: string
+  running: boolean
+  ip: string
+  /** false → reason (misconfigured — the UI shows it, create 400s on it) */
+  ok: boolean
+  reason: string
+}
+
+export interface GenModelInfo {
+  kind: 'image' | 'video'
+  slots: string[]
+}
+
+export interface GenOverview {
+  slots: GenSlot[]
+  /** fleet instances with llm entries (the enhance-target candidates) */
+  instances: GenInstance[]
+  enhance_target: GenEnhanceTarget
+  /** queued jobs, oldest first */
+  queue: GenJob[]
+  /** recent jobs, newest first (in-flight included) */
+  jobs: GenJob[]
+  /** model name → info (the address space: purposes must point here) */
+  models: Record<string, GenModelInfo>
+  purposes: Record<string, string>
+  /** instance + model = where prompt enhancement runs */
+  enhance: { enabled: boolean; prompts: Record<string, string>; instance: string; model: string }
+  gc_days: number
 }
 
 export interface UpdatePreview {

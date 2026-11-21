@@ -54,9 +54,24 @@ info "Installing panel-api to /opt/panel-api"
 sudo mkdir -p /opt/panel-api
 # gpu_pool.py: the GPU pool's ledger/override/allocation logic (shared with
 # the boot oneshot). gpu_autostart.py: the boot autostart (below).
+# gen_jobs.py: the Gen section's job queue + settings + lane math (pure logic;
+# main.py drives it).
 sudo cp -a "$REPO_ROOT/panel-api/main.py" "$REPO_ROOT/panel-api/gpu_pool.py" \
-  "$REPO_ROOT/panel-api/gpu_autostart.py" "$REPO_ROOT/panel-api/requirements.txt" /opt/panel-api/
+  "$REPO_ROOT/panel-api/gpu_autostart.py" "$REPO_ROOT/panel-api/gen_jobs.py" \
+  "$REPO_ROOT/panel-api/requirements.txt" /opt/panel-api/
 sudo chown -R panel:panel /opt/panel-api
+
+# Gen artifacts: the image/video outputs land here — panel-api (a host
+# service) writes them as user panel on job completion, and panel-web serves
+# them ro at /gen (the UI's static URLs). Owner panel (the writer); 755 so
+# the panel-web container reads them. Gated on /models (the GPU fleet's phase
+# creates it); until then docker auto-creates the bind source as root:root
+# and the doctor's gen check goes red until this is re-run.
+if [[ -d /models ]]; then
+  sudo install -d -m 755 -o panel -g panel /models/gen-output
+else
+  warn "/models missing — gen artifacts need it (GPU fleet phase); re-run make api once it exists"
+fi
 
 # GPU pool state: seed the ledger (panel-owned 0600) once; the override
 # is its compose projection (0644 — docker compose reads it as root). 02
@@ -64,7 +79,7 @@ sudo chown -R panel:panel /opt/panel-api
 # predates this feature consistent, and panel-api re-seeds both at startup
 # if a hand removed them. Never hand-edit either file.
 if [[ ! -f /opt/panel-api/gpu-pool.json ]]; then
-  printf '{\n  "allocations": {},\n  "autostart": []\n}\n' | sudo tee /opt/panel-api/gpu-pool.json >/dev/null
+  printf '{\n  "allocations": {},\n  "autostart": [],\n  "reserved": {}\n}\n' | sudo tee /opt/panel-api/gpu-pool.json >/dev/null
 fi
 if [[ ! -f /opt/panel-api/gpu-pool-override.yml ]]; then
   printf 'services: {}\n' | sudo tee /opt/panel-api/gpu-pool-override.yml >/dev/null

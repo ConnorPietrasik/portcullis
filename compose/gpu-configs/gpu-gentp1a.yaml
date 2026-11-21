@@ -1,0 +1,33 @@
+# gpu-gentp1a — gen slot (PRIVATE: no router — see the compose block header).
+# radiance 2.x takes its settings from THIS file alone: the container's
+# command is `radiance --config /etc/radiance/radiance.yaml` (x-gpu-base) —
+# no flags. A key is the pre-2.x flag minus its dashes, at its level (upstream
+# docs/MULTIMODEL.md §4; the full reference: `radiance --help`).
+#
+# Gen-ONLY: the gen model is the sole entry — no in-slot LLM (prompt
+# enhancement runs on the writer instance, Gen settings → enhance target).
+# Nothing to swap against, no ttl — the entry simply stays resident, so a
+# slot start pays a disk load once and the first job pays nothing.
+#
+# NOTE: a config edit syncs to /opt/panel on `make update` but recreates
+# NOTHING (the mount path is unchanged) — radiance reads it once at start;
+# restart the slot from the panel's GPUs view to apply it.
+
+server:
+  host: 0.0.0.0
+  port: 8000
+  api-key-env: RADIANCE_API_KEY
+memory:
+  gpu-headroom-mib: 96
+  host-mib: 24576 # the budget the pre-writer slot design (in-slot LLM + the
+  # gen model, since removed) was sized for; the gen-only pinned need is a
+  # strict subset of it, and the budget is a CEILING (what the process may
+  # pin), not a reservation — never lower it on a guess
+scheduler:
+  load-timeout: 300s # cold load (16–20 GiB off NVMe + engine init) + headroom
+  drain-timeout: 30s
+  warm-up: true # load the entry at start so the first job pays no disk load
+models:
+  krea-2-raw-iq8r: # image gen (12.9B DiT, IQ8R) — the engine sizes image
+    model: /models/image/krea-2-raw-iq8r.rad # models itself (batch/context from the largest pass)
+    tp: 1 # == the block's gpu.cards (doctor cross-checks)

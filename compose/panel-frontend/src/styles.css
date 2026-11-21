@@ -1393,6 +1393,26 @@ pre.out.err {
   margin-top: 10px;
 }
 
+/* the dedicated group: reserved tiles sit OUT of the pool grid (position is
+   the "not mixed in" cue — no alarm color). auto-fill (not auto-fit) keeps a
+   lone tile at one cell wide instead of stretching across the row. */
+.gpu-pool-dedicated {
+  margin-top: 12px;
+}
+
+.gpu-pool-caption {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--dim);
+  margin-bottom: 6px;
+}
+
+.gpu-pool.dedicated {
+  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+  margin-top: 0;
+}
+
 .gpu-tile {
   background: var(--bg);
   border: 1px solid var(--line);
@@ -1406,6 +1426,11 @@ pre.out.err {
 
 .gpu-tile.held {
   border-color: var(--green);
+}
+
+.gpu-tile.reserved {
+  border-style: dashed;
+  opacity: 0.8;
 }
 
 .gpu-tile-top {
@@ -1469,6 +1494,44 @@ pre.out.err {
   color: var(--red);
 }
 
+/* card dedications (reservations) under the pool grid */
+.reservations {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+}
+
+.reservation {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.reservation .badge {
+  font-size: 11px;
+}
+
+.reservation.form {
+  flex-wrap: wrap;
+  padding: 8px 10px;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  width: 100%;
+}
+
+.reservation.form input[type='text'] {
+  min-width: 180px;
+}
+
+/* the dedicated-card chip in the Overview's per-GPU header */
+.chip.reserved {
+  border-color: var(--amber);
+  color: var(--amber);
+}
+
 /* the expanded pick row under an instance */
 .pick-row td {
   background: var(--bg);
@@ -1498,4 +1561,126 @@ pre.out.err {
 .pick.blocked {
   opacity: 0.45;
   cursor: default;
+}
+
+/* ── Gen view ──────────────────────────────────────────────────────────── */
+
+.gen-view .card + .card {
+  margin-top: 14px;
+}
+
+.gen-composer .gen-compose-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px 14px;
+  margin: 8px 0 4px;
+}
+
+.gen-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 13px;
+}
+
+.gen-field > span {
+  color: var(--muted);
+}
+
+.gen-field select,
+.gen-field input,
+.gen-field textarea {
+  width: 100%;
+}
+
+.gen-field textarea {
+  resize: vertical;
+  font-family: inherit;
+}
+
+.gen-prompt {
+  grid-column: 1 / -1;
+}
+
+.gen-target-line {
+  margin: 6px 0 0;
+  font-size: 12px;
+}
+
+.gen-err {
+  margin: 8px 0 0;
+}
+
+.gen-model-note {
+  margin: 2px 0 0;
+  font-size: 12px;
+}
+
+.gen-err-text {
+  color: var(--red);
+}
+
+.gen-progress {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 8px;
+  min-width: 110px;
+}
+
+.gen-progress i {
+  font-style: normal;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.gen-prompt-cell {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gen-artifact {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.gen-thumb {
+  width: 56px;
+  height: 56px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--track);
+}
+
+/* a video with no (best-effort) thumbnail — same box, dashed, no image */
+.gen-thumb-placeholder {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-style: dashed;
+  color: var(--dim);
+  font-size: 15px;
+}
+
+.gen-modelchip {
+  display: inline-block;
+  margin-right: 6px;
+}
+
+.gen-modelchip i {
+  font-style: normal;
+  color: var(--dim);
+  font-size: 11px;
+  margin-left: 3px;
+}
+
+.gen-settings {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 10px 14px;
+  margin: 8px 0 4px;
 }

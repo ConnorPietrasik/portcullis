@@ -993,11 +993,15 @@ snapshot_host_stack() { # <snapshot-dir>
   fi
   # The deployed config tree — a tarball so rollback restores it as a unit.
   # Explicit members only, so runtime data is never in it: authelia/db.sqlite3
-  # (TOTP seeds) and panel-frontend's node_modules/dist.
+  # (TOTP seeds) and panel-frontend's node_modules/dist. gpu-configs MUST ride
+  # it too: the radiance configs are coupled to the compose blocks that mount
+  # them (a mount-target move and the configs' model paths land in the same
+  # update), so a rollback that restored the compose but not the configs would
+  # leave every gpu-* instance pointing at a model path that no longer exists.
   local members=()
-  for m in docker-compose.yml traefik portfolio searxng authelia/configuration.yml \
-           authelia/users_database.yml panel-frontend .env .panel-api.env \
-           .panel-ddns.env; do
+  for m in docker-compose.yml gpu-configs traefik portfolio searxng \
+           authelia/configuration.yml authelia/users_database.yml panel-frontend \
+           .env .panel-api.env .panel-ddns.env; do
     # if, not `[[ ]] &&`: when the test fails the &&-list is the loop body's
     # last command and leaves the loop's exit status at 1.
     if [[ -e "/opt/panel/$m" ]]; then members+=("$m"); fi
@@ -1083,7 +1087,7 @@ wait_panel_api_healthy() { # <timeout-seconds>
 update_panel_api() {
   PANEL_API_REASON=""
   local f
-  for f in main.py gpu_pool.py gpu_autostart.py requirements.txt; do
+  for f in main.py gpu_pool.py gpu_autostart.py gen_jobs.py requirements.txt; do
     sudo cp -a "$REPO_ROOT/panel-api/$f" /opt/panel-api/ \
       || { PANEL_API_REASON="cannot install $f into /opt/panel-api"; return 1; }
   done

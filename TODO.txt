@@ -1,3 +1,11 @@
-Add image / video gen stuff
+Add image / video edit stuff
+Add servitor image/video integration
+- `/machine/gen/*` route alias over the same handlers + bearer gate
+  (`compare_digest`, not dev-bypassed) — no handler rework.
+- doctor: no router **rule** matches `PathPrefix(/machine)` (rule-based, not
+  a word grep).
+- Servitor script (`gen-image`/`gen-video`, `--out`, `--list`, exit codes;
+  key already in the guest env as `OMNISSIAH_API_KEY`) + ~10-line skill doc,
+  in the servitor repo, deployed via `servitor-sync`.
 Make an actual portfolio site
 MAYBE - An Android app, so I can do everything from my phone without a browser? Would also fix the NAT hairpin thing since it could probably do explicit network stuff for itself.

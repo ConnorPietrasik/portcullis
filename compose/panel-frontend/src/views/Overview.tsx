@@ -199,6 +199,16 @@ export default function Overview({ intervalMs }: { intervalMs: number }) {
   const net = data?.net ?? {}
   const disks = Array.isArray(data?.disks) ? data!.disks : []
   const gpus = Array.isArray(data?.gpus) ? data!.gpus : []
+  // Render order: pool cards first (ROCR index), the dedicated (reserved)
+  // card(s) last — the x8 card sits outside the pairs the pool actually
+  // runs, so it stays out of the middle of the block. Each card keeps its
+  // GPU-N + BDF identity, and the charts/open-state key on the card NAME,
+  // so the reorder is purely cosmetic (it mirrors the GPUs view's split).
+  const orderedGpus = [...gpus].sort(
+    (a, b) =>
+      Number(a.reserved_for != null) - Number(b.reserved_for != null) ||
+      a.rocr_index - b.rocr_index,
+  )
   const load = Array.isArray(data?.load) ? data!.load : []
   const cores = cpu?.cores || 0
 
@@ -250,7 +260,7 @@ export default function Overview({ intervalMs }: { intervalMs: number }) {
 
       {gpus.length > 0 && (
         <div className="gpus">
-          {gpus.map((g) => (
+          {orderedGpus.map((g) => (
             <GpuCard key={g.card} gpu={g} hist={hist} windowN={windowN} intervalS={intervalS} spanLabel={spanLabel} />
           ))}
         </div>
@@ -838,6 +848,14 @@ function GpuCard({ gpu, hist, windowN, intervalS, spanLabel }: { gpu: Gpu; hist:
         <h3>GPU-{gpu.rocr_index}</h3>
         {gpu.pci_id && <Chip title={`driver: ${gpu.driver || '?'}`}>{gpu.pci_id}</Chip>}
         {gpu.pci_slot && <Chip title="PCI slot">{gpu.pci_slot.replace(/^0000:/, '')}</Chip>}
+        {gpu.reserved_for && (
+          <Chip
+            className="reserved"
+            title={`reserved for ${gpu.reserved_for}${gpu.reserved_note ? ` — ${gpu.reserved_note}` : ''}: the auto-grab never hands this card to another instance`}
+          >
+            {gpu.reserved_note || 'reserved'}
+          </Chip>
+        )}
         <Pill tone={state.tone} title={state.title}>
           {state.label}
         </Pill>
