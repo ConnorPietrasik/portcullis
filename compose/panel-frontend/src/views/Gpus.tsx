@@ -458,7 +458,14 @@ export default function Gpus({ intervalMs }: { intervalMs: number }) {
                           const holder = data.pool[c]?.holder ?? null
                           const reserved = data.pool[c]?.reserved ?? null
                           // fenced two ways: held by someone else, OR reserved for
-                          // someone else — the reservation is the x8 card's fence
+                          // someone else — the reservation is the x8 card's fence.
+                          // The fence blocks SELECTING a card, not deselection: a
+                          // card already in the seeded set can become fenced after
+                          // the fact (a reservation is made, or another instance
+                          // grabs it). Disabling that checkbox strands the set —
+                          // apply would always 400 (the backend re-checks the
+                          // fence) with no way out but "auto". The backend fence
+                          // stays the authority; this only keeps the picker usable.
                           const blockedHolder = holder != null && holder !== inst.name
                           const blockedResv = reserved != null && reserved.for !== inst.name
                           const blocked = blockedHolder || blockedResv
@@ -474,7 +481,7 @@ export default function Gpus({ intervalMs }: { intervalMs: number }) {
                             >
                               <input
                                 type="checkbox"
-                                disabled={blocked}
+                                disabled={blocked && !picked.includes(c)}
                                 checked={picked.includes(c)}
                                 onChange={() => toggleCard(c)}
                               />
