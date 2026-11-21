@@ -7,6 +7,7 @@
 // that colour means "this needs you" (amber/red) or "just a reading"
 // (accent/cyan). Anything else is a rainbow you have to decode.
 
+import { useEffect, useId, useRef } from 'react'
 import type { ReactNode } from 'react'
 import { clamp01 } from './fmt'
 import type { Tone } from './fmt'
@@ -247,5 +248,86 @@ export function TrendMark({ arrow, text, tone = 'muted' }: { arrow: string; text
       {arrow && <b>{arrow}</b>}
       {text}
     </span>
+  )
+}
+
+// ─────────────────────────── dialog ──────────────────────────────────────
+
+/**
+ * A popup editor: a backdrop + a centred card over the page. Closes on
+ * Escape, the ×, the caller's own cancel, or a mousedown that STARTS on the
+ * backdrop (checked on mousedown, not click — a click that only ENDS on the
+ * backdrop after dragging text out of the modal would otherwise close it
+ * and lose the selection). Body scroll is locked while open. On open, focus
+ * moves into the dialog (so Escape and Tab start there); on close it is
+ * restored to whatever was focused before. Deliberately no focus trap:
+ * this app's inputs are simple and tab order stays sane.
+ */
+export function Modal({
+  title,
+  onClose,
+  children,
+  footer,
+  width = 640,
+}: {
+  title: ReactNode
+  onClose: () => void
+  children: ReactNode
+  footer?: ReactNode
+  /** max width in px */
+  width?: number
+}) {
+  // Callers pass inline arrows (new identity every render); read the latest
+  // through a ref so the Escape listener below subscribes ONCE instead of
+  // re-subscribing on every caller re-render (i.e. every keystroke).
+  const closeRef = useRef(onClose)
+  useEffect(() => {
+    closeRef.current = onClose
+  }, [onClose])
+
+  const boxRef = useRef<HTMLDivElement>(null)
+  const titleId = useId()
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') closeRef.current()
+    }
+    window.addEventListener('keydown', onKey)
+    const prevOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    const prevFocus = document.activeElement
+    boxRef.current?.focus()
+    return () => {
+      window.removeEventListener('keydown', onKey)
+      document.body.style.overflow = prevOverflow
+      if (prevFocus instanceof HTMLElement) prevFocus.focus()
+    }
+  }, [])
+
+  return (
+    <div
+      className="modal-backdrop"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose()
+      }}
+    >
+      <div
+        ref={boxRef}
+        className="modal"
+        style={{ maxWidth: width }}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        tabIndex={-1}
+      >
+        <header>
+          <h3 id={titleId}>{title}</h3>
+          <button className="modal-x" title="close" onClick={onClose}>
+            ×
+          </button>
+        </header>
+        <div className="modal-body">{children}</div>
+        {footer && <div className="modal-footer btns">{footer}</div>}
+      </div>
+    </div>
   )
 }

@@ -8,7 +8,7 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
 import { usePoll } from '../usePoll'
-import { Meter } from '../ui'
+import { Meter, Modal } from '../ui'
 import { relTime } from '../fmt'
 import type { GenJob, GenOverview, GenSlot, GenState } from '../types'
 
@@ -481,9 +481,102 @@ interface SettingsForm {
   gcDays: string
 }
 
+// The per-model rewrite instructions live in a popup, not on the card: with
+// a fleet's worth of gen models, one textarea each would swamp the settings
+// card (and a 2-row box is too small to compose an instruction anyway).
+// The card keeps ONE button + a set-count; the popup gives each instruction
+// a model dropdown and a full-width, tall textarea. It edits the SAME
+// form.prompts draft as the card — no second copy — so the card's and the
+// popup's save buttons persist the identical body (the
+// settings PUT is all-or-nothing: the server rebuilds the whole file from
+// the body, a partial one wipes the fields it omits). Close just drops the
+// popup; the draft stays in the card, nothing is lost.
+function PromptEditorModal({
+  models,
+  prompts,
+  onPrompt,
+  err,
+  busy,
+  saving,
+  onSave,
+  onClose,
+}: {
+  models: string[]
+  prompts: Record<string, string>
+  onPrompt: (model: string, text: string) => void
+  err: string | null
+  busy: boolean
+  saving: boolean
+  onSave: () => void
+  onClose: () => void
+}) {
+  const [sel, setSel] = useState('')
+  // the selection can go stale if the fleet changes while open — fall back
+  // to the first model rather than editing an entry that's no longer hosted
+  const model = models.includes(sel) ? sel : models[0] ?? ''
+  // the fallback can leave the state holding the dead name while the select
+  // shows the fallback — sync them (one render, then model === sel settles)
+  useEffect(() => {
+    if (sel !== model) setSel(model)
+  }, [model, sel])
+  const set = models.filter((n) => (prompts[n] ?? '').trim() !== '').length
+  return (
+    <Modal
+      title={
+        <>
+          enhancement prompts <span className="muted">— {set}/{models.length} models set</span>
+        </>
+      }
+      onClose={onClose}
+      footer={
+        <>
+          <button disabled={busy || saving} onClick={onSave}>
+            {saving ? 'saving…' : 'save settings'}
+          </button>
+          <button onClick={onClose}>close</button>
+        </>
+      }
+    >
+      <label className="gen-field">
+        <span>
+          model <span className="muted">— pick which model's instruction to edit</span>
+        </span>
+        <select value={model} onChange={(e) => setSel(e.target.value)}>
+          {models.map((n) => (
+            <option key={n} value={n}>
+              {n} — {(prompts[n] ?? '').trim() ? 'prompt set' : '(no prompt)'}
+            </option>
+          ))}
+        </select>
+      </label>
+      {model && (
+        <label className="gen-field">
+          <span>
+            enhancement prompt — <code>{model}</code>
+          </span>
+          <textarea
+            rows={10}
+            value={prompts[model] ?? ''}
+            placeholder="(empty = no enhancement for this model)"
+            onChange={(e) => onPrompt(model, e.target.value)}
+          />
+        </label>
+      )}
+      {err && <div className="banner err gen-err">{err}</div>}
+      <p className="muted gen-model-note">
+        the enhance target (the instance → model pair in the settings) rewrites the job's prompt with
+        this instruction before it reaches the gen model; a model with an empty prompt skips
+        enhancement. Saving stores it with the rest of the gen settings.
+      </p>
+    </Modal>
+  )
+}
+
 function SettingsCard({ o, busy, onSaved }: { o: GenOverview; busy: boolean; onSaved: () => void }) {
   const [form, setForm] = useState<SettingsForm | null>(null)
   const [err, setErr] = useState<string | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [showPrompts, setShowPrompts] = useState(false)
   // seed once from the first poll; later polls never clobber a half-edited form
   useEffect(() => {
     if (!form) {
@@ -503,10 +596,12 @@ function SettingsCard({ o, busy, onSaved }: { o: GenOverview; busy: boolean; onS
   const videoModels = Object.entries(o.models).filter(([, m]) => m.kind === 'video').map(([n]) => n)
   const genModels = [...imageModels, ...videoModels]
   const targetInstance = o.instances.find((i) => i.name === form.enhanceInstance)
+  const promptCount = genModels.filter((n) => (form.prompts[n] ?? '').trim() !== '').length
 
-  async function save() {
-    if (!form) return
+  async function save(): Promise<boolean> {
+    if (!form) return false
     setErr(null)
+    setSaving(true)
     const body: Record<string, unknown> = {
       purposes: Object.fromEntries(Object.entries(form.purposes).filter(([, v]) => v)),
       enhance: {
@@ -520,8 +615,12 @@ function SettingsCard({ o, busy, onSaved }: { o: GenOverview; busy: boolean; onS
     try {
       await api('/gen/settings', { method: 'PUT', body: JSON.stringify(body) })
       onSaved()
+      return true
     } catch (e) {
       setErr(String(e instanceof Error ? e.message : e))
+      return false
+    } finally {
+      setSaving(false)
     }
   }
 
@@ -607,19 +706,22 @@ function SettingsCard({ o, busy, onSaved }: { o: GenOverview; busy: boolean; onS
             ))}
           </select>
         </label>
-        {genModels.map((n) => (
-          <label key={n} className="gen-field">
-            <span>
-              enhancement prompt — <code>{n}</code>
-            </span>
-            <textarea
-              rows={2}
-              value={form.prompts[n] ?? ''}
-              placeholder="(empty = no enhancement for this model)"
-              onChange={(e) => setForm({ ...form, prompts: { ...form.prompts, [n]: e.target.value } })}
-            />
-          </label>
-        ))}
+        <div className="gen-field">
+          <span>
+            enhancement prompts <span className="muted">— one rewrite instruction per gen model; edited in the popup</span>
+          </span>
+          <button
+            disabled={busy || saving || genModels.length === 0}
+            title={
+              genModels.length === 0
+                ? 'no gen models deployed (the gen slots)'
+                : 'edit the per-model enhancement prompts'
+            }
+            onClick={() => setShowPrompts(true)}
+          >
+            manage enhancement prompts ({promptCount}/{genModels.length} set)
+          </button>
+        </div>
         <label className="gen-field">
           <span>
             delete artifacts after (days)
@@ -633,12 +735,26 @@ function SettingsCard({ o, busy, onSaved }: { o: GenOverview; busy: boolean; onS
           />
         </label>
       </div>
-      {err && <div className="banner err gen-err">{err}</div>}
+      {/* while the popup is open its own banner shows the error — don't
+          render the same one twice (here and behind the backdrop) */}
+      {err && !showPrompts && <div className="banner err gen-err">{err}</div>}
       <div className="btns">
-        <button disabled={busy} onClick={() => void save()}>
-          save settings
+        <button disabled={busy || saving} onClick={() => void save()}>
+          {saving ? 'saving…' : 'save settings'}
         </button>
       </div>
+      {showPrompts && genModels.length > 0 && (
+        <PromptEditorModal
+          models={genModels}
+          prompts={form.prompts}
+          onPrompt={(n, v) => setForm({ ...form, prompts: { ...form.prompts, [n]: v } })}
+          err={err}
+          busy={busy}
+          saving={saving}
+          onSave={() => void save().then((ok) => { if (ok) setShowPrompts(false) })}
+          onClose={() => setShowPrompts(false)}
+        />
+      )}
     </div>
   )
 }
