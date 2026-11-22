@@ -17,6 +17,7 @@ jwt="$(openssl rand -hex 32)"
 sess="$(openssl rand -hex 32)"
 enc="$(openssl rand -hex 32)"
 searxng_secret="$(openssl rand -hex 32)"
+servitor_edge_key="$(openssl rand -hex 32)"
 
 sed -i \
   -e "s|__PANEL_TOKEN__|${panel_token}|g" \
@@ -24,6 +25,7 @@ sed -i \
   -e "s|__AUTHELIA_SESSION_SECRET__|${sess}|g" \
   -e "s|__AUTHELIA_STORAGE_ENCRYPTION_KEY__|${enc}|g" \
   -e "s|__SEARXNG_SECRET__|${searxng_secret}|g" \
+  -e "s|__SERVITOR_EDGE_KEY__|${servitor_edge_key}|g" \
   "$REPO_ROOT/.env"
 
 # Placeholder-survival assert: the fill list above is hardcoded, so a

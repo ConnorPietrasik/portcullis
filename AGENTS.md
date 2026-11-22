@@ -130,9 +130,15 @@ change, not a refactor. The "why" for each is in `docs/ARCHITECTURE.md`.
   `make update`. RUNBOOK → "GPU fleet".
 - **Servitor VM (day-2)**: four `servitor-*` panel actions (status/vm-
   restart/sync/doctor); the route (`traefik/dynamic/servitor.yml`, raw VM IP
-  upstream — invariant 2: still a file, no docker.sock) and the actions live
-  in THIS repo; the scripts live in the separate `/opt/servitor-repo`
-  checkout. Day-2 updates + image swaps are SSH-side (`make update` in that
+  upstream — invariant 2: still a file, no docker.sock) + its second
+  middleware (`servitor-edge` in `traefik/dynamic/middlewares.yml`, injects
+  `X-Servitor-Edge-Key` from `SERVITOR_EDGE_KEY` — the edge credential the
+  VM app re-verifies on every route; invariant 3 in the servitor repo) and
+  the actions live in THIS repo; the scripts live in the separate
+  `/opt/servitor-repo` checkout. `SERVITOR_EDGE_KEY` must be the SAME value
+  in this repo's `.env` and `/opt/servitor-repo/.env` (a mismatch 403s the
+  whole servitor UI — `make doctor` cross-checks them). Day-2 updates +
+  image swaps are SSH-side (`make update` in that
   repo — self-gated, deliberately not a panel action) and ALSO run as the
   non-gating tail of portcullis's own `make update` / auto-update
   (`SERVITOR_UPDATE=0` to skip; a servitor failure never rolls back the host

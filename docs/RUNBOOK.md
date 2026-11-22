@@ -1149,8 +1149,13 @@ The [servitor](https://github.com/ConnorPietrasik/servitor) project — a home
 assistant that runs pi (a coding agent) in a libvirt VM on the edge segment —
 is hosted on this server. The VM is a **raw IP upstream in one traefik route**,
 not a container: the file provider reaches it at `SERVITOR_VM_IP:8787`, the
-auth chain (`auth-chain@file`) is its only gate (the app authenticates nobody),
-and the VM's own nftables admits 8787 from the edge subnet only + 22 from the
+auth chain (`auth-chain@file`) gates the user and the `servitor-edge`
+middleware injects the edge credential the app re-verifies on every route
+(invariant 3 in the servitor repo — the app authenticates no user, and the
+credential is what stops a neighbor container from driving the agent: the
+next line explains why reachability alone is not enough), and the VM's own
+nftables admits 8787 from the WHOLE edge subnet (the proxy's source IP is
+indistinguishable from a neighbor's — hence the credential) + 22 from the
 host's edge-bridge IP /32 + the ops subnet (the host's own ssh to the VM
 sources its edge-bridge IP — the kernel picks the output-interface address
 for the connected route — so neither LAN-only nor the full edge segment is
@@ -1189,6 +1194,10 @@ sudo ssh-keygen -t ed25519 -N '' -f /root/.srv/deploy_key   # pub half gets bake
 sudo cp /opt/servitor-repo/.env.example /opt/servitor-repo/.env
 sudo chmod 600 /opt/servitor-repo/.env
 #    — set OMNISSIAH_API_KEY (= the fleet's LLM_API_KEY), EXA_API_KEY,
+#      SERVITOR_EDGE_KEY (the edge credential, invariant 3 over there —
+#      generate ONE value, e.g. openssl rand -hex 32, and set the SAME
+#      value in THIS repo's .env too: the servitor-edge middleware's
+#      source; a mismatch 403s the whole UI, `make doctor` cross-checks),
 #      SERVITOR_EDGE_SUBNET (from: sudo docker network inspect edge -f
 #      '{{range .IPAM.Config}}{{.Subnet}}{{end}}'), SERVITOR_OPS_SUBNET
 #      (your LAN subnet), SERVITOR_VM_IP (unused address in the edge subnet;
@@ -1250,7 +1259,7 @@ make update                          # gated: sync + recreate + doctor gate
 | edit prompts/skills/lib | edit `agent-config/` / `lib/` in `/opt/servitor-repo`, panel → `servitor-sync` (never blocks a run — an active run gets the update-waiting flag and exit 0; the app's tick applies at the next idle moment) |
 | deploy gate | panel → `servitor-doctor` (guest certification + firewall probes + one live prompt + one live search) |
 | update pi / extension / guest userland | it runs itself as the best-effort tail of portcullis's own `make update` (host gates pass first; its failure never rolls back the host stack — `SERVITOR_UPDATE=0` skips it), or `sudo make update` in the host checkout (SSH — long, network-bound; floats each selection to the newest release in the same major, reports out-of-major releases instead of applying them, rebuilds + swaps the image when the userland outgrows the 7-day freshness floor so the guest kernel updates with it, its own conformance gates + auto-rollback; deliberately NOT a panel action). First run on a fresh server: the gate is host-side, so the checkout needs `sudo make venv` + the `slot1` user (servitor INSTALL.md §10) |
-| rotate keys | host `.env` → servitor `deploy/sync.sh` (re-injects the key slice into the guest's 0600 env file) + restart; the portcullis stack's copy of the key floats with its own `make update` as usual |
+| rotate keys | host `.env` → servitor `deploy/sync.sh` (re-injects the key slice into the guest's 0600 env file) + restart; the portcullis stack's copy of the key floats with its own `make update` as usual. The edge key (`SERVITOR_EDGE_KEY`) rotates on BOTH sides: this repo's .env (the middleware's source) + `/opt/servitor-repo/.env` (the guest's copy), then `make update` here + a servitor-sync — the doctor's key probe catches a half-rotation |
 
 The four actions exec `virsh` and the checkout's `deploy/sync.sh` /
 `deploy/doctor.sh` as root, and portcullis's `make update` servitor tail

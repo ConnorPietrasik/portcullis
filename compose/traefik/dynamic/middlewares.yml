@@ -1,6 +1,7 @@
-# Shared middlewares. The X-Panel-Token header value is a placeholder —
-# stack_sync_configs (setup/common.sh) substitutes it in the deployed file
-# (which therefore contains a secret — it is chmod 600 on the server).
+# Shared middlewares. The X-Panel-Token and X-Servitor-Edge-Key header
+# values are placeholders — stack_sync_configs (setup/common.sh)
+# substitutes them in the deployed files (which therefore contain secrets
+# — they are chmod 600 on the server).
 
 http:
   middlewares:
@@ -45,3 +46,19 @@ http:
       headers:
         customRequestHeaders:
           X-Panel-Token: __PANEL_TOKEN__
+
+    # The servitor edge credential (invariant 3 in the servitor repo).
+    # Injected on the servitor route ONLY, AFTER the auth chain: the app
+    # re-verifies it on every route (constant-time), and the guest
+    # firewall admits the port from the WHOLE edge subnet — the proxy's
+    # source IP is indistinguishable from a neighbor's, so the credential
+    # is what stops a neighbor container (the public gpu fleet) from
+    # driving the agent or reading its files directly. Traefik overwrites
+    # any client-supplied value (same contract as panel-secret above).
+    # The value MUST equal SERVITOR_EDGE_KEY in /opt/servitor-repo/.env
+    # (the guest's copy, synced into the guest env file by its key slice);
+    # make doctor cross-checks the two.
+    servitor-edge:
+      headers:
+        customRequestHeaders:
+          X-Servitor-Edge-Key: __SERVITOR_EDGE_KEY__

@@ -132,7 +132,7 @@ panel-uid systemd units load — `/opt/panel/.panel-api.env` (0600; `PANEL_TOKEN
 `DDNS_HOSTS`) — because a panel-uid process can read its own `/proc/<pid>/environ`, so the panel-uid services (long-lived
 panel-api, and the same-uid panel-ddns oneshot on each tick) never load the full set: each gets only its slice (`LLM_API_KEY` is
 in panel-api's by design — the /v1 fallback router's bearer gate and the SearXNG search gate, which reuses it; the Authelia secrets are in neither). Deploy-time placeholders
-(`__PANEL_TOKEN__`, `__ACME_EMAIL__`, `__ACME_CA_SERVER__`) are substituted into the deployed Traefik configs (static
+(`__PANEL_TOKEN__`, `__ACME_EMAIL__`, `__ACME_CA_SERVER__`, `__SERVITOR_EDGE_KEY__`) are substituted into the deployed Traefik configs (static
 `traefik.yml` + `dynamic/middlewares.yml`), and `__SEARXNG_SECRET__` into the deployed
 `searxng/settings.yml` (the instance secret — see below), by `stack_sync_configs` in `setup/common.sh` — run by both
 `setup/02-deploy-stack.sh` (first boot) and `setup/08-update.sh` (every `make update`); the repo copy stays clean.
@@ -169,10 +169,16 @@ libvirt/KVM domain on the portcullis edge bridge (24 vCPU, 30 GB balloon ceiling
 ~200 GB state disk, no GPU), with per-session slot uids, overlay workdirs, and a
 default-deny guest nftables inside. Portcullis's role is deliberately thin —
 three things, all inside its existing invariants: (1) **one file-provider route**
-to the VM's ingress IP:8787; the app authenticates nobody, so reachability IS
-the control — the edge auth chain (Authelia 2FA) is the only gate, and the VM's
-own firewall admits the port from the edge subnet only, which is why the route
-may name a raw IP: an attacker would already have to be on the edge segment. (2)
+to the VM's ingress IP:8787, carrying two gates: the edge auth chain
+(Authelia 2FA) authenticates the user, and the `servitor-edge` middleware
+injects the edge credential (`X-Servitor-Edge-Key` — `SERVITOR_EDGE_KEY` in
+this repo's .env, sedded into the deployed middlewares.yml, 0600) which the
+app re-verifies on every route; the VM's own firewall admits the port from the
+WHOLE edge subnet (the proxy's source IP is indistinguishable from a
+neighbor's), so the credential — not mere reachability — is what stops a
+neighbor container (the public gpu fleet) from driving the agent or reading
+its files directly, and it is why the route may name a raw IP at all: an
+attacker would already have to be on the edge segment AND hold the key. (2)
 **Four panel-do actions** (`servitor-status/-vm-restart/-sync/-doctor`) —
 `virsh` plus the servitor repo's host-side `deploy/sync.sh`/`deploy/doctor.sh`,
 executed as root from a second checkout (`/opt/servitor-repo`) under the same
@@ -185,8 +191,12 @@ container, so docker's FORWARD rules never see its traffic and the host's
 default-deny routed policy applies to its egress; without the line the VM has
 no public DNS and its model/search calls die. The doctor parses the IP from
 the route file and checks the rule against it. What portcullis does NOT do: run any servitor
-process, hold its secrets (the key slice lives in the guest's 0600 env file,
-injected by its own sync pipeline), or open 8787 on the host (nothing on the
+process, or hold its model/search secrets (that key slice lives in the guest's
+0600 env file, injected by the servitor sync pipeline). It DOES hold the edge
+credential (`SERVITOR_EDGE_KEY`) — the value the middleware injects — and
+`make doctor` cross-checks it against the servitor checkout's copy (a drift
+403s the whole servitor UI with no other symptom). Nor does portcullis open
+8787 on the host (nothing on the
 host listens on it — the only host-side consumer is panel-do's 5 s healthz
 probe). VM downtime is a first-class state: doctor warns (route 502s) but never
 red-lights the update gate for a deliberately powered-down VM.

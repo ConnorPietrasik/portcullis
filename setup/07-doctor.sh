@@ -1135,6 +1135,48 @@ else
     bad "panel-do registry missing servitor-status — the panel's servitor actions are dead"
     hint "binary is stale — make panel-do (rebuilds + reinstalls it)"
   fi
+  # Edge credential drift (invariant 3 in the servitor repo): the middleware's
+  # value (this repo's .env, sedded into the deployed middlewares.yml) and the
+  # guest's (the servitor checkout's .env, synced into the guest env file by
+  # its key slice) must agree — a drift 403s EVERY servitor request with no
+  # other symptom, so it gets a hard check here. Values are compared in shell
+  # variables and never printed (either side may be the secret store's only
+  # readable record). Compare what the two CONSUMERS actually receive: trim +
+  # strip one pair of matching surrounding quotes (envload.sh, the servitor's
+  # `source`, and systemd's EnvironmentFile all agree on that) — a value
+  # quoted in one file and bare in the other is the SAME key, not drift.
+  # Absent checkout = SKIP (the route pre-dates the install; INSTALL.md §3
+  # owns the pairing).
+  if [[ -d /opt/servitor-repo && -f /opt/servitor-repo/.env ]]; then
+    serv_pk_a="$(sudo grep -m1 -E '^[[:space:]]*SERVITOR_EDGE_KEY[[:space:]]*=' "$REPO_ROOT/.env" 2>/dev/null | cut -d= -f2- || true)"
+    serv_pk_b="$(sudo grep -m1 -E '^[[:space:]]*SERVITOR_EDGE_KEY[[:space:]]*=' /opt/servitor-repo/.env 2>/dev/null | cut -d= -f2- || true)"
+    # The consumer-equivalent of the value (never echoes — the value may be
+    # the secret store's only readable record): ltrim/rtrim, then one pair of
+    # matching surrounding quotes, exactly as envload.sh / `source` / systemd
+    # parse it. A lone quote or an unterminated one is left alone (drifts
+    # against the bare value, as it would at deploy time).
+    serv_pk_norm() {
+      local v="$1"
+      v="${v#"${v%%[![:space:]]*}"}"
+      v="${v%"${v##*[![:space:]]}"}"
+      case "$v" in
+        '"'*'"') v="${v:1:${#v}-2}" ;;
+        "'"*"'") v="${v:1:${#v}-2}" ;;
+      esac
+      printf '%s' "$v"
+    }
+    serv_pk_a="$(serv_pk_norm "$serv_pk_a")"
+    serv_pk_b="$(serv_pk_norm "$serv_pk_b")"
+    if [[ -z "$serv_pk_a" || -z "$serv_pk_b" ]]; then
+      bad "SERVITOR_EDGE_KEY missing from one of the two .env files (portcullis / the servitor checkout) — the route and the VM disagree, every request 403s"
+      hint "generate ONE value (openssl rand -hex 32) and set it in BOTH: this repo's .env and /opt/servitor-repo/.env, then make update + panel servitor-sync"
+    elif [[ "$serv_pk_a" != "$serv_pk_b" ]]; then
+      bad "SERVITOR_EDGE_KEY drift: the portcullis .env and /opt/servitor-repo/.env disagree — every servitor request 403s"
+      hint "make the two files hold the SAME value, then make update (the middleware) + panel servitor-sync (the guest key slice)"
+    else
+      ok "SERVITOR_EDGE_KEY agrees between the portcullis .env and the servitor checkout"
+    fi
+  fi
 fi
 
 # ── panel-ddns ───────────────────────────────────────────────────────────────

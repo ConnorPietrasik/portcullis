@@ -3,11 +3,16 @@
 # address (invariant 2: the route is a file, no docker.sock). The IP mirrors
 # SERVITOR_VM_IP/SERVITOR_BIND in /opt/servitor-repo/.env — keep in sync on
 # re-address.
-# Auth: the portcullis auth chain only (Authelia 2FA); the
-# servitor.pietrasik.top admins-only rule pair in authelia/configuration.yml
-# sits ABOVE the wildcard, or any authenticated user reaches the agent VM.
-# No UFW ingress change: the route rides 443; the VM's firewall admits 8787
-# from the edge subnet only.
+# Auth: two gates on this route. (1) the portcullis auth chain (Authelia
+# 2FA); the servitor.pietrasik.top admins-only rule pair in
+# authelia/configuration.yml sits ABOVE the wildcard, or any authenticated
+# user reaches the agent VM. (2) the servitor-edge middleware injects the
+# edge credential (X-Servitor-Edge-Key) which the app re-verifies on every
+# route (invariant 3 in the servitor repo): the VM's firewall admits 8787
+# from the WHOLE edge subnet, so without the credential a neighbor
+# container (the public gpu fleet) could drive the agent and read its files
+# directly.
+# No UFW ingress change: the route rides 443.
 http:
   routers:
     servitor:
@@ -16,6 +21,7 @@ http:
         - websecure
       middlewares:
         - auth-chain@file
+        - servitor-edge@file
       service: servitor
   services:
     servitor:
