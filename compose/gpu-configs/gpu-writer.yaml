@@ -51,7 +51,7 @@ models:
     model: /models/llm/hemmingway-1.5-iq4r-s-tool-tail-mtp-gptq.rad
     aliases: [default] # model-less requests land here (the instance's default)
     tp: 1 # == the block's gpu.cards (doctor cross-checks — this is the file's first tp:)
-    max-model-len: 100000
+    max-model-len: 200000
     max-num-seqs: 8 # the panel's enhance cap lands here by default; over-
     # subscribing is safe (radiance queues excess sequences)
     # Packager-recommended: the MTP drafter the model ships (auto = the
