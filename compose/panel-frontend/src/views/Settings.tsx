@@ -33,10 +33,6 @@ export default function Settings({
           <input value={v} inputMode="numeric" onChange={(e) => setV(e.target.value)} />
         </label>
         <button onClick={save}>save</button>
-        <p className="muted">
-          Stored in this browser's localStorage. 2s is a good default; the API is rate-limited to
-          10 req/s, so don't go below ~1.5s with all views open.
-        </p>
       </div>
       <LLMRouterCard intervalMs={intervalMs} />
       <AutoUpdateCard intervalMs={intervalMs} />
@@ -60,7 +56,7 @@ function AutoUpdateCard({ intervalMs }: { intervalMs: number }) {
     if (
       !window.confirm(
         on
-          ? 'enable the daily auto-update timer?\n\nit fires 2 min after boot + daily — on a box that is already up, the first tick fires immediately (the same gated, auto-rolling-back make update; a dirty clone skips)'
+          ? 'enable the daily auto-update timer? (the first tick fires immediately)'
           : 'disable the daily auto-update timer?',
       )
     )
@@ -84,14 +80,8 @@ function AutoUpdateCard({ intervalMs }: { intervalMs: number }) {
     <div className="card">
       <h3>auto-update</h3>
       <p className="muted">
-        Re-runs <code>make update</code> daily (and after boot): floating container images, panel-web's build
-        bases, npm/pip within their declared ranges — with the same doctor precondition, snapshot, health gate and
-        auto-rollback as a manual run. It applies only what the server clone holds — no git pull; a dirty clone is
-        skipped, and majors only land when you commit them.
-      </p>
-      <p className="muted">
         {enabled == null ? (
-          'timer not installed — run <code>make autoupdate</code> on the server'
+          'timer not installed (<code>make autoupdate</code>)'
         ) : enabled ? (
           <b className="t-ok">enabled</b>
         ) : (
@@ -181,9 +171,7 @@ function LLMRouterCard({ intervalMs }: { intervalMs: number }) {
         llm.pietrasik.top <span className="muted">— ordered fallback</span>
       </h3>
       <p className="muted">
-        One base URL for clients that just want the best model currently serving:{' '}
-        <code>base_url = https://llm.pietrasik.top/v1</code> with your LLM_API_KEY. Requests go to
-        the FIRST instance below that's up — the order is priority, traffic is never split.
+        <code>base_url = https://llm.pietrasik.top/v1</code> + LLM_API_KEY
       </p>
       <table>
         <thead>
@@ -227,7 +215,7 @@ function LLMRouterCard({ intervalMs }: { intervalMs: number }) {
           {order.length === 0 && (
             <tr>
               <td colSpan={4} className="muted">
-                order is empty — every request gets 503 until you add an instance
+                order is empty (requests 503)
               </td>
             </tr>
           )}

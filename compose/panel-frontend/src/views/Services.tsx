@@ -140,8 +140,7 @@ export default function Services({ intervalMs }: { intervalMs: number }) {
     <>
       {data.containers.length === 0 ? (
         <div className="banner">
-          no containers carry the <code>panel.manage</code> label — add it to services you want to
-          control here (see docs/RUNBOOK.md → “add an app”)
+          no containers carry the <code>panel.manage</code> label
         </div>
       ) : (
         cats.map((cat) => {
@@ -187,7 +186,7 @@ export default function Services({ intervalMs }: { intervalMs: number }) {
                             href={`https://${c.service.slice(4)}.pietrasik.top/open`}
                             target="_blank"
                             rel="noreferrer"
-                            title="radiance dashboard — Authelia, then the API key is injected for this origin (panel-api /open)"
+                            title="radiance dashboard"
                           >
                             dashboard ↗
                           </a>

@@ -217,7 +217,7 @@ export default function Overview({ intervalMs }: { intervalMs: number }) {
       <div className="ov-bar">
         <h2 className="host">{data?.host?.hostname ?? 'host'}</h2>
         <span className="sub">{cpu?.model ? shortCpu(cpu.model) : '—'}</span>
-        {cores > 0 && <Chip title="logical CPUs — load average is per-core against this">{cores} threads</Chip>}
+        {cores > 0 && <Chip title="logical CPUs">{cores} threads</Chip>}
         {data?.host?.kernel && <Chip title="kernel">{data.host.kernel}</Chip>}
         <span className="right">
           <span className={`live ${error ? 'err' : stale ? 'stale' : 'ok'}`}>
@@ -358,7 +358,7 @@ function UpdateBanners({
         </b>{' '}
         {failure?.gate && <span>— {failure.gate}</span>}{" "}
         {updateTs(report?.state?.snapshot)}{' '}
-        <span title="nothing was applied — there is no snapshot to roll back to">· nothing was applied, nothing to roll back</span>{' '}
+        <span>· nothing was applied, nothing to roll back</span>{' '}
         <button onClick={() => onRun(false)} disabled={busy}>
           re-run update
         </button>
@@ -416,8 +416,7 @@ function UpdateBanners({
         {dirty && <span> · uncommitted changes in the clone</span>}
         {gitError != null && (
           <span title={gitError}>
-            {' '}· <b className="t-crit">clone git status unreadable</b> — the auto-update refuses an
-            unverifiable clone
+            {' '}· <b className="t-crit">clone git status unreadable</b>
           </span>
         )}
         {majors.length > 0 && (
@@ -429,13 +428,6 @@ function UpdateBanners({
         <button
           onClick={() => onRun(false)}
           disabled={busy || dirty || gitError != null}
-          title={
-            dirty
-              ? 'the clone has uncommitted changes — commit them, or use “run anyway”'
-              : gitError != null
-                ? 'git status is unreadable — the action will refuse; “run anyway” applies the working tree as-is, deliberately'
-                : undefined
-          }
         >
           {dirty ? 'run (clone dirty)' : gitError != null ? 'run (status unreadable)' : 'run now'}
         </button>
@@ -443,7 +435,7 @@ function UpdateBanners({
           <button
             onClick={() => onRun(true)}
             disabled={busy}
-            title="applies the working tree as-is (the daily auto-update skips a dirty clone and refuses an unreadable one)"
+            title="applies the working tree as-is"
           >
             run anyway
           </button>
@@ -492,20 +484,20 @@ function UpdatesCard({
   return (
     <section className="panelish">
       <header>
-        <h3 onClick={() => setOpen(!open)} style={{ cursor: 'pointer' }} title="last update's before→after — click to expand">
+        <h3 onClick={() => setOpen(!open)} style={{ cursor: 'pointer' }} title="click to expand">
           updates {open ? '▾' : '▸'}
         </h3>
         <span className="note">
           {status == null && 'no update run yet'}
           {inProgress && !partialRollback && <b className="t-warn">in progress…</b>}
           {partialRollback && (
-            <b className="t-crit" title="the automatic rollback was only partial — unknown stack state (re-run it from the banner)">
+            <b className="t-crit" title="unknown stack state">
               partial rollback
             </b>
           )}
           {status === 'updated' && <b className="t-ok">{updateTs(report?.state?.snapshot)}</b>}
           {status === 'failed' && (
-            <b className="t-crit" title="aborted at a pre-snapshot gate (preflight/doctor) — nothing was applied, nothing to roll back">
+            <b className="t-crit" title="aborted at a pre-snapshot gate">
               failed
             </b>
           )}
@@ -521,14 +513,10 @@ function UpdatesCard({
             {report?.state?.repo_root ? (
               <>
                 deployed {report.state.repo_head ? <code>{report.state.repo_head.slice(0, 7)}</code> : 'from the server clone'} ·{' '}
-                <code>{report.state.repo_root}</code> — the auto-update re-runs <code>make update</code> from it (gated,
-                auto-rollback; it never git-pulls)
+                <code>{report.state.repo_root}</code>
               </>
             ) : (
-              <>
-                no update state yet — run <code>make update</code> once; the auto-update (daily timer + the button
-                below) then re-runs it, gated, with auto-rollback
-              </>
+              <>no update state yet</>
             )}
           </p>
           {rows.length > 0 && (
@@ -574,7 +562,7 @@ function UpdatesCard({
                 run update
               </button>
             )}
-            <button onClick={onRollback} disabled={busy || status == null || status === 'failed'} title={status === 'failed' ? 'nothing was applied — there is no snapshot to roll back to' : undefined}>
+            <button onClick={onRollback} disabled={busy || status == null || status === 'failed'} title={status === 'failed' ? 'nothing to roll back' : undefined}>
               rollback last
             </button>
           </div>
@@ -593,7 +581,7 @@ function TileUse({ cpu, hist, windowN, intervalS }: { cpu: Metrics['cpu'] | unde
   const s = seriesOf(tail(hist, windowN), (x) => x.cpuPct)
   const t = trend(s, intervalS, 0, '%')
   return (
-    <Tile label="cpu use" title="instantaneous utilisation of all cores (Δ of /proc/stat)"> 
+    <Tile label="cpu use" title="all cores"> 
       <Big value={num(use, use != null && use < 10 ? 1 : 0)} unit="%" tone={toneOf(use == null ? null : use / 100, T.cpuUse.warn, T.cpuUse.crit)} />
       <Chart series={[{ values: s, tone: 'load', fill: true }]} min={0} max={100} height={26} grid={[50]} />
       <div className="foot">
@@ -611,7 +599,7 @@ function TileCpuTemp({ hist, windowN, intervalS }: { hist: Sample[]; windowN: nu
   const a = axis(s, { floorAt: 20, ceilAt: T.cpuTemp.max })
   const tn = toneOf(temp == null ? null : temp / T.cpuTemp.max, T.cpuTemp.warn, T.cpuTemp.crit)
   return (
-    <Tile label="cpu temp" title="k10temp Tctl — on Ryzen this tracks the hottest core, offset and all" right={<TrendMark {...trend(s, intervalS, 1, '°')} />}>
+    <Tile label="cpu temp" title="k10temp Tctl" right={<TrendMark {...trend(s, intervalS, 1, '°')} />}>
       <Big value={num(temp, 0)} unit="°C" tone={tn} />
       <Chart series={[{ values: s, tone: tn, fill: true }]} min={a.min} max={a.max} height={26} grid={[T.cpuTemp.max * T.cpuTemp.warn]} />
       <div className="foot">
@@ -645,14 +633,10 @@ function TileLoad({
   return (
     <Tile
       label="load"
-      title={
-        cores > 0
-          ? `runnable tasks, 1/5/15 min — ${cores} threads means ${cores}.0 is a fully busy box`
-          : 'runnable tasks, 1/5/15 min'
-      }
+      title="runnable tasks, 1/5/15 min"
       right={
         blocked ? (
-          <Pill tone="crit" title="procs_blocked — tasks stuck in uninterruptible IO; this is the 'why is everything slow' counter">
+          <Pill tone="crit" title="tasks stuck in uninterruptible IO">
             {blocked} blocked
           </Pill>
         ) : (
@@ -701,7 +685,7 @@ function TileRam({ ram, hist, windowN, intervalS }: { ram: NonNullable<Metrics['
   return (
     <Tile
       label="memory"
-      title={`used ${mem(used)} — memory nothing can reclaim · cache ${mem(cache)} — pages the kernel drops the moment you need them · free ${mem(free)} · alarm at ${Math.round(
+      title={`used ${mem(used)} · cache ${mem(cache)} · free ${mem(free)} · alarm at ${Math.round(
         T.ram.warn * 100
       )}% / ${Math.round(T.ram.crit * 100)}%`}
       right={<TrendMark {...trend(s, intervalS, 1, '%')} />}
@@ -731,7 +715,7 @@ function TileSwap({ swap, hist, windowN, intervalS }: { swap: NonNullable<Metric
   return (
     <Tile
       label="swap"
-      title="swapped out — RAM is fine until this moves, then something is out of memory"
+      title="swapped out"
       right={<TrendMark {...trend(s, intervalS, 1, '%')} />}
     >
       <Big value={mem(used)} unit={total ? `/ ${mem(total, 0)}` : undefined} tone={toneOf(frac, T.swap.warn, T.swap.crit)} />
@@ -749,7 +733,7 @@ function TileNet({ net, hist, windowN, spanLabel }: { net: NonNullable<Metrics['
   const top = Math.max(1, ...rx.map((v, i) => Math.max(v ?? 0, tx[i] ?? 0)))
   const ifaces = net.ifaces?.length ? net.ifaces.join(' ') : 'no physical interface'
   return (
-    <Tile label="network" title={`${ifaces} — physical links only, docker/veth/bridge/tunnel traffic is already counted there`}>
+    <Tile label="network" title={ifaces}>
       <div className="dual">
         <span className="dl">
           <em>↓</em> {bitsPerSec(net.rx_bits_s)}
@@ -847,7 +831,7 @@ function GpuCard({ gpu, hist, windowN, intervalS, spanLabel }: { gpu: Gpu; hist:
         {gpu.reserved_for && (
           <Chip
             className="reserved"
-            title={`reserved for ${gpu.reserved_for}${gpu.reserved_note ? ` — ${gpu.reserved_note}` : ''}: the auto-grab never hands this card to another instance`}
+            title={`reserved for ${gpu.reserved_for}${gpu.reserved_note ? ` — ${gpu.reserved_note}` : ''}`}
           >
             {gpu.reserved_note || 'reserved'}
           </Chip>
@@ -866,20 +850,13 @@ function GpuCard({ gpu, hist, windowN, intervalS, spanLabel }: { gpu: Gpu; hist:
           <Big value={num(util)} unit="%" tone="load" />
           <span
             className="gsub"
-            title={
-              gpu.mem_clock_mhz
-                ? `graphics clock (memory runs at ${gpu.mem_clock_mhz} MHz) · fan`
-                : 'graphics clock (sclk) · fan'
-            }
+            title={gpu.mem_clock_mhz ? `graphics clock · memory at ${gpu.mem_clock_mhz} MHz` : undefined}
           >
             {num(gpu.clock_mhz)} MHz · {fanText}
           </span>
           <Chart series={[{ values: utilS, tone: 'load', fill: true }]} min={0} max={100} height={20} dot={false} />
         </div>
-        <div
-          className="gstat"
-          title="No warn zone on purpose: an LLM server reserves all the VRAM it is given, so a full bar means a model is loaded — not that you are out of room."
-        >
+        <div className="gstat">
           <h5>vram</h5>
           <span className="gv t-load">
             {mem(gpu.vram_used_mib)}
@@ -887,23 +864,20 @@ function GpuCard({ gpu, hist, windowN, intervalS, spanLabel }: { gpu: Gpu; hist:
           </span>
           <Meter pct={vramFrac} tone="load" />
         </div>
-        <div
-          className="gstat"
-          title={junction != null ? 'junction — the silicon hot-spot; this is what throttles first' : 'edge — no junction sensor on this card'}
-        >
+        <div className="gstat">
           <h5>{junction != null ? 'junction' : 'edge'}</h5>
           <span className={`gv t-${thermTone}`}>
             {num(therm, 0)}
             <em>°C</em>
           </span>
-          <span className="gsub" title="HBM/GDDR memory temperature — the third sensor; hot VRAM throttles the memory clock">
+          <span className="gsub" title="memory temp">
             mem {num(memC, 0)}°
           </span>
           <Chart series={[{ values: thermS, tone: thermTone, fill: true }]} min={thermAxis.min} max={thermAxis.max} height={20} dot={false} />
         </div>
         <div
           className="gstat"
-          title={gpu.power_cap_w ? `${num(gpu.power_w, 1)} W of a ${gpu.power_cap_w} W limit — a full bar is the card working at its limit, not a warning` : 'no power sensor on this card'}
+          title={gpu.power_cap_w ? `${num(gpu.power_w, 1)} W of a ${gpu.power_cap_w} W limit` : 'no power sensor'}
         >
           <h5>power</h5>
           <span className="gv t-load">
@@ -939,7 +913,7 @@ function GpuCard({ gpu, hist, windowN, intervalS, spanLabel }: { gpu: Gpu; hist:
               tone="load"
               unit="%"
               trendUnit="%"
-              title="GPU busy — the work the card is doing"
+              title="GPU busy"
             />
             <GpuTrace
               label="vram"
@@ -951,7 +925,7 @@ function GpuCard({ gpu, hist, windowN, intervalS, spanLabel }: { gpu: Gpu; hist:
               tone="flow"
               unit="%"
               trendUnit="%"
-              title="VRAM as a % of total — flat at 100 % is a loaded model, not a leak"
+              title="VRAM % of total"
             />
             <GpuTrace
               label="junction"
@@ -963,7 +937,7 @@ function GpuCard({ gpu, hist, windowN, intervalS, spanLabel }: { gpu: Gpu; hist:
               tone={toneOf(junction == null ? null : junction / T.junction.max, T.junction.warn, T.junction.crit)}
               unit="°C"
               trendUnit="°"
-              title="hwmon temp2 — the silicon hot-spot; this is what throttles first"
+              title="hwmon temp2"
             />
             <GpuTrace
               label="edge"
@@ -975,7 +949,7 @@ function GpuCard({ gpu, hist, windowN, intervalS, spanLabel }: { gpu: Gpu; hist:
               tone={toneOf(edge == null ? null : edge / T.edge.max, T.edge.warn, T.edge.crit)}
               unit="°C"
               trendUnit="°"
-              title="hwmon temp1 — the cooler's own sensor"
+              title="hwmon temp1"
             />
             <GpuTrace
               label="mem temp"
@@ -987,7 +961,7 @@ function GpuCard({ gpu, hist, windowN, intervalS, spanLabel }: { gpu: Gpu; hist:
               tone={toneOf(memC == null ? null : memC / T.memTemp.max, T.memTemp.warn, T.memTemp.crit)}
               unit="°C"
               trendUnit="°"
-              title="hwmon temp3 — HBM/GDDR temperature; hot VRAM throttles the memory clock"
+              title="hwmon temp3"
             />
             <GpuTrace
               label="power"
@@ -998,11 +972,7 @@ function GpuCard({ gpu, hist, windowN, intervalS, spanLabel }: { gpu: Gpu; hist:
               tone="load"
               unit="W"
               trendUnit=" W"
-              title={
-                gpu.power_cap_w
-                  ? `drawn against the ${gpu.power_cap_w} W limit — a full trace is the card at its limit, not a warning`
-                  : 'no power sensor on this card'
-              }
+              title={gpu.power_cap_w ? `drawn against the ${gpu.power_cap_w} W limit` : 'no power sensor'}
             />
             <GpuTrace
               label="fan"
@@ -1024,7 +994,7 @@ function GpuCard({ gpu, hist, windowN, intervalS, spanLabel }: { gpu: Gpu; hist:
               tone="muted"
               unit="MHz"
               trendUnit=" MHz"
-              title={gpu.mem_clock_mhz ? `graphics clock (sclk); memory runs at ${gpu.mem_clock_mhz} MHz` : 'graphics clock (sclk)'}
+              title={gpu.mem_clock_mhz ? `graphics clock · memory at ${gpu.mem_clock_mhz} MHz` : undefined}
             />
           </div>
         </div>
@@ -1141,7 +1111,7 @@ function StorageCard({
               <span className="m">{d.mount}</span>
               <span className="id">{id || 'device —'}</span>
               {d.temp_c != null && (
-                <span className={`id t-${dtone(d.temp_c)}`} title="drive temperature — NVMe throttles around 70-80 °C and dies young when it lives there">
+                <span className={`id t-${dtone(d.temp_c)}`} title="drive temperature">
                   {num(d.temp_c, 0)}°
                 </span>
               )}
@@ -1150,7 +1120,7 @@ function StorageCard({
                 {num((frac ?? 0) * 100, 0)}% <em>used</em>
               </span>
               <span className="of">{mem(d.used_mib)} / {mem(d.total_mib, 0)}</span>
-              <span className="free" title="space a non-root user can actually write (reserved blocks excluded)">
+              <span className="free" title="space a non-root user can write">
                 {mem(d.avail_mib)} free
               </span>
             </div>
@@ -1219,7 +1189,7 @@ function BoardSensors({ sensors }: { sensors: Sensor[] }) {
   if (chips.length === 0) return null
   return (
     <div className="board">
-      <span className="bk" title="hottest reading per chip, from /sys/class/hwmon — drives are shown on their mount instead">
+      <span className="bk" title="hottest reading per chip">
         board
       </span>
       {chips.map((c) => (

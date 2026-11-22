@@ -52,7 +52,7 @@ function GpuTile({
         ) : reserved ? (
           <span
             className="badge"
-            title={`reserved for ${reserved.for} — auto-grab never hands this card to another instance`}
+            title={`reserved for ${reserved.for}`}
           >
             {reserved.note || 'reserved'}
           </span>
@@ -75,10 +75,7 @@ function GpuTile({
         )}
       </div>
       {reserved && (
-        <div
-          className="gpu-tile-row"
-          title={`reserved for ${reserved.for}${reserved.note ? ` — ${reserved.note}` : ''}: the auto-grab never hands it to another instance, and this instance's own grab lands on it first`}
-        >
+        <div className="gpu-tile-row">
           <span className="muted">→ {reservedDisplay ?? reserved.for}</span>
         </div>
       )}
@@ -164,16 +161,6 @@ export default function Gpus({ intervalMs }: { intervalMs: number }) {
             {reservedCards.length ? ` · ${reservedCards.length} reserved` : ''}
           </span>
         </h3>
-        <p className="muted">
-          Cards are assigned per instance below: <code>auto</code> grabs the lowest free set (sized
-          by the instance's <code>gpu.cards</code> label — a card reserved for that instance comes
-          first), <code>pick</code> names exact cards. A card can be <b>reserved</b> for one
-          instance — the physically-odd card (e.g. the x8-linked one) that must never be mixed into
-          the others' pool: the auto-grab then never hands it to anyone else, another instance's pick
-          of it is refused, and the reserving instance's own grab lands on it first. The pin is{' '}
-          <code>ROCR_VISIBLE_DEVICES</code> at container start — an assignment (re)creates the
-          container, and the set sticks across stops, updates and reboots.
-        </p>
         <div className="gpu-pool">
           {data.pool
             .filter((p) => p.reserved == null) // reserved cards render in the dedicated group below
@@ -189,7 +176,7 @@ export default function Gpus({ intervalMs }: { intervalMs: number }) {
 
         {reservedCards.length > 0 && (
           <div className="gpu-pool-dedicated">
-            <div className="gpu-pool-caption">dedicated — outside the auto-grab pool</div>
+            <div className="gpu-pool-caption">dedicated</div>
             <div className="gpu-pool dedicated">
               {reservedCards.map((p) => (
                 <GpuTile
@@ -226,7 +213,6 @@ export default function Gpus({ intervalMs }: { intervalMs: number }) {
                 <button
                   className="danger"
                   disabled={busy !== null}
-                  title="unreserve — the card rejoins the auto-grab pool for everyone"
                   onClick={() =>
                     act(`unreserve:${p.index}`, () =>
                       api<GpuPool>('/gpus/unreserve', {
@@ -260,13 +246,10 @@ export default function Gpus({ intervalMs }: { intervalMs: number }) {
                 .filter((p) => p.reserved == null || p.reserved!.for === resFor)
                 .map((p) => {
                   const owner = p.reserved?.for ?? null
-                  const reRecord = owner != null && owner === resFor
                   const title = owner
-                    ? reRecord
-                      ? `already reserved for ${holderDisplay(owner) ?? owner} — applying re-records its BDF`
-                      : `reserved for ${holderDisplay(owner) ?? owner} — select that instance to re-record, or unreserve first`
+                    ? `reserved for ${holderDisplay(owner) ?? owner}`
                     : p.holder
-                      ? `card ${p.index} — held by ${holderDisplay(p.holder)} (reserving it for that holder is allowed)`
+                      ? `held by ${holderDisplay(p.holder)}`
                       : `card ${p.index}`
                   return (
                     <label key={p.index} className="pick" title={title}>
@@ -330,7 +313,7 @@ export default function Gpus({ intervalMs }: { intervalMs: number }) {
 
       <div className="card">
         <h3>
-          instances <span className="muted">— fleet (gpu-*) from the deployed compose</span>
+          instances
         </h3>
         <table>
           <thead>
@@ -360,7 +343,7 @@ export default function Gpus({ intervalMs }: { intervalMs: number }) {
                       {drift && inst.holding && (
                         <span
                           className="muted"
-                          title="the live container pins different cards (a failed apply, or a hand-run compose)"
+                          title="live container pins different cards"
                         >
                           {' '}
                           → holds <Cards xs={inst.holding} tone="bad" />
@@ -375,7 +358,7 @@ export default function Gpus({ intervalMs }: { intervalMs: number }) {
                         type="checkbox"
                         checked={inst.autostart}
                         disabled={busy !== null}
-                        title="start on boot (gpu-autostart.service, in list order)"
+                        title="start on boot"
                         onChange={(e) =>
                           act(`autostart:${inst.name}`, () =>
                             api<GpuPool>('/gpus/autostart', {
@@ -417,11 +400,7 @@ export default function Gpus({ intervalMs }: { intervalMs: number }) {
                         </button>
                       )}
                       <button
-                        title={
-                          inst.running
-                            ? 'move to the lowest free cards — its own reserved cards first (recreates — brief downtime)'
-                            : 'grab the lowest free cards — its own reserved cards first + start'
-                        }
+                        title={inst.running ? 'recreates the container' : undefined}
                         disabled={busy !== null}
                         onClick={() =>
                           act(`auto:${inst.name}`, async () => {
@@ -527,12 +506,6 @@ export default function Gpus({ intervalMs }: { intervalMs: number }) {
             )}
           </tbody>
         </table>
-        <p className="muted">
-          <b>boot</b> = comes up automatically after a reboot (gpu-autostart.service, in list
-          order; if two saved sets overlap, the later one is moved to other free cards — see the
-          warnings above). <b>add a second instance of a model</b> (e.g. gpu-27b-1 on cards 2,3):
-          copy the compose block, its radiance config, + the router pair in this repo (<code>make doctor</code> checks all six name references match), <code>make update</code>, then assign cards here — see docs/RUNBOOK.md → GPU fleet.
-        </p>
       </div>
     </div>
   )

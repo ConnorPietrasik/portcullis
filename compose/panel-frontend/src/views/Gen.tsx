@@ -107,14 +107,10 @@ function Composer({
 
   return (
     <div className="card gen-composer">
-      <h3>
-        new job <span className="muted">— one queue; jobs spread across the slots that host their model</span>
-      </h3>
+      <h3>new job</h3>
       <div className="gen-compose-grid">
         <label className="gen-field">
-          <span>
-            model <span className="muted">(purpose key or exact name)</span>
-          </span>
+          <span>model</span>
           <select
             value={effective}
             onChange={(e) => {
@@ -154,23 +150,12 @@ function Composer({
           </select>
         </label>
         <label className="gen-field">
-          <span>
-            enhance prompt{' '}
-            <span className="muted">
-              (off-slot — {et.ok ? `${et.instance}'s ${et.model} rewrites it first` : 'no valid enhance target'}
-              )
-            </span>
-          </span>
+          <span>enhance prompt</span>
           <label className="inline">
             <input
               type="checkbox"
               checked={enhanceConfigured && enhanceOn}
               disabled={busy || !enhanceConfigured}
-              title={
-                enhanceConfigured
-                  ? 'per-model prompt in the settings below'
-                  : 'no enhancement prompt configured for this model — set one in the settings, or leave it off'
-              }
               onChange={(e) => setEnhance(e.target.checked)}
             />{' '}
             <span className="muted">
@@ -181,9 +166,7 @@ function Composer({
         {kind === 'video' && (
           <>
             <label className="gen-field">
-              <span>
-                seconds <span className="muted">(rounded up to the model's steps — its range lands in the job error if out of range)</span>
-              </span>
+              <span>seconds</span>
               <input type="number" step="0.5" value={seconds} onChange={(e) => setSeconds(e.target.value)} disabled={busy} />
             </label>
             <label className="gen-field">
@@ -203,9 +186,7 @@ function Composer({
           </label>
         )}
         <label className="gen-field">
-          <span>
-            size <span className="muted">(WIDTHxHEIGHT — the model's own grid; its 400 names it if you miss)</span>
-          </span>
+          <span>size</span>
           <input type="text" value={size} onChange={(e) => setSize(e.target.value)} disabled={busy} placeholder="1344x768" />
         </label>
         <label className="gen-field gen-prompt">
@@ -236,10 +217,7 @@ function Composer({
         <button disabled={!canSubmit} onClick={() => void submit()}>
           queue {kind ? `a ${kind} job` : 'a job'}
         </button>
-        <span className="muted">
-          {o.queue.length > 0 && `${o.queue.length} queued — `}
-          jobs start when a slot that hosts their model has a free lane; a drained slot yields its cards to a queued job
-        </span>
+        {o.queue.length > 0 && <span className="muted">{o.queue.length} queued</span>}
       </div>
     </div>
   )
@@ -250,9 +228,7 @@ function Composer({
 function SlotsCard({ o, busy, act }: { o: GenOverview; busy: boolean; act: (k: string, fn: () => Promise<unknown>) => void }) {
   return (
     <div className="card">
-      <h3>
-        slots <span className="muted">— the gen lane (cards assigned in the GPU view)</span>
-      </h3>
+      <h3>slots</h3>
       <table>
         <thead>
           <tr>
@@ -290,15 +266,10 @@ function SlotsCard({ o, busy, act }: { o: GenOverview; busy: boolean; act: (k: s
                   <button
                     className="danger"
                     disabled={busy || s.status.busy}
-                    title={s.status.busy ? 'a job is in flight on this slot' : 'stop (disabled while a job is in flight on this slot)'}
+                    title={s.status.busy ? 'a job is in flight' : undefined}
                     onClick={() =>
                       act(`gen-stop:${s.name}`, async () => {
-                        if (
-                          !window.confirm(
-                            `stop ${s.display}? no job is in flight on it; the queue is unaffected (a queued job will start it again if it needs it)`,
-                          )
-                        )
-                          return
+                        if (!window.confirm(`stop ${s.display}?`)) return
                         await api('/gpus/stop', { method: 'POST', body: JSON.stringify({ service: s.name }) })
                       })
                     }
@@ -308,7 +279,7 @@ function SlotsCard({ o, busy, act }: { o: GenOverview; busy: boolean; act: (k: s
                 ) : (
                   <button
                     disabled={busy}
-                    title={s.status.blockers.length ? s.status.blockers.join(' · ') : 'start (on its assigned cards when free, else the lowest free set)'}
+                    title={s.status.blockers.length ? s.status.blockers.join(' · ') : undefined}
                     onClick={() => act(`gen-start:${s.name}`, () => api('/gpus/start', { method: 'POST', body: JSON.stringify({ service: s.name }) }))}
                   >
                     start
@@ -320,19 +291,12 @@ function SlotsCard({ o, busy, act }: { o: GenOverview; busy: boolean; act: (k: s
           {o.slots.length === 0 && (
             <tr>
               <td colSpan={5} className="muted">
-                no gen slots in the deployed compose (the gpu.private instances — see RUNBOOK → Gen)
+                no gen slots in the deployed compose
               </td>
             </tr>
           )}
         </tbody>
       </table>
-      <p className="muted">
-        A slot keeps running after its in-flight jobs finish (lazy stop — the gen model stays
-        resident, so the next job pays no disk load). It yields its cards only when (a) a queued
-        job needs them — a drained slot stops automatically to free the lane, (b) you stop it
-        here or in the GPU view, or (c) a reboot. Its gen model is the only entry — prompt
-        enhancement runs off-slot, on the enhance target above.
-      </p>
     </div>
   )
 }
@@ -361,7 +325,7 @@ function SlotStatus({ s }: { s: GenSlot }) {
     )
   }
   return (
-    <span className="badge" title={st.blockers.join(' · ') || 'cards free — start it (a queued job will)'}>
+    <span className="badge" title={st.blockers.join(' · ') || 'cards free'}>
       down
     </span>
   )
@@ -454,13 +418,6 @@ function JobRow({
         <button
           className="danger"
           disabled={busy}
-          title={
-            !inFlight
-              ? 'delete the record + artifact'
-              : job.state === 'queued'
-                ? 'cancel (removes it from the queue; the record stays as canceled)'
-                : 'cancel (drops the in-flight request — the slot aborts the work within a few seconds)'
-          }
           onClick={() => onDelete(job)}
         >
           {inFlight ? 'cancel' : 'delete'}
@@ -581,9 +538,7 @@ function PromptEditorModal({
       }
     >
       <label className="gen-field">
-        <span>
-          model <span className="muted">— pick which model's instruction to edit</span>
-        </span>
+        <span>model</span>
         <select value={model} onChange={(e) => setSel(e.target.value)}>
           {models.map((n) => (
             <option key={n} value={n}>
@@ -607,9 +562,7 @@ function PromptEditorModal({
       )}
       {model && sources.length > 0 && (
         <div className="gen-field">
-          <span>
-            copy prompt from <span className="muted">— reuse a live (or stale) model's instruction for this one</span>
-          </span>
+          <span>copy from</span>
           <div className="gen-copyrow-ctl">
             <select value={copyFrom} onChange={(e) => setCopyFrom(e.target.value)} disabled={busy || saving}>
               <option value="">— pick a source —</option>
@@ -622,7 +575,7 @@ function PromptEditorModal({
             </select>
             <button
               disabled={busy || saving || copyFrom === ''}
-              title={`copy ${copyFrom || 'the picked model'}'s prompt into ${model} (an existing prompt is replaced — you're asked first)`}
+              title={`copy ${copyFrom}'s prompt into ${model}`}
               onClick={doCopy}
             >
               copy
@@ -639,16 +592,11 @@ function PromptEditorModal({
             <button
               className="danger"
               disabled={busy || saving}
-              title="delete every stale entry"
               onClick={() => onStaleDelete(stale)}
             >
               delete all
             </button>
           </div>
-          <p className="muted gen-model-note">
-            the settings save stays blocked while these are present (the server rejects unknown model names) — copy a
-            prompt into a current model above, then delete the entry.
-          </p>
           {stale.map((n) => (
             <div key={n} className="gen-stale-row">
               <code>{n}</code>
@@ -663,7 +611,6 @@ function PromptEditorModal({
               <button
                 className="danger"
                 disabled={busy || saving}
-                title={`delete the entry for ${n}`}
                 onClick={() => onStaleDelete([n])}
               >
                 delete
@@ -673,11 +620,6 @@ function PromptEditorModal({
         </div>
       )}
       {err && <div className="banner err gen-err">{err}</div>}
-      <p className="muted gen-model-note">
-        the enhance target (the instance → model pair in the settings) rewrites the job's prompt with
-        this instruction before it reaches the gen model; a model with an empty prompt skips
-        enhancement. Saving stores it with the rest of the gen settings.
-      </p>
     </Modal>
   )
 }
@@ -741,9 +683,7 @@ function SettingsCard({ o, busy, onSaved }: { o: GenOverview; busy: boolean; onS
 
   return (
     <div className="card">
-      <h3>
-        settings <span className="muted">— purposes, enhancement prompts, artifact age GC</span>
-      </h3>
+      <h3>settings</h3>
       <div className="gen-settings">
         <label className="gen-field">
           <span>
@@ -783,14 +723,10 @@ function SettingsCard({ o, busy, onSaved }: { o: GenOverview; busy: boolean; onS
             checked={form.enhanceEnabled}
             onChange={(e) => setForm({ ...form, enhanceEnabled: e.target.checked })}
           />{' '}
-          <span>
-            enhance by default <span className="muted">(per-model prompt required — a model without one skips)</span>
-          </span>
+          <span>enhance by default</span>
         </label>
         <label className="gen-field">
-          <span>
-            enhance via instance <span className="muted">(any fleet instance with an llm entry)</span>
-          </span>
+          <span>enhance via instance</span>
           <select
             value={form.enhanceInstance}
             onChange={(e) => {
@@ -810,9 +746,7 @@ function SettingsCard({ o, busy, onSaved }: { o: GenOverview; busy: boolean; onS
           </select>
         </label>
         <label className="gen-field">
-          <span>
-            … using its model <span className="muted">(the /v1 model name)</span>
-          </span>
+          <span>… using its model</span>
           <select value={form.enhanceModel} onChange={(e) => setForm({ ...form, enhanceModel: e.target.value })}>
             {(targetInstance?.llms ?? []).map((m) => (
               <option key={m} value={m}>
@@ -822,17 +756,13 @@ function SettingsCard({ o, busy, onSaved }: { o: GenOverview; busy: boolean; onS
           </select>
         </label>
         <div className="gen-field">
-          <span>
-            enhancement prompts <span className="muted">— one rewrite instruction per gen model; edited in the popup</span>
-          </span>
+          <span>enhancement prompts</span>
           <button
             disabled={busy || saving || (genModels.length === 0 && staleModels.length === 0)}
             title={
-              genModels.length === 0 && staleModels.length === 0
-                ? 'no gen models deployed (the gen slots)'
-                : staleModels.length > 0
-                  ? `edit the per-model enhancement prompts (${staleModels.length} stale entr${staleModels.length === 1 ? 'y' : 'ies'} to copy or delete)`
-                  : 'edit the per-model enhancement prompts'
+              staleModels.length > 0
+                ? `${staleModels.length} stale entr${staleModels.length === 1 ? 'y' : 'ies'} — copy or delete before saving`
+                : undefined
             }
             onClick={() => setShowPrompts(true)}
           >

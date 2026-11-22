@@ -63,16 +63,10 @@ export default function Actions({ intervalMs }: { intervalMs: number }) {
   if (!data) return <div className="banner">loading…</div>
 
   return (
-    <>
-      <div className="banner">
-        registry is read live from <code>panel-do --list</code> — the UI can never offer what the
-        binary won't run
-      </div>
-      <div className="grid">
-        {data.actions.map((a) => (
-          <ActionCard key={a.name} a={a} />
-        ))}
-      </div>
-    </>
+    <div className="grid">
+      {data.actions.map((a) => (
+        <ActionCard key={a.name} a={a} />
+      ))}
+    </div>
   )
 }

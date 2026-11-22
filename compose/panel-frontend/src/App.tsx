@@ -52,7 +52,7 @@ export default function App() {
           {tab === 'Settings' && <Settings intervalMs={intervalMs} onChange={changeInterval} />}
         </Suspense>
       </main>
-      <footer>refresh: {(intervalMs / 1000).toFixed(1)}s — set in Settings</footer>
+      <footer>refresh: {(intervalMs / 1000).toFixed(1)}s</footer>
     </div>
   )
 }
