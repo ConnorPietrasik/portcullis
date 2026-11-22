@@ -1,24 +1,17 @@
-# LLM fallback router — llm.pietrasik.top /v1 → panel-api. One base URL for
+# LLM fallback router — llm.pietrasik.top/v1 → panel-api. One base URL for
 # clients that just want the best model currently serving: panel-api walks
 # the admin-configured priority order (panel Settings) and routes to the
-# first instance that's up. Serves /v1 ONLY — the admin /api/* stays behind
-# panel.pietrasik.top's auth chain (see the router comment below).
+# first instance that's up.
 #
-# LLM-SCOPED on purpose, and stays here (not in gpu.yml): it routes chat
-# /v1, and only chat-LLM instances belong in its order — image/video
-# generators (same fleet, /v1/images + /v1/videos) are the hostless
-# gpu.private gen slots: no public host at all, so they can never enter
-# this order (and would 501 on it). The per-instance routers of the whole
-# fleet live in gpu.yml; fleet-* marks the shared routers there (make
-# doctor's orphan check assumes gpu- = instance).
+# Scoped to /v1 ONLY: panel-api also serves /api/* (the admin API), which
+# must stay reachable only via panel.pietrasik.top's auth chain — on this
+# host a client could supply both gate headers itself.
+# LLM-scoped on purpose, and stays here (not gpu.yml): the gen slots are
+# hostless (gpu.private) and could never enter the chat order.
 
 http:
   routers:
-    # ordered fallback — first instance up in the panel-configured order wins.
-    # Scoped to /v1 on purpose: panel-api also serves /api/* (the admin API),
-    # and that must stay reachable ONLY via panel.pietrasik.top's Authelia +
-    # panel-secret chain — on this host a client could supply both headers itself.
     fleet-fallback:
       rule: "Host(`llm.pietrasik.top`) && PathPrefix(`/v1`)"
-      middlewares: [sec-headers@file] # no llm-rate — see middlewares.yml
+      middlewares: [sec-headers@file] # no rate limit here — see middlewares.yml
       service: panel-api

@@ -1,29 +1,26 @@
-# Edge stack: traefik + authelia + panel UI.
-# Deployed to /opt/panel by setup/02-deploy-stack.sh (which fills in .env).
-#
-# Routing (all TLS via the *.pietrasik.top wildcard cert, DNS-01 via NameSilo):
-#   pietrasik.top            → portfolio container (public, uncomment below)
+# Edge stack: traefik + authelia + panel UI. Deployed to /opt/panel by
+# setup/02-deploy-stack.sh (which fills in .env). All TLS via the
+# *.pietrasik.top wildcard cert (DNS-01 via NameSilo):
+#   pietrasik.top            → portfolio (public)
 #   panel.pietrasik.top/     → panel-web (Authelia: admins)
 #   panel.pietrasik.top/api  → host API :8010 (Authelia + X-Panel-Token, via docker0 gateway 172.17.0.1)
-#   search.pietrasik.top     → searxng (agent API — panel-api forwardAuth gate, bearer LLM_API_KEY)
-#   searx.pietrasik.top      → searxng (browser UI — Authelia)
+#   search.pietrasik.top     → searxng agent API (panel-api forwardAuth key gate)
+#   searx.pietrasik.top      → searxng browser UI (Authelia)
 #   auth.pietrasik.top       → authelia portal
 #
 # Traefik runs the FILE provider only (traefik/dynamic/*.yml) — no docker
 # provider, no docker.sock (a ro-mounted socket still grants full Docker API
 # access). Adding an app = compose service on `edge` + a router/service in
-# traefik/dynamic/ (see docs/RUNBOOK.md → “add an app”).
+# traefik/dynamic/ (docs/RUNBOOK.md → “Add an app”).
 
-# Log rotation — docker's json-file driver grows unbounded by default.
 x-logging: &default-logging
   driver: json-file
   options:
     max-size: "10m"
     max-file: "3"
 
-# Healthcheck cadence (shared). Deliberately lazy: one loopback request per
-# container per interval, while a hang still surfaces as unhealthy after
-# interval × retries (~6 min). Healthchecks diagnose; they never restart.
+# Healthchecks diagnose; they never restart. Cadence deliberately lazy:
+# a hang still surfaces as unhealthy after interval × retries.
 x-healthcheck: &healthcheck-opts
   interval: 2m
   timeout: 10s
@@ -31,63 +28,51 @@ x-healthcheck: &healthcheck-opts
   start_period: 1m
 
 # GPU fleet boilerplate — merged into every gpu-* block via `<<: *gpu-base`.
-# What varies per instance: environment (ROCR_VISIBLE_DEVICES + key), volumes
-# (its radiance config file), labels. Everything else is identical for every
-# radiance server, so it lives once here.
+# YAML <<: merges SHALLOW: a block's own environment/volumes lists REPLACE
+# the anchor's — that is why every block re-lists its model mount.
 x-gpu-base: &gpu-base
-  image: stilldeadcode/radiance:latest # the ONE image deliberately OUTSIDE the
-  # declared-line policy — frequent builds are wanted. A build that passes the
-  # gates but breaks behavior: make rollback WHAT=radiance (RUNBOOK → GPU fleet)
+  image: stilldeadcode/radiance:latest # the ONE image outside the declared-line policy — frequent
+  # builds wanted. Bad build: make rollback WHAT=radiance (RUNBOOK → GPU fleet)
   restart: "no" # the fleet must not resurrect itself after a reboot — you pick
-  # the set from the panel (edge services stay unless-stopped)
+  # the set from the panel; the boot autostart list (GPU view) is what comes back
   init: true # forwards SIGTERM; the engine finishes its step and releases the cards
   logging: *default-logging
   user: "1000:1000"
   devices: ["/dev/kfd", "/dev/dri"] # all cards visible; ROCR_VISIBLE_DEVICES pins the set
-  # Host-LOCAL gids (Arch assigns dynamically — not portable across boxes):
-  # render=987, video=983. Verify: getent group render video,
-  # then confirm the device owners: stat -c '%n %u:%g' /dev/kfd /dev/dri/*
+  # Host-LOCAL gids (Arch assigns dynamically — not portable): render=987,
+  # video=983. Verify: getent group render video; stat -c '%n %u:%g' /dev/kfd /dev/dri/*
   group_add: ["987", "983"]
   security_opt:
-    # radiance's io_uring reads + ROCm's NUMA binding (mbind/set_mempolicy)
-    # are refused by Docker's default seccomp. Both are in the UPSTREAM
-    # radiance repo (codeberg.org/StillDeadcode/radiance) — see its
-    # deploy/compose/common.yaml and the tighter profile it ships
+    # radiance's io_uring + ROCm's NUMA binding (mbind/set_mempolicy) are
+    # refused by Docker's default seccomp. Upstream ships a tighter profile
     # (deploy/compose/seccomp-radiance.json) if you ever want to run confined.
     - seccomp=unconfined
   ulimits:
     memlock: -1
   # radiance 2.x takes NO command-line flags: one YAML file per instance
-  # (radiance --config FILE; the key reference is `radiance --help`, upstream
-  # docs/MULTIMODEL.md §4). Each block mounts its own
-  # compose/gpu-configs/<instance>.yaml — and YAML <<: merges SHALLOW, so a
-  # block's volumes list REPLACES this one: every block re-lists its
-  # class-dir mount below (the same trap as labels).
+  # (compose/gpu-configs/<instance>.yaml; the key reference is `radiance --help`)
   command: ["--config", "/etc/radiance/radiance.yaml"]
   volumes:
     - /models/llm:/models/llm:ro
-    # only if a model needs a CUSTOM chat template (rare — the .rad carries
-    # its own): mount the .jinja in the block and set override-chat-template
-    # in that instance's radiance config
+    # custom chat template (rare — the .rad carries its own): mount the .jinja
+    # in the block + set override-chat-template in that instance's radiance config
   stop_grace_period: 60s # finishes the in-flight step, releases the cards
   healthcheck:
     interval: 1m
     timeout: 10s
     retries: 3
-    start_period: 5m # the MODEL LOAD is the slow part: ~1m on this hardware,
+    start_period: 5m # the MODEL LOAD is the slow part — shorter reads unhealthy
+    # mid-load, and make update's 600s gate auto-rolls-back a still-loading
+    # reload (raise UPDATE_HEALTH_TIMEOUT only for a much slower model)
     test: ["CMD", "busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8000/health"]
-    # 5m is the margin — shorter reads unhealthy mid-load and make update's
-    # 600s gate auto-rolls-back while a reload is still loading (raise
-    # UPDATE_HEALTH_TIMEOUT only for a much slower model — RUNBOOK → GPU fleet)
   networks: [edge] # NO network_mode: host — on the bridge, port 8000 is
-  # reachable only from traefik (no UFW rule, no LAN/WAN exposure), so the
-  # server binds 0.0.0.0 instead of the playground's --host ::
+  # reachable only from traefik (no UFW rule, no LAN/WAN exposure)
 
 services:
   traefik:
-    # Image policy: floats on the MAJOR line — patch/minor security releases
-    # ride in on `make update` (snapshot + gate + auto-rollback); a major is a
-    # deliberate one-word edit — that's where breaking changes live.
+    # Image policy: floats on the MAJOR line — patch/minor ride in on
+    # `make update` (snapshot + gate + auto-rollback); a major is a
+    # deliberate one-word edit (RUNBOOK → Updates).
     image: traefik:v3
     restart: unless-stopped
     logging: *default-logging
@@ -97,15 +82,14 @@ services:
       test: ["CMD", "traefik", "healthcheck", "--ping"]
     environment:
       NAMESILO_API_KEY: ${NAMESILO_API_KEY}
-      NAMESILO_PROPAGATION_TIMEOUT: ${NAMESILO_PROPAGATION_TIMEOUT:-1800} # NameSilo TTLs are slow; keep this high (seconds!)
-      # The one-time `*` CNAME (RUNBOOK Phase 0) makes _acme-challenge.pietrasik.top
-      # a wildcard-synthesized CNAME, which lego would follow during DNS-01 and
-      # misplace the challenge TXT (go-acme/lego#1816). Disabling CNAME follow
-      # pins the standard behavior: TXT at _acme-challenge.pietrasik.top, where
-      # the explicit record wins over the wildcard.
+      NAMESILO_PROPAGATION_TIMEOUT: ${NAMESILO_PROPAGATION_TIMEOUT:-1800} # NameSilo DNS is slow (seconds!)
+      # The Phase-0 wildcard CNAME makes _acme-challenge.* a synthesized
+      # CNAME, which lego would follow during DNS-01 and misplace the TXT
+      # (go-acme/lego#1816). CNAME-follow off pins the standard behavior:
+      # TXT at _acme-challenge.pietrasik.top, where the explicit record wins.
       LEGO_DISABLE_CNAME_SUPPORT: "true"
     labels:
-      - panel.manage=edge router # shows in the panel's Services view
+      - panel.manage=edge router
       - panel.category=Panel # group header in the Services view (absent → "Other")
     volumes:
       - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
@@ -114,7 +98,7 @@ services:
     networks: [edge]
 
   authelia:
-    image: authelia/authelia:4 # same policy: floats on the major line (make update / RUNBOOK → Updates)
+    image: authelia/authelia:4 # same policy: floats on the major line
     restart: unless-stopped
     logging: *default-logging
     volumes: ["./authelia:/config"]
@@ -137,74 +121,55 @@ services:
     healthcheck:
       <<: *healthcheck-opts
       test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/"]
-    labels: ["panel.manage=true", "panel.category=Panel"] # routed via traefik/dynamic/panel.yml
+    labels: ["panel.manage=true", "panel.category=Panel"]
     networks: [edge]
     volumes:
-      # Gen artifacts (image/video outputs): panel-api (a host service, user
-      # panel) writes them into /models/gen-output; the UI serves them
-      # statically at /gen/* (ro — the web container never writes). A missing
-      # host dir is auto-created by docker as root:root — `make api` / the
+      # Gen artifacts: panel-api (host service, user panel) writes
+      # /models/gen-output; the UI serves them statically at /gen/* (ro).
+      # A missing host dir is auto-created root:root — make api / the
       # doctor's gen check goes red until ownership is fixed.
       - /models/gen-output:/gen:ro
 
-  # Public portfolio site (bare domain — Authelia bypass rule for pietrasik.top
-  # already lives in configuration.yml). Placeholder page for now; replace
-  # compose/portfolio/index.html with the real site whenever it exists.
+  # Public portfolio site (bare domain — the Authelia bypass is in
+  # configuration.yml). Placeholder page; swap compose/portfolio/ for the
+  # real site whenever it exists.
   portfolio:
-    image: nginx:stable-alpine # current stable (oldstable) line, floats; use `alpine` to track mainline
+    image: nginx:stable-alpine # current stable (oldstable) line, floats; `alpine` tracks mainline
     restart: unless-stopped
     logging: *default-logging
     healthcheck:
       <<: *healthcheck-opts
       test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/"]
     volumes: ["./portfolio:/usr/share/nginx/html:ro"]
-    labels: ["panel.manage=true", "panel.category=Web"] # shows in the panel's Services view
+    labels: ["panel.manage=true", "panel.category=Web"]
     networks: [edge]
 
-  # ── GPU fleet (Radiance) — start/stop instances from the panel ──────────────
-  # An instance = one block here + one router pair in traefik/dynamic/gpu.yml:
-  # gpu-<name> ↔ <name>.pietrasik.top. Port always 8000 (own IP per container).
-  #
-  # CARDS: the GPU view (panel tab "GPUs") assigns card sets per instance at
-  # run time — it pins ROCR_VISIBLE_DEVICES through /opt/panel-api/gpu-pool-
-  # override.yml (every compose render includes it), so the pins below are
-  # FALLBACK DEFAULTS for a hand-run compose, not the running truth. gpu.cards
-  # is how many cards the instance NEEDS (keep == the tp in its radiance
-  # config — doctor checks) — the pool's auto-
-  # grab sizes off it. The display name (panel.manage) has no card set in it
-  # (the set moves — and no commas: docker ps encodes labels comma-joined).
-  # restart "no" so a reboot never resurrects the set you chose; the boot
-  # autostart list (GPU view) is what comes back. Model files by class:
-  # /models/llm/ (chat LLMs), /models/image/ + /models/video/ (gen models —
-  # mounted only by the gen slots below). Every block ro-mounts its class
-  # dir AT that subpath: the gen section's config parser takes the model's
-  # kind from the 2nd path component (/models/{llm,image,video}/...), so the
-  # mount target is the class subdir, not the bare /models — an instance's
-  # llm entries are discoverable (e.g. as Gen enhance targets) only that way.
-  # New instance (including a second copy of a model, e.g. gpu-27b-1): copy
-  # the block + its router pair (RUNBOOK → GPU fleet; make doctor checks all
-  # six name references match), make update, then assign cards in the GPU
-  # view.
+  # ── GPU fleet (Radiance) ──────────────────────────────────────────────────
+  # An instance = one block here + one radiance config (gpu-configs/<name>.yaml)
+  # + a router pair in traefik/dynamic/gpu.yml (six name references — make
+  # doctor checks them; RUNBOOK → GPU fleet). The GPU view pins
+  # ROCR_VISIBLE_DEVICES at run time (gpu-pool-override.yml), so the pins
+  # below are FALLBACK defaults for a hand-run compose. gpu.cards = how many
+  # cards the instance needs (== tp in its config; the pool's auto-grab
+  # sizes off it). The class-dir mount
+  # AT the subpath is load-bearing: the gen config parser takes the model's
+  # kind from the 2nd path component (/models/{llm,image,video}/...), so an
+  # instance's llm entries are discoverable (Gen enhance targets) only that way.
   gpu-27b:
     <<: *gpu-base
     environment:
-      ROCR_VISIBLE_DEVICES: "0,1" # fallback default (the GPU view's override wins): 2 cards — the
-      # IQR-V4 vocabulary-weighted lm_head (output.k<B>) only shards at tp<=2 — class row counts
-      # are multiples of 512, not 1024 (radiance: "rows a multiple of 256 a rank")
+      ROCR_VISIBLE_DEVICES: "0,1" # the IQR-V4 vocabulary-weighted lm_head only shards at
+      # tp<=2 (class row counts are multiples of 512, not 1024)
       RADIANCE_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env} # read by api-key-env in the
       # radiance config, so the key never sits in argv (ps / docker inspect)
-      RADIANCE_LOG: "warn" # per-request INFO lines (tok/s, cache, ttft) are chatty — radiance docs §6.5
+      RADIANCE_LOG: "warn" # per-request INFO lines (tok/s, cache, ttft) are chatty
     volumes:
-      # replaces the anchor's list (shallow <<): re-lists the /models/llm
-      # class-subpath mount, adds this instance's radiance config
-      # (2.x takes no flags — RUNBOOK → GPU fleet)
       - /models/llm:/models/llm:ro
       - ./gpu-configs/gpu-27b.yaml:/etc/radiance/radiance.yaml:ro
     labels:
       - panel.manage=Qwen 27B IQ6R-S-V4 # Services view name (no card set — it moves)
-      - panel.category=LLM # NOT on x-gpu-base: the per-block labels list replaces
-      # the anchor's on merge (shallow <<), so new instances carry it by copying the block
-      - gpu.cards=2 # the pool's auto-grab size (== tp in gpu-configs/gpu-27b.yaml — doctor checks)
+      - panel.category=LLM
+      - gpu.cards=2
   gpu-27b-1:
     <<: *gpu-base
     environment:
@@ -212,232 +177,169 @@ services:
       RADIANCE_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env}
       RADIANCE_LOG: "warn"
     volumes:
-      - /models/llm:/models/llm:ro # shallow <<: this list replaces the anchor's
+      - /models/llm:/models/llm:ro
       - ./gpu-configs/gpu-27b-1.yaml:/etc/radiance/radiance.yaml:ro
     labels:
       - panel.manage=Qwen 27B IQ6R-S-V4 1
       - panel.category=LLM
-      - gpu.cards=2 # == tp in gpu-configs/gpu-27b-1.yaml
+      - gpu.cards=2
   gpu-27b-2:
     <<: *gpu-base
     environment:
-      ROCR_VISIBLE_DEVICES: "5,6" # its physical cards (tiles 5,6 since the 7th card took tile 4)
+      ROCR_VISIBLE_DEVICES: "5,6"
       RADIANCE_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env}
       RADIANCE_LOG: "warn"
     volumes:
-      - /models/llm:/models/llm:ro # shallow <<: this list replaces the anchor's
+      - /models/llm:/models/llm:ro
       - ./gpu-configs/gpu-27b-2.yaml:/etc/radiance/radiance.yaml:ro
     labels:
       - panel.manage=Qwen 27B IQ6R-S-V4 2
       - panel.category=LLM
-      - gpu.cards=2 # == tp in gpu-configs/gpu-27b-2.yaml
+      - gpu.cards=2
   gpu-flashnext:
     <<: *gpu-base
     environment:
-      ROCR_VISIBLE_DEVICES: "0,1,2,3" # fallback default (override wins): same four cards as
-      # gpu-27b's — not at the same time
+      ROCR_VISIBLE_DEVICES: "0,1,2,3"
       RADIANCE_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env}
       RADIANCE_LOG: "warn"
     volumes:
-      - /models/llm:/models/llm:ro # shallow <<: this list replaces the anchor's
+      - /models/llm:/models/llm:ro
       - ./gpu-configs/gpu-flashnext.yaml:/etc/radiance/radiance.yaml:ro
     labels:
-      - panel.manage=Qwen Flash-Next # Services view name (no card set — it moves)
+      - panel.manage=Qwen Flash-Next
       - panel.category=LLM
-      - gpu.cards=4 # the pool's auto-grab size (== tp in gpu-configs/gpu-flashnext.yaml)
+      - gpu.cards=4
 
   # The writer (the 7th card, the odd one out): PCIe5 x8 instead of x16 —
   # the LOAD traffic is ~half speed, but inference is VRAM-bandwidth-bound,
   # so the always-resident chat models live here (the swapping gen slots
-  # keep the x16 cards). Multi-model config = radiance's router: "writer"
-  # (hemmingway) + "uncensored" (gemma), picked by the /v1 `model` name.
-  # The Gen section routes prompt enhancement at the "writer" entry (Gen
-  # settings → enhance target; the engine talks by container IP over the
-  # edge network, like the gen slots). Disk-park only (rare swaps; pinned
-  # host RAM is the scarce shared resource). Public instance: standard six
-  # references (RUNBOOK → GPU fleet). Card index: tile 4, MEASURED (the x8
-  # PCIE6 card trained at position 4 in the KFD order — PCIe slot order !=
-  # enumeration order; the GPU view + the
-  # Overview's per-tile BDF chips are the map — re-derive after any card
-  # add/remove); the fallback below is a fallback (the GPU view's override wins).
+  # keep the x16 cards). Multi-model = radiance's router: "writer" +
+  # "uncensored", picked by the /v1 `model` name. The Gen section's prompt
+  # enhancement targets the "writer" entry (Gen settings → enhance target).
+  # Disk-park only (pinned host RAM is the scarce shared resource).
+  # Card index: tile 4, MEASURED (PCIe slot order != enumeration order; the
+  # GPU view + the Overview's per-tile BDF chips are the map — re-derive
+  # after any card add/remove).
   gpu-writer:
     <<: *gpu-base
     environment:
-      ROCR_VISIBLE_DEVICES: "4" # fallback default (override wins) — the x8 card (tile 4, measured)
+      ROCR_VISIBLE_DEVICES: "4"
       RADIANCE_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env}
       RADIANCE_LOG: "warn"
     volumes:
-      # class-subpath mount like every fleet block: the gen section's config
-      # parser takes the model's class from the 2nd path component
-      # — /models/llm/... → llm — and the enhance target must be discoverable
-      # as llm entries
       - /models/llm:/models/llm:ro
       - ./gpu-configs/gpu-writer.yaml:/etc/radiance/radiance.yaml:ro
     labels:
-      - panel.manage=Writer # Services view name (no card set — it moves)
+      - panel.manage=Writer
       - panel.category=LLM
-      - gpu.cards=1 # == tp in gpu-configs/gpu-writer.yaml (doctor cross-checks)
+      - gpu.cards=1
 
-  # ── Gen slots (private fleet instances) — image/video gen, edge-only ──────
-  # gpu.private=true: no router pair, no fleet-open host, no subdomain — the
-  # panel's Gen section (panel-api) is the consumer, and it talks to the slot
-  # by container IP (a router is never in the data path). make doctor asserts
-  # no-host BOTH ways (a router here = drift) and exempts the fleet-open host
-  # check; gpu.cards/config/tp checks still apply. The LANE is cards 5,6 by
-  # card overlap (the 7th card took tile 4 — see gpu-writer above): the tp2
-  # slot takes both, the two tp1 slots one each (disjoint → parallel). The
-  # Gen section owns the queue (one FIFO, lazy stop, idle-yield, one
-  # preemption rule — RUNBOOK → Gen); the GPU view still assigns
-  # cards + autostart, and start/stop are the same panel-do gpu-apply/gpu-stop
-  # (override included — invariant 7). Each slot is gen-ONLY (its gen model is
-  # the sole config entry, resident): prompt enhancement runs off-slot, on
-  # the writer instance (Gen settings → enhance target).
+  # ── Gen slots (private fleet instances) — image/video gen, edge-only ─────
+  # gpu.private=true = fleet instance with NO public host (no router pair,
+  # no fleet-open host, no subdomain): panel-api is the consumer and talks
+  # to the slot by container IP. make doctor asserts no-host BOTH ways.
+  # The LANE is cards 5,6 by overlap: the tp2 slot takes both, the two tp1
+  # slots one each (disjoint → parallel). The Gen section owns the queue
+  # (RUNBOOK → Gen); start/stop are the same panel-do actions (override
+  # included — invariant 7). Each slot is gen-ONLY (resident); prompt
+  # enhancement runs off-slot, on the writer.
   gpu-gentp1a:
     <<: *gpu-base
     environment:
-      ROCR_VISIBLE_DEVICES: "5" # fallback default (override wins) — lane card 5
+      ROCR_VISIBLE_DEVICES: "5"
       RADIANCE_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env}
       RADIANCE_LOG: "warn"
     volumes:
-      # shallow <<: replaces the anchor's list — the slot mounts its class
-      # subdir at a subpath like every fleet block; it is gen-only, so no
-      # /models/llm mount (enhancement is off-slot)
       - /models/image:/models/image:ro
       - ./gpu-configs/gpu-gentp1a.yaml:/etc/radiance/radiance.yaml:ro
     labels:
-      - panel.manage=Gen TP1-A # Services view name (no card set — it moves)
-      - gpu.cards=1 # == tp in gpu-configs/gpu-gentp1a.yaml (doctor cross-checks)
-      - gpu.private=true # no public host — the Gen section is the consumer
-      - panel.category=Gen # Services view group (non-LLM model classes get their own)
+      - panel.manage=Gen TP1-A
+      - gpu.cards=1
+      - gpu.private=true
+      - panel.category=Gen
   gpu-gentp1b:
     <<: *gpu-base
     environment:
-      ROCR_VISIBLE_DEVICES: "6" # lane card 6 — disjoint from tp1a, so both run
-      # in parallel (the queue never serializes them)
+      ROCR_VISIBLE_DEVICES: "6"
       RADIANCE_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env}
       RADIANCE_LOG: "warn"
     volumes:
-      - /models/image:/models/image:ro # shallow <<: this list replaces the anchor's
+      - /models/image:/models/image:ro
       - ./gpu-configs/gpu-gentp1b.yaml:/etc/radiance/radiance.yaml:ro
     labels:
-      - panel.manage=Gen TP1-B # Services view name (no card set — it moves)
-      - gpu.cards=1 # == tp in gpu-configs/gpu-gentp1b.yaml
+      - panel.manage=Gen TP1-B
+      - gpu.cards=1
       - gpu.private=true
-      - panel.category=Gen # Services view group (non-LLM model classes get their own)
+      - panel.category=Gen
   gpu-gentp2:
     <<: *gpu-base
     environment:
-      ROCR_VISIBLE_DEVICES: "5,6" # fallback default (override wins) — the whole lane
+      ROCR_VISIBLE_DEVICES: "5,6"
       RADIANCE_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env}
       RADIANCE_LOG: "warn"
     volumes:
-      - /models/video:/models/video:ro # shallow <<: this list replaces the anchor's
+      - /models/video:/models/video:ro
       - ./gpu-configs/gpu-gentp2.yaml:/etc/radiance/radiance.yaml:ro
     labels:
-      - panel.manage=Gen TP2 # Services view name (no card set — it moves)
-      - gpu.cards=2 # == tp in gpu-configs/gpu-gentp2.yaml
+      - panel.manage=Gen TP2
+      - gpu.cards=2
       - gpu.private=true
-      - panel.category=Gen # Services view group (non-LLM model classes get their own)
+      - panel.category=Gen
 
-  # ── SearXNG — web search for agents + private browser UI ──────────────────
-  # Image floats on latest — declared OUTSIDE the declared-line policy (the
-  # radiance precedent): the project ships rolling date tags, no releases.
-  # Bad build: make rollback WHAT=searxng (IMAGE ONLY — a settings rollback
-  # needs the FULL make rollback). Hold a known build: pin the tag.
-  # Image-bump duty (RUNBOOK → Web search): diff our settings.yml against the
-  # file the new image ships — under use_default_settings, an upstream default
-  # flip is a silent behavior change (formats is the live example) — AND diff
-  # searx/settings_defaults.py's SCHEMA: the environ_name list (a new
-  # env-override name is a new channel over our settings.yml) AND the default
-  # values (a flip for a key our settings.yml doesn't set is invisible in the
-  # shipped-file diff; the doctor's probes cover the security-critical ones),
-  # confirm the app uid is still 977 (the compose user pin, the sync's chown
-  # target and the doctor's owner check all name it), and re-run the
-  # effective-secret probe (RUNBOOK → Web search → image-bump duty; make
-  # doctor carries it).
+  # ── SearXNG — web search for agents + private browser UI ─────────────────
+  # Image floats on latest, declared OUTSIDE the declared-line policy (the
+  # radiance precedent): rolling date tags, no releases. Bad build: make
+  # rollback WHAT=searxng (IMAGE ONLY). Image-bump duty (RUNBOOK → Web
+  # search): diff our settings.yml against the file the new image ships
+  # AND searx/settings_defaults.py's SCHEMA (a new env-override name or a
+  # flipped default is a silent behavior change), confirm the app uid is
+  # still 977, re-run the effective-secret probe (make doctor carries it).
   searxng:
     image: searxng/searxng:latest
-    # restart: unless-stopped — and do NOT merge x-gpu-base (it carries
-    # restart: "no", which the update's on-demand test treats as "leave
-    # down"). searxng is always-on, not on-demand.
+    # do NOT merge x-gpu-base — it carries restart: "no", which the update's
+    # on-demand test treats as "leave down"; searxng is always-on
     restart: unless-stopped
     logging: *default-logging
-    # The image's own uid (the image sets no USER — a bare `docker run` is
-    # root; this line is what drops the app to 977). As 977 the entrypoint
-    # can't chown, so it prints ONE benign 'is not owned by
-    # "searxng:searxng"' line per start and continues — for the config DIR, which the sync's
-    # tar leaves non-977 (the data volume seeds 977:977 from the image and
-    # stays quiet; the log-line count is in the RUNBOOK verification). Nothing
-    # in the normal path writes the config dir (we ship settings.yml, so the
-    # template copy never runs) — but the app READS it: the sync chowns the
-    # deployed settings.yml to 977:977 (root:root 0600 would be EACCES at
-    # import → crashloop). RUNBOOK pre-empts the three wrong fixes: dropping
-    # user: (root + FORCE_OWNERSHIP=true → chown -R of the synced tree every
-    # start), hand-chown under /opt/panel (undone by the next tar sync — the
-    # sync's OWN chown line is the sanctioned one), making the mount writable
-    # to silence it.
+    # The image sets no USER (a bare `docker run` is root) — this line drops
+    # the app to 977. As 977 the entrypoint can't chown the config dir and
+    # prints one benign ownership line per start; the sync's chown of
+    # settings.yml is the sanctioned fix (root:root 0600 would be EACCES →
+    # crashloop). Nothing in the normal path writes the config dir.
     user: "977:977"
     environment:
-      # NO SEARXNG_SECRET line — and this absence is a security control,
-      # not an omission: SearXNG applies env > settings.yml (SCHEMA in
-      # searx/settings_defaults.py). The secret rides the sed machinery:
-      # .env → stack_sync_configs substitutes the secret_key placeholder
-      # in the deployed searxng/settings.yml (chown 977:977 + chmod 600 —
-      # the app reads it as 977). An env line here would OVERRIDE the file
-      # — and put the secret in the container environ (docker inspect),
-      # the exposure the reduced-env files exist to avoid.
-      # (This prose deliberately never writes the placeholder token: this
-      # file is inside the sync's placeholder-survival grep, which dies on
-      # ANY token it finds, and the sed never rewrites this file — a named
-      # token in a comment would red-light every update.)
-      # The listener port is env-owned (entrypoint aliases
-      # SEARXNG_PORT→GRANIAN_PORT); pin it or an upstream default change
-      # moves the listener out from under the route, the healthcheck and
-      # the gate.
-      SEARXNG_PORT: "8080"
-      # Makes the "drop user:" wrong-fix harmless instead of chown -R'ing
-      # the repo-synced tree.
-      FORCE_OWNERSHIP: "false"
-      # The image's real capacity ceiling is ~4 concurrent requests, not
-      # the rate limit. The image's ENV default is ALREADY 4 — this pin is
-      # a no-op today; its job is to keep a future upstream default change
-      # from moving the ceiling (that change shows up in the image-bump
-      # Dockerfile diff, not as silent queueing). (Doctor enforces this
-      # block as a NAMED allow-list — additions are a deliberate diff,
-      # illegal members fail, and a guard key fails loudly. GRANIAN_HOST
-      # is NOT a member: no host pin has been needed — both
-      # loopback families answered.)
-      GRANIAN_BLOCKING_THREADS: "4"
+      # NO secret/base_url/limiting SEARXNG_* keys here — env > settings.yml,
+      # so this block carries only the pinned names (the doctor enforces it
+      # as a named allow-list). The secret rides the sed substitution in the
+      # DEPLOYED settings.yml; a named placeholder token must never appear in
+      # this file (the sync's survival grep dies on one).
+      SEARXNG_PORT: "8080" # env-owned (SEARXNG_PORT→GRANIAN_PORT); pinned so an
+      # upstream default change can't move the listener out from under the
+      # route, healthcheck and gate
+      FORCE_OWNERSHIP: "false" # makes the "drop user:" wrong-fix harmless instead of
+      # chown -R'ing the repo-synced tree every start
+      GRANIAN_BLOCKING_THREADS: "4" # the image's real capacity ceiling (~4 concurrent), not
+      # the rate limit. No-op today (image default is 4) — the pin keeps a
+      # future upstream default flip visible in the image-bump diff
     healthcheck:
       <<: *healthcheck-opts
-      # The image ships NO HEALTHCHECK, and make update counts a
-      # healthcheck-less running container as healthy — this test is the
-      # only health gate. Loopback verified: 127.0.0.1 answers, [::1] does
-      # too (dual-stack — no GRANIAN_HOST pin).
+      # the image ships NO HEALTHCHECK and make update counts a
+      # healthcheck-less running container as healthy — this is the only
+      # health gate. 127.0.0.1 is dual-stack (no GRANIAN_HOST pin needed)
       test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/healthz"]
     volumes:
-      # The image declares /etc/searxng as a VOLUME — a dropped or renamed
-      # bind does not fail: Docker hands out an ANONYMOUS volume, the
-      # entrypoint copies the upstream template in (the template's own
-      # image_proxy: true; formats: [html] inherited from the shipped
-      # defaults it use_default_settings's), and the instance boots
-      # healthy (agents 403, healthcheck green, compose diff clean).
-      # make doctor's mount check asserts the exact bind — anonymous
-      # volumes carry NO inspect flag, so it greps the bind string, not
-      # 'AnonymousVolume'.
+      # The image declares /etc/searxng as a VOLUME — a dropped/renamed bind
+      # does NOT fail: Docker hands out an anonymous volume and the instance
+      # boots healthy from the upstream template (agents 403, healthcheck
+      # green). make doctor's mount check asserts the exact bind.
       - ./searxng:/etc/searxng:ro
-      # Named volume, never a repo bind — runtime data must not flow back
-      # into the repo. Seeded from the image's 977:977 dir (no warning).
+      # runtime data never flows back into the repo; seeded 977:977 from the image
       - searxng-cache:/var/cache/searxng
     labels:
-      - panel.manage=SearXNG     # Services view: start/stop like any app
-      - panel.category=Search    # unpinned groups sort alphabetically by
-                                 # design — no frontend code; do NOT pin
-                                 # 'Search' in CATEGORY_ORDER
+      - panel.manage=SearXNG
+      - panel.category=Search # unpinned groups sort alphabetically — do NOT pin 'Search'
     networks: [edge]
-    # NO published ports. The only internet path is the two routers in
-    # traefik/dynamic/search.yml; the API router is whole-host key-gated
-    # (see its header).
+    # NO published ports — the only internet paths are the two routers in
+    # traefik/dynamic/search.yml (agent API key-gated, browser UI Authelia)
 
 volumes:
   acme: {}

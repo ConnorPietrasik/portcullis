@@ -1,31 +1,24 @@
-# GPU fleet — one router per instance WITH a public host (any model class
-# the pool serves — chat LLMs today; the image/video gen slots are
-# gpu.private: no router here, panel-api reaches them by container IP —
-# see their compose header). TLS terminates here (wildcard cert, DNS-01);
-# auth is the server's own API key (Authorization: Bearer), NOT
-# Authelia — forward-auth is cookie-based and can't serve API clients that
-# only speak bearer tokens. These routers deliberately omit auth-chain@file,
-# so plain OpenAI clients work with
-#   base_url = https://<name>.pietrasik.top/v1
-# The API key is the gate — a wrong key 401s before any GPU work, and
-# radiance's admission control (429 + Retry-After) bounds spend (see the
-# "no rate-limit" note in middlewares.yml). A
-# host 502s until its instance is up — harmless. Rule: service gpu-<name> ↔
-# Host(`<name>.pietrasik.top`) ↔ http://gpu-<name>:8000 (RUNBOOK → GPU fleet).
+# GPU fleet — one router pair per instance WITH a public host (any model
+# class the pool serves). The gen slots are gpu.private: no router here —
+# panel-api reaches them by container IP (see the compose header). TLS
+# terminates here; auth is the instance's own API key (Authorization:
+# Bearer), NOT Authelia — forward-auth is cookie-based and can't serve
+# bearer-only clients. A wrong key 401s before any GPU work; radiance's
+# admission control (429 + Retry-After) bounds spend (see the no-rate-limit
+# note in middlewares.yml). A host 502s until its instance is up — harmless.
 #
 # Naming: gpu-<name> is an INSTANCE — router, traefik service, compose
-# service and container all share the name, 1:1. make doctor's orphan check
-# ASSUMES that prefix (a gpu-* router with no compose service is stale), so
-# SHARED (non-instance) routers never carry it: they are fleet-* and route
-# to the panel-api service (defined in panel.yml — same file provider, so
-# one service, not redefined here):
+# service and container share the name, 1:1 (make doctor's orphan check
+# assumes that prefix). Shared (non-instance) routers are fleet-*, never
+# gpu-*, and route to the panel-api service defined in panel.yml (same file
+# provider, so one service, not redefined here):
 #   fleet-fallback  llm.pietrasik.top /v1     — ordered LLM fallback (llm.yml)
 #   fleet-open      <instance hosts> /open    — dashboards' key bootstrap
-# Never name a shared router or service gpu-*.
+# New instance = router pair + `|| Host(`<name>.pietrasik.top`)` in
+# fleet-open (make doctor verifies the list; RUNBOOK → GPU fleet).
 
 http:
   routers:
-    # one pair per instance — copy for each (gpu-27b2 → 27b2.pietrasik.top, …)
     gpu-27b:
       rule: "Host(`27b.pietrasik.top`)"
       middlewares: [sec-headers@file]
@@ -51,30 +44,15 @@ http:
       middlewares: [sec-headers@file]
       service: gpu-writer
 
-    # Key bootstrap for the radiance dashboards (panel Services view → the
-    # "dashboard ↗" link per instance). The dashboard HTML is public on every
-    # instance host; its data calls need the bearer key, which the page only
-    # reads from its OWN origin's localStorage. /open is a one-line page served
-    # by panel-api (which holds LLM_API_KEY) that writes it there and bounces
-    # to / — opens a working dashboard with zero typing. The ONLY
-    # Authelia-gated path on these hosts: /v1 etc. stay bearer-gated for API
-    # clients. Admins-only — the Authelia wildcard admits any user to the
-    # path, so panel-api re-checks Remote-User/Remote-Groups. No secret gate
-    # by design (a browser can't hold the panel token): a direct 172.17.0.1
-    # bind hit 401s only while it leaves Remote-* unset — an edge container
-    # that CAN spoof them already sits on the fleet's own network (accepted,
-    # see require_forward_auth_admin in panel-api). New instance = add
-    # `|| Host(`<name>.pietrasik.top`)` to the rule — make doctor verifies
-    # that host list against the compose services (make update refuses while
-    # it's red). Named fleet-* (not gpu-*) on purpose — the name IS the
-    # instance marker (see header), so this router needs no exemption in
-    # doctor's orphan check. Traefik v3's rule language takes ONE host per
-    # Host() — the v2 multi-value form is a parse error traefik SWALLOWS
-    # (logs it, drops just this router), and /open then falls through to
-    # the instance's bare-Host router, whose API-key gate answers every
-    # dashboard link with 401 {"error":{"message":"invalid api key",…}}.
-    # Hosts are OR'd with || and kept inside (): a top-level rule is one
-    # (possibly OR-ed) conjunction.
+    # Key bootstrap for the radiance dashboards: /open is a one-line page
+    # served by panel-api (which holds LLM_API_KEY) that writes the key into
+    # the dashboard's own-origin localStorage and bounces to /. The ONLY
+    # Authelia-gated path on these hosts — /v1 stays bearer-gated for API
+    # clients. Admins-only: the wildcard admits any user to the path, so
+    # panel-api re-checks Remote-Groups.
+    # Traefik v3 takes ONE host per Host() — the v2 multi-value form is a
+    # parse error traefik SWALLOWS (logs it, drops just this router), so
+    # OR the hosts inside one conjunction: (Host(`a`) || Host(`b`)) && ...
     fleet-open:
       rule: "(Host(`27b.pietrasik.top`) || Host(`27b-1.pietrasik.top`) || Host(`27b-2.pietrasik.top`) || Host(`flashnext.pietrasik.top`) || Host(`writer.pietrasik.top`)) && PathPrefix(`/open`)"
       middlewares: [auth-chain@file]
@@ -105,6 +83,3 @@ http:
       loadBalancer:
         servers:
           - url: "http://gpu-writer:8000"
-
-    # (fleet-fallback and fleet-open route to the panel-api service in
-    # panel.yml — same file provider; not redefined here.)

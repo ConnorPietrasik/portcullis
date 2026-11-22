@@ -5,13 +5,13 @@ log:
   level: INFO
 accessLog: {}
 
-# /ping on the internal :8082 "traefik" entrypoint — used by the compose
-# healthcheck. Never published: only 80/443 are.
+# /ping on the internal :8082 entrypoint — used by the compose healthcheck.
+# Never published: only 80/443 are.
 ping: {}
 
 providers:
   # FILE ONLY — no docker provider, so traefik mounts no docker.sock.
-  # All routers/services live in traefik/dynamic/*.yml (watched for changes).
+  # All routers/services live in traefik/dynamic/*.yml (watched, hot-reloaded).
   file:
     directory: /etc/traefik/dynamic
 
@@ -40,9 +40,8 @@ certificatesResolvers:
       storage: /letsencrypt/acme.json
       dnsChallenge:
         provider: namesilo
-        # Pin lego's recursive propagation checks to public resolvers. Without
-        # this they use the container's /etc/resolv.conf (127.0.0.11 → host
-        # resolver), which can serve the PREVIOUS challenge token from cache
-        # (TTL 3600) — the pre-check then waits out its whole 30-min budget
-        # even though every public resolver and authoritative NS is current.
+        # Pin lego's propagation checks to public resolvers: via the
+        # container resolver (127.0.0.11 → host) they can serve the
+        # PREVIOUS challenge token from cache (TTL 3600) and the pre-check
+        # burns its whole 30-min budget with everything else current.
         resolvers: ["1.1.1.1:53", "8.8.8.8:53"]

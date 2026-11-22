@@ -1,5 +1,5 @@
-# Authelia configuration. Secrets are injected via environment variables in
-# docker-compose.yml (AUTHELIA_*), never stored in this file.
+# Authelia configuration. Secrets are injected via the AUTHELIA_*
+# environment (docker-compose.yml), never stored in this file.
 # Docs: https://www.authelia.com/configuration/prologue/introduction/
 
 theme: dark
@@ -16,10 +16,9 @@ authentication_backend:
   file:
     path: /config/users_database.yml
 
-# Order matters: first match wins. Specific rules BEFORE the wildcard.
-# The bare-domain bypass is deliberately LAST so it can only ever match
-# pietrasik.top itself — anything added later on a new subdomain is
-# private-by-default (caught by the *.pietrasik.top rule above it).
+# Order matters: first match wins. Specific rules BEFORE the wildcard; the
+# bare-domain bypass stays LAST so any new subdomain is private-by-default
+# (it falls to the *.pietrasik.top rule above it).
 access_control:
   default_policy: deny
   rules:
@@ -28,29 +27,20 @@ access_control:
 
     - domain: panel.pietrasik.top
       policy: two_factor
-      subject: ['group:admins'] # panel: only you — enforced by the deny rule
-                                # below (a subject rule only MATCHES admins, it
-                                # does not exclude everyone else)
-
+      subject: ['group:admins'] # only admins — a subject rule only MATCHES
+                                # admins; the deny below EXCLUDES everyone else
     - domain: panel.pietrasik.top
-      policy: deny # everyone else: without this catch-all, non-admins fall
-                   # through to the *.pietrasik.top wildcard below and are
-                   # admitted after 2FA (UI shell; the API still 403s them)
+      policy: deny # without this catch-all, non-admins fall through to the
+                   # wildcard below and are admitted after 2FA
 
     - domain: servitor.pietrasik.top
       policy: two_factor
-      subject: ['group:admins'] # agent VM: only you — same two-rule pattern
-                                # as the panel: the subject rule MATCHES
-                                # admins, the deny below excludes everyone
-                                # else (without it non-admins fall through
-                                # to the *.pietrasik.top wildcard and are
-                                # admitted after 2FA)
-
+      subject: ['group:admins'] # same two-rule pattern as the panel
     - domain: servitor.pietrasik.top
       policy: deny
 
     # Example rules — uncomment (kept ABOVE the wildcard) when you add these
-    # apps; until then they are dead weight (a matching router doesn't exist):
+    # apps; until then they are dead weight (no matching router exists):
     # - domain: jellyfin.pietrasik.top # friends-only app
     #   policy: two_factor
     #   subject: ['group:friends']
@@ -67,8 +57,9 @@ access_control:
       policy: bypass
 
 session:
-  # default_redirection_url MUST be per-cookie (4.38+ multi-domain protection):
-  # a top-level one is a hard startup error while cookies[] is configured.
+  # default_redirection_url MUST be per-cookie (4.38+ multi-domain
+  # protection): a top-level one is a hard startup error while cookies[] is
+  # configured.
   cookies:
     - name: authelia_session
       domain: pietrasik.top

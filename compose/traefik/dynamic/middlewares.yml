@@ -1,7 +1,7 @@
-# Shared middlewares. The X-Panel-Token and X-Servitor-Edge-Key header
-# values are placeholders — stack_sync_configs (setup/common.sh)
-# substitutes them in the deployed files (which therefore contain secrets
-# — they are chmod 600 on the server).
+# Shared middlewares. The X-Panel-Token and X-Servitor-Edge-Key values are
+# placeholders — stack_sync_configs (setup/common.sh) substitutes them in
+# the deployed files (which therefore contain secrets — chmod 600 on the
+# server).
 
 http:
   middlewares:
@@ -9,15 +9,13 @@ http:
       headers:
         stsSeconds: 31536000
         stsIncludeSubdomains: true
-        frameDeny: true # X-Frame-Options: DENY — nothing here needs to be iframed
+        frameDeny: true # X-Frame-Options: DENY — nothing here needs iframing
         contentTypeNosniff: true
         referrerPolicy: same-origin
 
-    # Authelia forward-auth. Traefik strips any client-supplied Remote-*
-    # headers and replaces them with Authelia's verdict. /api/authz/forward-auth
-    # is the 4.38+ replacement for the deprecated /api/verify?rd=… — the portal
-    # URL now comes from the session cookie's authelia_url, so the rd parameter
-    # is gone.
+    # /api/authz/forward-auth is the 4.38+ replacement for the deprecated
+    # /api/verify?rd=… (the portal URL now comes from the session cookie's
+    # authelia_url, so the rd parameter is gone).
     authelia:
       forwardAuth:
         address: http://authelia:9091/api/authz/forward-auth
@@ -30,34 +28,27 @@ http:
       chain:
         middlewares: [sec-headers, authelia]
 
-    # No rate-limit middleware on the fleet's machine-API hosts (per-instance
-    # subdomains + llm.pietrasik.top). The API key IS the gate: a wrong key
-    # 401s before any GPU work, and at 256 bits of entropy guessing is
-    # infeasible at any rate; radiance's admission control (429 +
-    # Retry-After) is the backpressure that actually bounds GPU spend. A
-    # per-IP token bucket shared by every client behind one NAT (the
-    # dashboard's 5 req/s /history polling, agents on the same box) only
-    # punished genuine traffic while a leaked key from another IP would
-    # bypass it entirely. If you are tempted to re-add one: don't.
+    # No rate limit on the fleet machine-API hosts: the API key IS the gate
+    # (a wrong key 401s before any GPU work, and radiance's admission
+    # control bounds GPU spend), and a per-IP bucket shared by every client
+    # behind one NAT only punishes genuine traffic — a leaked key from
+    # another IP would bypass it entirely. If you are tempted to re-add one:
+    # don't.
 
-    # Injected into requests forwarded to the panel API only. Clients cannot
-    # set this header themselves — Traefik overwrites it.
+    # Injected into requests forwarded to the panel API only — Traefik
+    # overwrites any client-supplied value; panel-api re-verifies it.
     panel-secret:
       headers:
         customRequestHeaders:
           X-Panel-Token: __PANEL_TOKEN__
 
-    # The servitor edge credential (invariant 3 in the servitor repo).
-    # Injected on the servitor route ONLY, AFTER the auth chain: the app
-    # re-verifies it on every route (constant-time), and the guest
-    # firewall admits the port from the WHOLE edge subnet — the proxy's
-    # source IP is indistinguishable from a neighbor's, so the credential
-    # is what stops a neighbor container (the public gpu fleet) from
-    # driving the agent or reading its files directly. Traefik overwrites
-    # any client-supplied value (same contract as panel-secret above).
-    # The value MUST equal SERVITOR_EDGE_KEY in /opt/servitor-repo/.env
-    # (the guest's copy, synced into the guest env file by its key slice);
-    # make doctor cross-checks the two.
+    # The servitor edge credential (invariant 3 in the servitor repo): the
+    # guest firewall admits the port from the WHOLE edge subnet, so the key
+    # — re-verified by the app on every route — is what stops a neighbor
+    # container (the public gpu fleet) from driving the agent or reading
+    # its files (same Traefik-overwrites-any-client-value contract as
+    # panel-secret above). Must equal SERVITOR_EDGE_KEY in
+    # /opt/servitor-repo/.env (make doctor cross-checks).
     servitor-edge:
       headers:
         customRequestHeaders:

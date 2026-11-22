@@ -1,18 +1,12 @@
-# Portcullis route for the servitor agent VM.
-# Raw-IP upstream: the libvirt domain sits on the edge bridge at a static
-# address (invariant 2: the route is a file, no docker.sock). The IP mirrors
-# SERVITOR_VM_IP/SERVITOR_BIND in /opt/servitor-repo/.env — keep in sync on
-# re-address.
-# Auth: two gates on this route. (1) the portcullis auth chain (Authelia
-# 2FA); the servitor.pietrasik.top admins-only rule pair in
-# authelia/configuration.yml sits ABOVE the wildcard, or any authenticated
-# user reaches the agent VM. (2) the servitor-edge middleware injects the
-# edge credential (X-Servitor-Edge-Key) which the app re-verifies on every
-# route (invariant 3 in the servitor repo): the VM's firewall admits 8787
-# from the WHOLE edge subnet, so without the credential a neighbor
-# container (the public gpu fleet) could drive the agent and read its files
-# directly.
-# No UFW ingress change: the route rides 443.
+# Portcullis route for the servitor agent VM. Raw-IP upstream: the libvirt
+# domain sits on the edge bridge at a static address (invariant 2: the route
+# is a file, no docker.sock). The IP mirrors SERVITOR_VM_IP in
+# /opt/servitor-repo/.env — keep in sync on re-address.
+# Auth: two gates — the auth chain (the servitor admins-only rule pair in
+# authelia/configuration.yml sits ABOVE the wildcard) + servitor-edge (the
+# app re-verifies the key on every route — why it is needed: the middleware
+# comment in middlewares.yml). Rides 443 — no UFW ingress change.
+
 http:
   routers:
     servitor:
@@ -29,18 +23,11 @@ http:
         servers:
           - url: "http://172.18.0.15:8787"
         passHostHeader: true
-        # SSE contract: a stream cut by a proxy timeout is the
-        # dropped-connection bug we are forbidden to reproduce.
-        #  - frequent flushes (heartbeats ~15 s; deltas are disposable, but
-        #    the stream must never be cut)
-        #  - timeouts: Traefik v3 has NO per-service response timeout —
-        #    entrypoint writeTimeout defaults to 0 and backend forwarding
-        #    timeouts default to 0, so a 20-minute bash call (zero events)
-        #    is never cut; the heartbeat is what keeps the client-side
-        #    connection live. flushInterval is v3's only responseForwarding
-        #    field (default 100ms, ignored for responses v3 recognizes as
-        #    streaming) — set for the record. Do NOT re-add a readTimeout
-        #    key: v3 has no such loadBalancer field and silently ignores
-        #    unknown ones (that would be dead config).
+        # SSE contract: a stream cut by a proxy timeout is the bug we must
+        # not reproduce. Traefik v3 has NO per-service response timeout
+        # (defaults are 0) — the app's ~15 s heartbeats keep the client side
+        # live. flushInterval is v3's only responseForwarding field (set for
+        # the record); do NOT re-add a readTimeout key — v3 has no such
+        # loadBalancer field and silently ignores unknown ones.
         responseForwarding:
           flushInterval: 100ms

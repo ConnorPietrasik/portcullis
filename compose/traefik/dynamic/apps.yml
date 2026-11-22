@@ -1,6 +1,6 @@
-# Public apps. The file provider watches this directory — edits apply without
-# a traefik restart. Add future public apps here (private apps get a router in
-# their own file with auth-chain@file; see docs/RUNBOOK.md → “add an app”).
+# Public apps. The file provider watches this directory — edits apply
+# without a traefik restart. Add future public apps here (private apps get a
+# router with auth-chain@file; RUNBOOK → “Add an app”).
 
 http:
   routers:
