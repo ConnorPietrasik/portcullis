@@ -488,10 +488,17 @@ interface SettingsForm {
 // settings PUT is all-or-nothing: the server rebuilds the whole file from
 // the body, a partial one wipes the fields it omits). Close just drops the
 // popup; the draft stays in the card, nothing is lost.
+//
+// STALE entries — prompt keys that match no deployed gen model (a model
+// rename/swap left them behind) — are surfaced here, not hidden: the PUT is
+// rejected by the server while any unknown name is in the body, so without
+// a path to copy (the text into a current model) or delete (the key) the
+// only exit would be hand-editing gen-settings.json on the host.
 function PromptEditorModal({
   models,
   prompts,
   onPrompt,
+  onStaleDelete,
   err,
   busy,
   saving,
@@ -501,6 +508,7 @@ function PromptEditorModal({
   models: string[]
   prompts: Record<string, string>
   onPrompt: (model: string, text: string) => void
+  onStaleDelete: (names: string[]) => void
   err: string | null
   busy: boolean
   saving: boolean
@@ -516,18 +524,56 @@ function PromptEditorModal({
   useEffect(() => {
     if (sel !== model) setSel(model)
   }, [model, sel])
+  const [copyFrom, setCopyFrom] = useState('')
+  // the source belongs to the target — a pick made for one model is
+  // meaningless for the next
+  useEffect(() => {
+    setCopyFrom('')
+  }, [model])
   const set = models.filter((n) => (prompts[n] ?? '').trim() !== '').length
+  // stale entries: prompt keys that match no deployed gen model (a model
+  // rename/swap left them behind). The settings PUT is all-or-nothing and
+  // the server rejects unknown names, so the save stays blocked until each
+  // is copied (its text into a current model) or deleted (the key).
+  const stale = Object.keys(prompts).filter((n) => !models.includes(n))
+  // copy sources: any entry with text — live or stale — never the target
+  const sources = Object.keys(prompts).filter((n) => n !== model && (prompts[n] ?? '').trim() !== '')
+
+  function doCopy() {
+    const text = prompts[copyFrom] ?? ''
+    if (!model || !copyFrom || text.trim() === '') return
+    // a copy REPLACES the target's prompt — confirm before overwriting it
+    if (
+      (prompts[model] ?? '').trim() !== '' &&
+      !window.confirm(`replace ${model}'s prompt with ${copyFrom}'s?`)
+    )
+      return
+    onPrompt(model, text)
+    setCopyFrom('')
+  }
+
   return (
     <Modal
       title={
         <>
-          enhancement prompts <span className="muted">— {set}/{models.length} models set</span>
+          enhancement prompts{' '}
+          <span className="muted">
+            — {set}/{models.length} models set{stale.length > 0 ? ` · ${stale.length} stale` : ''}
+          </span>
         </>
       }
       onClose={onClose}
       footer={
         <>
-          <button disabled={busy || saving} onClick={onSave}>
+          <button
+            disabled={busy || saving || stale.length > 0}
+            title={
+              stale.length > 0
+                ? `the settings can't be saved with ${stale.length} stale entr${stale.length === 1 ? 'y' : 'ies'} — copy (their prompts) or delete them first`
+                : undefined
+            }
+            onClick={onSave}
+          >
             {saving ? 'saving…' : 'save settings'}
           </button>
           <button onClick={onClose}>close</button>
@@ -558,6 +604,73 @@ function PromptEditorModal({
             onChange={(e) => onPrompt(model, e.target.value)}
           />
         </label>
+      )}
+      {model && sources.length > 0 && (
+        <div className="gen-field">
+          <span>
+            copy prompt from <span className="muted">— reuse a live (or stale) model's instruction for this one</span>
+          </span>
+          <div className="gen-copyrow-ctl">
+            <select value={copyFrom} onChange={(e) => setCopyFrom(e.target.value)} disabled={busy || saving}>
+              <option value="">— pick a source —</option>
+              {sources.map((n) => (
+                <option key={n} value={n}>
+                  {n}
+                  {stale.includes(n) ? ' (stale)' : ''}
+                </option>
+              ))}
+            </select>
+            <button
+              disabled={busy || saving || copyFrom === ''}
+              title={`copy ${copyFrom || 'the picked model'}'s prompt into ${model} (an existing prompt is replaced — you're asked first)`}
+              onClick={doCopy}
+            >
+              copy
+            </button>
+          </div>
+        </div>
+      )}
+      {stale.length > 0 && (
+        <div className="gen-stale">
+          <div className="gen-stale-head">
+            <span>
+              stale entries <span className="muted">— {stale.length} entr{stale.length === 1 ? 'y' : 'ies'} matching no deployed gen model</span>
+            </span>
+            <button
+              className="danger"
+              disabled={busy || saving}
+              title="delete every stale entry"
+              onClick={() => onStaleDelete(stale)}
+            >
+              delete all
+            </button>
+          </div>
+          <p className="muted gen-model-note">
+            the settings save stays blocked while these are present (the server rejects unknown model names) — copy a
+            prompt into a current model above, then delete the entry.
+          </p>
+          {stale.map((n) => (
+            <div key={n} className="gen-stale-row">
+              <code>{n}</code>
+              <span className="muted gen-stale-text" title={(prompts[n] ?? '').trim() || '(empty)'}>
+                {(prompts[n] ?? '').trim()
+                  ? (prompts[n] ?? '')
+                      .trim()
+                      .replace(/\s+/g, ' ')
+                      .slice(0, 120)
+                  : '(empty)'}
+              </span>
+              <button
+                className="danger"
+                disabled={busy || saving}
+                title={`delete the entry for ${n}`}
+                onClick={() => onStaleDelete([n])}
+              >
+                delete
+              </button>
+            </div>
+          ))}
+        </div>
       )}
       {err && <div className="banner err gen-err">{err}</div>}
       <p className="muted gen-model-note">
@@ -592,6 +705,11 @@ function SettingsCard({ o, busy, onSaved }: { o: GenOverview; busy: boolean; onS
   const imageModels = Object.entries(o.models).filter(([, m]) => m.kind === 'image').map(([n]) => n)
   const videoModels = Object.entries(o.models).filter(([, m]) => m.kind === 'video').map(([n]) => n)
   const genModels = [...imageModels, ...videoModels]
+  // prompt keys that match no deployed gen model (a rename/swap left them
+  // behind) — the PUT is rejected while they're in the draft, so the popup
+  // manages them (copy the text into a current model / delete the key)
+  // before any save goes out
+  const staleModels = Object.keys(form.prompts).filter((n) => !genModels.includes(n))
   const targetInstance = o.instances.find((i) => i.name === form.enhanceInstance)
   const promptCount = genModels.filter((n) => (form.prompts[n] ?? '').trim() !== '').length
 
@@ -708,15 +826,18 @@ function SettingsCard({ o, busy, onSaved }: { o: GenOverview; busy: boolean; onS
             enhancement prompts <span className="muted">— one rewrite instruction per gen model; edited in the popup</span>
           </span>
           <button
-            disabled={busy || saving || genModels.length === 0}
+            disabled={busy || saving || (genModels.length === 0 && staleModels.length === 0)}
             title={
-              genModels.length === 0
+              genModels.length === 0 && staleModels.length === 0
                 ? 'no gen models deployed (the gen slots)'
-                : 'edit the per-model enhancement prompts'
+                : staleModels.length > 0
+                  ? `edit the per-model enhancement prompts (${staleModels.length} stale entr${staleModels.length === 1 ? 'y' : 'ies'} to copy or delete)`
+                  : 'edit the per-model enhancement prompts'
             }
             onClick={() => setShowPrompts(true)}
           >
-            manage enhancement prompts ({promptCount}/{genModels.length} set)
+            manage enhancement prompts ({promptCount}/{genModels.length} set
+            {staleModels.length > 0 && <span className="muted"> · {staleModels.length} stale</span>})
           </button>
         </div>
         <label className="gen-field">
@@ -736,15 +857,30 @@ function SettingsCard({ o, busy, onSaved }: { o: GenOverview; busy: boolean; onS
           render the same one twice (here and behind the backdrop) */}
       {err && !showPrompts && <div className="banner err gen-err">{err}</div>}
       <div className="btns">
-        <button disabled={busy || saving} onClick={() => void save()}>
+        <button
+          disabled={busy || saving || staleModels.length > 0}
+          title={
+            staleModels.length > 0
+              ? `${staleModels.length} stale prompt entr${staleModels.length === 1 ? 'y' : 'ies'} — the server rejects the settings save until they're copied or deleted in "manage enhancement prompts"`
+              : undefined
+          }
+          onClick={() => void save()}
+        >
           {saving ? 'saving…' : 'save settings'}
         </button>
       </div>
-      {showPrompts && genModels.length > 0 && (
+      {/* the popup opens for the stale entries too (no gen models deployed,
+          only leftovers to clean up) */}
+      {showPrompts && (genModels.length > 0 || staleModels.length > 0) && (
         <PromptEditorModal
           models={genModels}
           prompts={form.prompts}
           onPrompt={(n, v) => setForm({ ...form, prompts: { ...form.prompts, [n]: v } })}
+          onStaleDelete={(names) => {
+            const next = { ...form.prompts }
+            for (const n of names) delete next[n]
+            setForm({ ...form, prompts: next })
+          }}
           err={err}
           busy={busy}
           saving={saving}

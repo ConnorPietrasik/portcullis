@@ -1686,6 +1686,64 @@ pre.out.err {
   margin: 8px 0 4px;
 }
 
+/* the popup's "copy prompt from" row — select + button side by side
+   (.gen-field children are full-width by default) */
+.gen-copyrow-ctl {
+  display: flex;
+  gap: 8px;
+}
+
+.gen-copyrow-ctl select {
+  flex: 1;
+}
+
+.gen-copyrow-ctl button {
+  width: auto;
+  flex: 0 0 auto;
+}
+
+/* the popup's stale prompt entries (model names matching no deployed gen
+   model — the save is blocked until they're copied or deleted) */
+.gen-stale {
+  padding-top: 8px;
+  border-top: 1px solid var(--line-soft);
+  font-size: 13px;
+}
+
+.gen-stale-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.gen-stale-head button {
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.gen-stale-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.gen-stale-row code {
+  flex-shrink: 0;
+}
+
+.gen-stale-row .gen-stale-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gen-stale-row button {
+  flex-shrink: 0;
+}
+
 /* ── modal (the popup editor — the gen enhancement prompts) ── */
 
 .modal-backdrop {

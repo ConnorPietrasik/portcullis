@@ -753,7 +753,11 @@ mkdir -p /models/llm /models/image /models/video
 toggle, the per-model enhancement prompts, the ENHANCE TARGET (instance + model — default
 `gpu-writer` / `Writer`), the GC age. State lives in `/opt/panel-api/gen-settings.json`
 (panel 0600) + `/opt/panel-api/gen-jobs.json` (queue + jobs, 0600) — both in the update snapshot,
-like the LLM router's settings.
+like the LLM router's settings. A model rename/swap leaves the old name's prompt entry behind:
+the *manage enhancement prompts* popup lists it under **stale entries** (its text can be copied
+into a current model, the entry deleted — one by one or all) — the PUT, and with it the tab's
+save, is rejected while any stale entry is in the draft, so that section is where a model
+change gets cleaned up, not a hand-edit of the file.
 - **V2 (servitor):** the same endpoints re-exposed under `/machine/gen/*` with the bearer
 `LLM_API_KEY` (no Authelia) — one handler set, two gates. Not in this release.
 

@@ -538,7 +538,7 @@ def validate_settings(
         else:
             for k, v in prompts_in.items():
                 if k not in known:
-                    errors.append(f"enhance.prompts: unknown gen model {k!r}")
+                    errors.append(f"enhance.prompts: unknown gen model {k!r} (matches no deployed gen model — copy or delete it in the Gen tab's enhancement prompts)")
                     continue
                 if not isinstance(v, str):
                     errors.append(f"enhance.prompts.{k}: must be a string")
