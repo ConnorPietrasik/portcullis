@@ -68,7 +68,8 @@ models:
     # A CEILING, not a preallocation: the KV pool is the budget-resolved
     # leftover VRAM. The one hard cost: one full-length sequence's KV is a
     # BOOT FLOOR (the fit question — header)
-    max-model-len: 65536
+    max-model-len: 100000
+    kv-cache-dtype: i8
     max-num-seqs: 8 # headroom for direct sessions
     # Packager-recommended per-model defaults (the sampling three are
     # defaults for requests that do not set them):
