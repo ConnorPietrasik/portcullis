@@ -13,16 +13,16 @@ Traefik uses for DNS-01; the key is never logged.
 Purely declarative, no state: every tick it detects the public IPv4 (2-of-3
 agreement across an OpenDNS UDP resolver and two HTTPS services — the
 unauthenticated UDP answer is spoofable on-path, so it never decides alone),
-lists the domain's records, updates every stale A record and creates missing
-ones; CNAMEs at a configured host are respected and skipped. Whatever drifted
-is fixed within one tick — a "nothing changed, skip" short-circuit was
-deliberately rejected: it can silently trust a stale assumption, for ~6 tiny
-API calls/hour saved. TTL is pinned at 3600 (NameSilo's minimum), so
-worst-case cutover ≈ timer interval + 1h of resolver caching.
+lists the domain's records, and updates/creates whatever drifted. CNAMEs at
+a configured host are respected and skipped. There is deliberately no
+"nothing changed, skip" short-circuit: it can silently trust a stale
+assumption, for ~6 tiny API calls/hour saved. TTL is pinned at 3600
+(NameSilo's minimum), so worst-case cutover ≈ timer interval + 1h of resolver
+caching.
 
-The domain is fixed at pietrasik.top and hardcoded: every other
-domain-aware piece of this project is pinned to it, so an env override here
-could only desync the A record from those routes.
+The domain is hardcoded: every other domain-aware piece of this project is
+pinned to it, so an env override here could only desync the A record from
+those routes.
 
 Env: DDNS_HOSTS (default "@" — the apex; set "@,*" only if the wildcard is
 ever an A record).

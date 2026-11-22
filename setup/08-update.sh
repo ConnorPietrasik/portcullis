@@ -33,19 +33,18 @@
 #                               world rolls back on its own (shape AND image).
 #                               It inherits UPDATE_DOCTOR (0 skips its
 #                               precheck + verify doctors too).
-#                               INVARIANT 9: the scripts this tail
-#                               root-execs live in an admin-editable
-#                               checkout OUTSIDE panel-do — the bash ones
-#                               (deploy/update.sh + its siblings
-#                               sync/doctor.sh + deploy/guest/build.sh)
-#                               pass managed_script_check (the bash mirror
-#                               of checkManagedScript), and the executed
-#                               python (deploy/resolve_target.py — run
-#                               under python3 by update.sh, its shebang
-#                               never the exec path) the file-level
-#                               managed_data_check — right here, before the
-#                               exec. A failed check skips its update
-#                               loudly; it never rolls back the host.
+#                               INVARIANT 9: the scripts this tail root-execs
+#                               live in an admin-editable checkout OUTSIDE
+#                               panel-do — the bash ones (deploy/update.sh +
+#                               its siblings sync/doctor.sh +
+#                               deploy/guest/build.sh) pass
+#                               managed_script_check, and the executed python
+#                               (deploy/resolve_target.py — run under python3
+#                               by update.sh, its shebang never the exec path)
+#                               the file-level managed_data_check — right
+#                               here, before the exec. A failed check skips
+#                               its update loudly; it never rolls back the
+#                               host.
 set -euo pipefail
 source "$(dirname "$(realpath "$0")")/common.sh"
 # panel-do's update-run/-force launch this script with --detach: re-exec in a
@@ -300,19 +299,11 @@ if [[ "${SERVITOR_UPDATE:-1}" == "1" ]]; then
       # steps (non-gating, as designed).
       info "servitor: the VM is shut off (planned downtime) — leaving it asleep: its update would wake it via the image swap (start it when you want the float: sudo virsh start servitor — the next tick then applies the update)"
     else
-      # INVARIANT 9 on this path: every script the tail root-execs — the
-      # bash ones directly (update.sh) or through it (guest/build.sh,
-      # sync.sh, doctor.sh) — passes managed_script_check (the bash mirror
-      # of panel-do's checkManagedScript) before any exec; the check's
-      # detail line(s) are already on the log. The tail is non-gating, so a
-      # failed check skips loudly — it never rolls back the host stack (the
-      # panel's servitor-* actions fail the same check at their own exec,
-      # so a writable checkout is visible from both sides). resolve_target.py
-      # is executed code too (update.sh runs it under python3 as root — its
-      # shebang is never the exec path): the chain check above covers its
-      # replaceability, managed_data_check its file-level writability (an
-      # in-place modification of a writable file, which the chain alone does
-      # not catch).
+      # INVARIANT 9 on this path (see the header): every script the tail
+      # root-execs passes managed_script_check before any exec; the executed
+      # resolve_target.py rides the chain check (replaceability) +
+      # managed_data_check (in-place modification, which the chain alone
+      # does not catch). Non-gating: a failed check skips loudly.
       managed_ok=1
       for s in update.sh sync.sh doctor.sh guest/build.sh; do
         if ! managed_script_check "/opt/servitor-repo/deploy/$s"; then

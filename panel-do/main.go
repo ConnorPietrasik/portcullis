@@ -9,7 +9,6 @@
 //   - Short-lived process: no listeners, no goroutines, no network — one
 //     documented exception: the bounded servitor healthz probe
 //     (probeServitorHealth).
-
 package main
 
 import (
@@ -77,9 +76,9 @@ func runCmd(ctx context.Context, path string, args ...string) (string, error) {
 
 // runCmdInput is runCmd with an input string on the child's stdin: for the
 // rare caller that must hand the child a value too sensitive for argv —
-// /proc/<pid>/cmdline is WORLD-readable (unlike environ, which is the
-// reason for the reduced env files), so a secret on argv would leak to
-// every local uid for the life of the exec; stdin is private to it.
+// /proc/<pid>/cmdline is WORLD-readable (unlike environ, which is the reason
+// for the reduced env files), so a secret on argv would leak to every local
+// uid for the life of the exec; stdin is private to it.
 func runCmdInput(ctx context.Context, path, stdin string, args ...string) (string, error) {
 	if !filepath.IsAbs(path) {
 		return "", fmt.Errorf("refusing non-absolute path %q", path)
@@ -189,8 +188,7 @@ func main() {
 		// skipResult (defined in the ACTIONS section) = an EXPECTED decline
 		// (dirty clone, an update already running): exit 75 (EX_TEMPFAIL),
 		// not a fault — panel-autoupdate.service declares SuccessExitStatus
-		// for it, so a skipped tick leaves no failed unit behind; the reason
-		// is the SKIPPED line below (this unit's journal).
+		// for it, so a skipped tick leaves no failed unit behind.
 		var skipped skipResult
 		if errors.As(err, &skipped) {
 			logf("action=%s SKIPPED dur=%s — %v", os.Args[1], time.Since(start), err)
@@ -237,13 +235,12 @@ var serviceNameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
 var gpuServiceRe = regexp.MustCompile(`^gpu-[a-z0-9][a-z0-9-]{0,62}$`)
 
 // gpuFleet lists the deployed stack's fleet instances (services named gpu-*)
-// and the number of cards each one needs — the GPU pool's static half. cards
-// comes from the gpu.cards label ALONE (== tp in the instance's radiance
-// config): radiance 2.x takes its settings from a YAML file, so the pre-2.x
-// --tp flag the old fallback read is gone from the command — a missing or
-// invalid label is an error, not a one-card guess (doctor cross-checks the
-// label against the config at update time). JSON array on stdout; read-only,
-// no args.
+// and the number of cards each one needs — the GPU pool's static half.
+// cards comes from the gpu.cards label ALONE (radiance 2.x reads its settings
+// from a YAML file, so the label — which must equal the config's tp — is the
+// pool's only source; doctor cross-checks them at update time): a missing or
+// invalid label is an error, not a one-card guess. JSON array on stdout;
+// read-only, no args.
 func gpuFleet(ctx context.Context, args []string, logf func(string, ...any)) error {
 	out, err := runCmd(ctx, "/usr/bin/docker", "compose", "--project-directory", "/opt/panel",
 		"-f", "/opt/panel/docker-compose.yml", "config", "--format", "json")
@@ -272,8 +269,7 @@ func gpuFleet(ctx context.Context, args []string, logf func(string, ...any)) err
 		if display == "" || display == "true" {
 			display = name
 		}
-		// The label is the ONLY source of the card need (radiance 2.x has no
-		// --tp left in the command to fall back to) — a missing or invalid
+		// The label is the ONLY source of the card need — a missing or invalid
 		// one errors the whole fleet listing rather than grab one card for a
 		// four-card instance.
 		cards, err := strconv.Atoi(composeLabel(s.Labels, "gpu.cards"))
@@ -596,9 +592,10 @@ func composeLabel(raw json.RawMessage, key string) string {
 //     doctor red-lights an installed unit that lost the knob.
 //   - the clone to run from is the one that last recorded itself: every
 //     `make update` writes repo_root into the state file, and every auto-exec
-//     re-validates it below (a swappable clone = root code execution on the
-//     next timer fire). No git is involved in the auto path: it floats the
-//     lines, and the clone only moves when the admin edits it.
+//     re-validates it below (checkManagedScript — a swappable clone = root
+//     code execution on the next timer fire). No git is involved in the auto
+//     path: it floats the lines, and the clone only moves when the admin
+//     edits it.
 
 const (
 	updateStatePath  = "/opt/panel/.update-state"
@@ -606,8 +603,8 @@ const (
 )
 
 // repo_root as recorded in the state file: absolute, sane characters, no
-// empty/`.`/`..` segments (the checks below stat the resolved path, but the
-// input stays strict and simple — no "//", no trailing slash).
+// empty/`.`/`..` segments (the checks below stat the resolved path; the
+// input stays strict — no "//", no trailing slash).
 var updatePathRe = regexp.MustCompile(`^/[A-Za-z0-9._/-]{1,254}$`)
 
 func validUpdatePath(p string) bool {
@@ -701,16 +698,13 @@ func firstLine(p string) (string, error) {
 // and not owned by the panel user — the same standard as this binary's
 // self-check. A group/other-writable DIRECTORY anywhere in the chain would
 // let a local user delete-and-replace the file (a writable script dir) or
-// the checkout directory itself (a writable ancestor), regardless of the
-// file's own mode — and every check below would pass on the stand-in — so
-// the WHOLE chain is checked, not just the leaf directories.
+// the checkout directory itself (a writable ancestor), and every leaf-level
+// check would pass on the stand-in — so the WHOLE chain is checked, not
+// just the leaf.
 //
-// The callers are the two places this binary execs a script out of an
-// admin-editable checkout: the auto-update clone (root = the state's
-// repo_root, rel = setup/08|09-*.sh) and the servitor deploy scripts
-// (root = /opt/servitor-repo, rel = deploy/sync|doctor.sh). In both, a
-// swapped script is root code execution — the check, not the ownership,
-// is the control.
+// Callers: the auto-update clone scripts and the servitor deploy scripts —
+// in both, a swapped script is root code execution. The check, not the
+// ownership, is the control.
 func checkManagedScript(root, rel string) (string, error) {
 	script := filepath.Join(root, rel)
 	panelUID, panelErr := panelUserID()
@@ -987,9 +981,9 @@ func updateReport(ctx context.Context, args []string, logf func(string, ...any))
 					}
 					// An image WITHOUT the label makes the Go template render the
 					// nil *string as the literal text "<nil>" (modern docker) or
-					// "<no value>" (older) — not an empty field. Treat both as
-					// "no version": those images classify as `moved`, and the
-					// dashboard's before→after column must not show the sentinel.
+					// "<no value>" (older) — treat both as "no version": those
+					// images classify as `moved`, and the before→after column must
+					// not show the sentinel.
 					if v != "" && v != "<nil>" && v != "<no value>" {
 						ver[id] = &v
 					}
@@ -1015,9 +1009,9 @@ func updateReport(ctx context.Context, args []string, logf func(string, ...any))
 		}
 	}
 	// The timer's state for the Settings card: enabled/disabled, or nil when
-	// the unit file isn't installed (`make autoupdate` fixes that) — for a
-	// missing unit, is-enabled prints "not-found" (systemd ≥ 250), which maps
-	// to nil like anything that isn't enabled/disabled.
+	// the unit file isn't installed (`make autoupdate` fixes that) — is-enabled
+	// prints "not-found" (systemd ≥ 250) for a missing unit, which maps to nil
+	// like anything that isn't enabled/disabled.
 	timerOut, _ := runCmd(ctx, "/usr/bin/systemctl", "is-enabled", "--", "panel-autoupdate.timer")
 	var timer *bool
 	switch t := strings.TrimSpace(timerOut); t {
@@ -1079,8 +1073,8 @@ func updatePreview(ctx context.Context, args []string, logf func(string, ...any)
 	// absent), so "not a checkout" is NOT an error here. A checkout whose
 	// status we CANNOT read is: update-run refuses it (fail closed), and the
 	// dashboard must not offer a plain "run now" for a clone it cannot
-	// verify — git_error carries the reason (corrupt index, …) and the
-	// panel's "run anyway" is the deliberate path, as for a dirty clone.
+	// verify — git_error carries the reason, and the panel's "run anyway" is
+	// the deliberate path, as for a dirty clone.
 	isRepo, _ := git("rev-parse", "--is-inside-work-tree")
 	if strings.TrimSpace(isRepo) == "true" {
 		if head, herr := git("rev-parse", "HEAD"); herr == nil {
@@ -1088,8 +1082,8 @@ func updatePreview(ctx context.Context, args []string, logf func(string, ...any)
 			if dh, ok := res["deployed_head"].(string); ok && dh != "" && dh != strings.TrimSpace(head) {
 				// A sha the clone no longer has (re-cloned tree) → git fails →
 				// the commit list stays empty; the line-file diff below still
-				// holds. commit_count is the FULL count — the list is capped
-				// at the last 30 for display. An EMPTY range (clone checked out
+				// holds. commit_count is the FULL count — the list is capped at
+				// the last 30 for display. An EMPTY range (clone checked out
 				// BEHIND the deployed head) is "nothing pending" — without the
 				// non-empty guard, Split("") would yield a phantom [""] commit.
 				if log, lerr := git("log", "--oneline", dh+"..HEAD"); lerr == nil && strings.TrimSpace(log) != "" {
@@ -1315,8 +1309,8 @@ func servitorScriptTail(what, script, out string, err error, logf func(string, .
 // resumable: re-run it (RUNBOOK → Servitor, troubleshooting).
 //
 // The deploy key is passed explicitly: runCmd's scrubbed env has no HOME,
-// so the script's ${HOME:-/root} default is only a backstop — /root/.srv
-// is the canonical root-side home (RUNBOOK → Servitor).
+// so the script's ${HOME:-/root} default is only a backstop (/root/.srv is
+// the canonical root-side home, RUNBOOK → Servitor).
 func servitorSync(ctx context.Context, args []string, logf func(string, ...any)) error {
 	script, err := checkManagedScript(servitorRepoPath, filepath.Join("deploy", "sync.sh"))
 	if err != nil {

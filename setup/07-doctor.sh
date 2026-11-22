@@ -126,16 +126,15 @@ fi
 # command-line flags, only --config). Those name references come from a
 # hand-copied block, and one wrong one leaves the container up but the
 # subdomain dead — silently — or the block red at panel-do gpu-fleet.
-# Both trees are checked: the repo's (make update
-# refuses to run while this is red — doctor is its precondition) and the
-# deployed one (what actually routes). The gpu-* prefix IS the instance
-# marker: the orphan check below assumes any gpu-* router pairs with a
-# compose service, so shared (non-instance) routers carry the fleet-*
-# prefix instead (fleet-fallback, fleet-open — both route to the panel-api
-# service in panel.yml) and need no exemption; a shared router named gpu-*
-# reports as stale on purpose (rename it). fleet-open's Host() list is
-# checked separately: it must name every instance host (end of
-# fleet_routes).
+# Both trees are checked: the repo's (make update refuses to run while this
+# is red — doctor is its precondition) and the deployed one (what actually
+# routes). The gpu-* prefix IS the instance marker: the orphan check below
+# assumes any gpu-* router pairs with a compose service, so shared
+# (non-instance) routers carry the fleet-* prefix instead (fleet-fallback,
+# fleet-open — both route to the panel-api service in panel.yml); a shared
+# router named gpu-* reports as stale on purpose (rename it). fleet-open's
+# Host() list is checked separately: it must name every instance host (end
+# of fleet_routes).
 # The gpu.cards label is the GPU pool's ONLY source of the instance's card
 # need (radiance 2.x: no --tp left in the command to fall back to) — a
 # missing label is checked here, not left to panel-do's runtime error.
@@ -218,13 +217,11 @@ fleet_routes() { # <compose.yml> <gpu.yml> <label>
   # router/service pair: the shared key-bootstrap router routes to the
   # panel-api service (no compose service to pair), but its host list must
   # still name EVERY public instance (private ones have no host to name). A
-  # missing host leaves that instance's
-  # dashboard link dead: /open falls through to the instance's bare-Host
-  # router (no forward-auth there), and radiance's API-key gate — which
-  # covers every path but GET / /health /dashboard /ping — answers the
-  # browser with 401 {"error":{"message":"invalid api key",…}}: that JSON
-  # IS the page the user sees. A stale host is harmless clutter (warn
-  # only). Empty fleet → nothing to compare.
+  # missing host leaves that instance's dashboard link dead: /open falls
+  # through to the instance's bare-Host router (no forward-auth there), and
+  # radiance's API-key gate answers the browser with 401
+  # {"error":{"message":"invalid api key",…}} — that JSON IS the page the
+  # user sees. A stale host is harmless clutter (warn only).
   if (( ${#svcs[@]} )); then
     local open_hosts inst_hosts missing stale stale_priv stale_pub add h badhost
     # Syntax canary: Traefik v3's Host() takes ONE value. The v2 multi-value
@@ -501,7 +498,7 @@ fi
 # probe matrix.
 #
 # Never `docker compose config` for expectations (interpolation makes healthy
-# containers look dead — the 4x phantom-FAIL incident); the deployed files
+# containers look dead); the deployed files
 # are grepped raw and container state comes from compose LABELS
 # (config-independent).
 section "search (searxng)"
@@ -509,8 +506,8 @@ section "search (searxng)"
 # allow-list — additions are a deliberate diff, and a guard key fails
 # LOUDLY: a guard key in env silently overrides the deployed settings.yml
 # (env > file) and every deployed-file check would pass on it. GRANIAN_HOST
-# is NOT a member: the 2026-11-13 spike forced no host pin (both loopback
-# families answered) — a future spike that does forces a deliberate edit here.
+# is NOT a member: no host pin has been needed (both loopback families
+# answer) — a future change that needs one forces a deliberate edit here.
 SEARXNG_ENV_ALLOW=(SEARXNG_PORT FORCE_OWNERSHIP GRANIAN_BLOCKING_THREADS)
 SEARXNG_ENV_GUARDS=(SEARXNG_SECRET SEARXNG_BASE_URL SEARXNG_LIMITER SEARXNG_PUBLIC_INSTANCE SEARXNG_IMAGE_PROXY)
 searxng_env_keys() { # <compose-file> → key, one per line
@@ -632,9 +629,8 @@ else
     hint "a token with no sed line is a public string running live; a sed line with no token is a dead fill"
   fi
   # Placement: set equality is blind to WHERE a token lives — a token in a
-  # file the sync's sed never rewrites (the 2026-11-13 bug: a comment in
-  # docker-compose.yml named the searxng one) survives the sync verbatim,
-  # and the deployed survival grep then red-lights every update. Every
+  # file the sync's sed never rewrites survives the sync verbatim, and the
+  # deployed survival grep then red-lights every update. Every
   # token-carrying file must be a sed target of stack_sync_configs.
   token_files="$(grep -rlE '__[A-Z_]+__' "$REPO_ROOT/compose/traefik/" "$REPO_ROOT/compose/searxng/" "$REPO_ROOT/compose/docker-compose.yml" 2>/dev/null || true)"
   misplaced=""

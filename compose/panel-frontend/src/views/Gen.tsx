@@ -40,11 +40,11 @@ function Cards({ xs }: { xs: number[] | null }) {
 // off radiance's implementation (ref/radiance, arch/minimaxh3 for H3):
 // chunk-quantized 24 fps timeline (7–20 chunks → 5.17–14.38 s, a request
 // rounds UP to a chunk), always with sound, 32-px grid with a 256-px floor,
-// the 1344×768 area cap, 4:1 max aspect, 8192-token prompt. The upstream
-// model's "few frames" mode is not exposed there — radiance's H3 floor is
-// 5.17 s. An annotation, not a second model registry: no discovery, no
-// enforcement — unknown models get no note, and radiance's submit-time 400
-// stays the authority (it names the model's own limits).
+// the 1344×768 area cap, 4:1 max aspect, 8192-token prompt (radiance's H3
+// floor is 5.17 s — the upstream "few frames" mode is not exposed). An
+// annotation, not a second model registry: no discovery, no enforcement —
+// unknown models get no note, and radiance's submit-time 400 stays the
+// authority (it names the model's own limits).
 const MODEL_NOTES: Record<string, string> = {
   'minimax-h3-i8':
     'video 5.17–14.38 s (24 fps, 7–20 chunks; request rounds up to a chunk ≈ 0.71 s) · with sound · sides ×32, ≥ 256 px, ≤ 1344×768 area, aspect ≤ 4:1 · prompt ≤ 8192 tokens',
@@ -483,11 +483,8 @@ interface SettingsForm {
 
 // The per-model rewrite instructions live in a popup, not on the card: with
 // a fleet's worth of gen models, one textarea each would swamp the settings
-// card (and a 2-row box is too small to compose an instruction anyway).
-// The card keeps ONE button + a set-count; the popup gives each instruction
-// a model dropdown and a full-width, tall textarea. It edits the SAME
-// form.prompts draft as the card — no second copy — so the card's and the
-// popup's save buttons persist the identical body (the
+// card. It edits the SAME form.prompts draft as the card — no second copy —
+// so the card's and the popup's save buttons persist the identical body (the
 // settings PUT is all-or-nothing: the server rebuilds the whole file from
 // the body, a partial one wipes the fields it omits). Close just drops the
 // popup; the draft stays in the card, nothing is lost.

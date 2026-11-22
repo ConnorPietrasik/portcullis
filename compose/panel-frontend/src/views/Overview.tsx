@@ -127,15 +127,11 @@ export default function Overview({ intervalMs }: { intervalMs: number }) {
   const hist = useHistory(data)
   const now = useNow(500)
   // Auto-update: the report is the control-plane poll (state file + live
-  // images — cheap, and the in-progress banner tails the run log through it),
-  // the preview is what the NEXT update would apply (local git + file facts).
-  // Neither is essential — a failure costs a banner/card, never the metrics.
-  // Respect the user's data budget (Settings → refresh interval): the update
-  // polls never run FASTER than the chosen interval. The 10 s / 30 s floors
-  // only apply at the fast desktop default — on a phone set to minutes- or
-  // hours (metered data) the update views refresh at that cadence too, i.e.
-  // effectively on load; the in-progress log tail then shows a snapshot, not
-  // a live feed. Button actions refresh immediately regardless (below).
+  // images), the preview is what the NEXT update would apply. Neither is
+  // essential — a failure costs a banner/card, never the metrics. The update
+  // polls never run FASTER than the chosen interval (the 10 s / 30 s floors
+  // only apply at the fast desktop default — on a metered phone cadence they
+  // effectively refresh on load); button actions refresh immediately.
   const upd = usePoll(() => api<UpdateReport>('/update'), Math.max(10_000, intervalMs))
   const prev = usePoll(() => api<UpdatePreview>('/update/preview'), Math.max(30_000, intervalMs))
   const [updBusy, setUpdBusy] = useState(false)

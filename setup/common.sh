@@ -357,21 +357,9 @@ acme_promote() { # <target-dir> — flip staging→prod. Idempotent; wipes the A
 # + pull → rebuild + converge → gate (post-update services healthy +
 # panel-api serving + full doctor) → automatic rollback of all of it on
 # failure. `make rollback` (09-rollback.sh) applies the rollback on demand.
-# The state file's lifecycle: a run flips it to in-progress under the lock
-# (update_begin_run / update_set_status in-progress) BEFORE any gate, so the
-# panel shows the run from the moment it starts; a snapshot then rewrites it
-# with the full pre-update record, and the run ends updated / failed / rolled
-# back. `failed` = aborted at a pre-snapshot gate (preflight/doctor) — the
-# stack is exactly as it was, so there is nothing to roll back. A failing
-# gate also records `failure` = {gate, detail} — the gate's FAILING lines
-# (update_record_failure) — which the dashboard's banner shows instead of the
-# run-log tail (a doctor report's tail is mostly passes); every auto-rollback
-# records at least the gate's name (its reason), so an in-progress state WITH
-# a failure is a DEAD run whose rollback was only partial (a live run never
-# carries the field — its own rewrites drop it), and the dashboard's banner
-# turns red on it. The next run's update_begin_run / snapshot_stack rewrites
-# drop it. Details:
-# docs/RUNBOOK.md → Updates.
+# State-file lifecycle: update_begin_run / snapshot_stack / update_set_status
+# below own the rewrites; the `failure` field's semantics are documented at
+# update_record_failure. Details: docs/RUNBOOK.md → Updates.
 
 STACK_STATE_FILE=/opt/panel/.update-state
 STACK_LOCK_FILE=/opt/panel/.update.lock
@@ -507,25 +495,22 @@ sudo_warm() { # re-warm the sudo timestamp so long operations don't prompt mid-r
 }
 
 managed_script_check() { # <script> — the bash mirror of panel-do's checkManagedScript
-  # (panel-do/main.go): a regular executable file with the repo's bash shebang,
-  # and the file, its directory, and every ancestor directory up to / not
-  # group/other-writable and not owned by the panel user. A writable directory
-  # ANYWHERE in the chain lets a local user delete-and-replace the file (a
-  # writable script dir) or the checkout dir itself (a writable ancestor) —
-  # so the WHOLE chain is checked, not just the leaf. panel-do applies the
-  # identical check in Go to every script IT execs (the clone's
-  # setup/08|09-*.sh, the servitor's deploy/sync|doctor.sh); this mirror
-  # covers what THIS tree root-execs outside panel-do: the 08-update.sh
-  # servitor tail → /opt/servitor-repo/deploy/{update,sync,doctor}.sh +
+  # (panel-do/main.go): a regular executable file with the repo's bash
+  # shebang, and the file, its directory, and every ancestor directory up to
+  # / not group/other-writable and not owned by the panel user. A writable
+  # directory ANYWHERE in the chain lets a local user delete-and-replace the
+  # file or the checkout dir itself — so the WHOLE chain is checked, not just
+  # the leaf. panel-do applies the identical check in Go to every script IT
+  # execs (the clone's setup/08|09-*.sh, the servitor's
+  # deploy/sync|doctor.sh); this mirror covers what THIS tree root-execs
+  # outside panel-do: the 08-update.sh servitor tail's
+  # /opt/servitor-repo/deploy/{update,sync,doctor}.sh +
   # deploy/guest/build.sh (the tail's executed python,
-  # deploy/resolve_target.py, runs under an interpreter — update.sh: `python3
-  # resolve_target.py`, its shebang never the exec path — its file-level
+  # deploy/resolve_target.py, runs under an interpreter — its file-level
   # writability is managed_data_check's; its replaceability rides this
-  # chain). A swapped
-  # script is root code execution — the check, not the ownership, is the
-  # control.
-  # Invariant 9 (AGENTS.md): a writable checkout is a security incident, not
-  # a perms quirk.
+  # chain). A swapped script is root code execution — the check, not the
+  # ownership, is the control. Invariant 9 (AGENTS.md): a writable checkout
+  # is a security incident, not a perms quirk.
   local script="$1" d mode uid first
   local panel_uid
   panel_uid="$(id -u panel 2>/dev/null || true)" # absent user → owner checks skipped (Go: same)
@@ -589,18 +574,15 @@ managed_script_check() { # <script> — the bash mirror of panel-do's checkManag
 managed_data_check() { # <file> — the FILE-LEVEL part of checkManagedScript's
   # standard for a checkout file root-executes WITHOUT a kernel dispatch of
   # its own (run under an interpreter: the 08-update.sh servitor tail's
-  # deploy/resolve_target.py runs via python3 as root — its shebang is
-  # never the exec path): the file itself not group/other-writable and
-  # not owned by the panel user. The exec-bit and shebang parts of the
-  # standard do not apply (the interpreter execs it, not the kernel); the
-  # DIRECTORY CHAIN is covered by the sibling scripts' managed_script_check
-  # (same checkout, same walk) — a writable directory anywhere in the chain
-  # lets a local user delete-and-replace the file. What this adds is the
+  # deploy/resolve_target.py runs via python3 as root): the file itself not
+  # group/other-writable and not owned by the panel user. The exec-bit and
+  # shebang parts do not apply (the interpreter execs it, not the kernel);
+  # the DIRECTORY CHAIN is covered by the sibling scripts'
+  # managed_script_check (same checkout, same walk). What this adds is the
   # case the chain alone does not catch: IN-PLACE MODIFICATION of a file a
-  # local user can write (same inode, new contents) — root code execution
-  # on the next exec, exactly like a swapped script.
-  # Invariant 9 (AGENTS.md): a writable checkout is a security incident, not
-  # a perms quirk.
+  # local user can write (same inode, new contents) — root code execution on
+  # the next exec, exactly like a swapped script. Invariant 9 (AGENTS.md): a
+  # writable checkout is a security incident, not a perms quirk.
   local file="$1" mode uid
   local panel_uid
   panel_uid="$(id -u panel 2>/dev/null || true)" # absent user → owner checks skipped (Go: same)
@@ -648,9 +630,8 @@ json.dump(d, open(sys.argv[3], "w"), indent=2)
 # NOT the run log (which keeps everything). Two shapes:
 #   - a doctor-style report (PASS/FAIL/WARN lines + ↳ hints): keep only the
 #     FAIL lines, the ↳ hint line(s) that follow each one, and the summary.
-#     The TAIL of such a report is mostly PASSes AFTER the failing check —
-#     exactly what the banner used to show (the run log's last 40 lines):
-#     a wall of passes and one unnamed failure.
+#     The TAIL of such a report is mostly PASSes AFTER the failing check — a
+#     bare tail is a wall of passes and one unnamed failure.
 #   - plain error output (a compose render error, a pull failure): the tail
 #     IS the error — keep the last 20 lines.
 # ANSI is stripped first (the banner is a <pre>, not a terminal), and a FAIL
@@ -712,13 +693,11 @@ json.dump(d, open(sys.argv[4], "w"), indent=2)
 
 # The attempt's record — written under the lock, BEFORE any gate runs, so the
 # run is visible in the panel (status in-progress + the run-log tail) from the
-# moment it holds the lock: a run that then dies at a pre-snapshot gate is
-# left `failed` by the gate's die instead of vanishing behind the previous
-# run's status. Minimal on purpose — NO `services`: the pre-update image set
-# is captured and re-tagged by snapshot_stack, which REWRITES this file with
-# the full snapshot. repo_root/repo_head are registered here already: panel-do
-# update-run and doctor read them from the state, and this file is the control
-# plane between the scripts and the dashboard.
+# moment it holds the lock. Minimal on purpose — NO `services`: the
+# pre-update image set is captured and re-tagged by snapshot_stack, which
+# REWRITES this file with the full snapshot. repo_root/repo_head are
+# registered here already: panel-do update-run and doctor read them from the
+# state.
 update_begin_run() {
   local ts tmp repo_head
   ts="$(date -u +%Y%m%dT%H%M%SZ)"

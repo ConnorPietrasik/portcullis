@@ -13,7 +13,8 @@
 # this side; pinning a name before the server routes it is harmless (Traefik
 # 404s it until you do).
 #
-# USAGE (client machines, e.g. the main PC — `make update` re-runs this on the server itself):
+# USAGE (client machines, e.g. the main PC — `make update` re-runs this on the
+# server itself):
 #   tools/panel-hosts.sh                  sync /etc/hosts (auto-sudo if needed)
 #   tools/panel-hosts.sh 10.0.0.99        one-off server-IP override
 #   PANEL_SERVER_IP=10.0.0.99 tools/panel-hosts.sh
@@ -26,12 +27,11 @@
 # the managed block itself is already in sync).
 #
 # Only the marked BEGIN/END block is managed — replaced in place when present,
-# appended at the end when absent; idempotent.
-# The rest of /etc/hosts is never touched; a pre-write backup lands at
-# <hosts-file>.panel-hosts.bak. Wildcard rules (Host(`*.x.top`)) become wildcard
-# hosts lines (glibc supports them). systemd-resolved consults /etc/hosts first,
-# so this works with it enabled. The pin is per-machine and LAN-only; public
-# DNS is never touched.
+# appended at the end when absent; idempotent. The rest of /etc/hosts is never
+# touched; a pre-write backup lands at <hosts-file>.panel-hosts.bak. Wildcard
+# rules (Host(`*.x.top`)) become wildcard hosts lines (glibc supports them).
+# systemd-resolved consults /etc/hosts first, so this works with it enabled.
+# The pin is per-machine and LAN-only; public DNS is never touched.
 #
 # PANEL_HOSTS_FILE overrides the target file (default /etc/hosts) — test hook.
 set -euo pipefail

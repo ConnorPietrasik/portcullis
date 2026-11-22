@@ -99,10 +99,9 @@ export default function Gpus({ intervalMs }: { intervalMs: number }) {
   // cadence, joined on pool index = ROCR index (the space
   // ROCR_VISIBLE_DEVICES counts in). The API supplies it as rocr_index (the
   // card's position in the KFD topology order — node id, host CPU node
-  // skipped; the same files the ROCm runtime reads) — the sysfs card NAME is
-  // not the ROCR index (on this host a non-GPU drm device takes card0, so
-  // the GPUs are card1..card7, and joining on the name was off by one: tile
-  // 0 had no readings, tiles 1+ showed the previous card's).
+  // skipped) — the sysfs card NAME is not the ROCR index (a non-GPU drm
+  // device can take a card slot), so the join is on the index, never the
+  // name.
   const metrics = usePoll(() => api<Metrics>('/metrics'), intervalMs)
 
   const [busy, setBusy] = useState<string | null>(null)

@@ -11,9 +11,7 @@ it (`panel-do`), everything else default-deny.
 
 **`docs/RUNBOOK.md` and `docs/ARCHITECTURE.md` are the reference docs.**
 RUNBOOK = phase-by-phase deploy, the UFW commands, updates, day-2 ops,
-troubleshooting. ARCHITECTURE = *why* each trust boundary exists. Comments 
-in the code carry security-critical rationale — read them, and update them 
-when you change the behavior they explain.
+troubleshooting. ARCHITECTURE = *why* each trust boundary exists.
 
 ## Environment
 

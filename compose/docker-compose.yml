@@ -45,7 +45,7 @@ x-gpu-base: &gpu-base
   user: "1000:1000"
   devices: ["/dev/kfd", "/dev/dri"] # all cards visible; ROCR_VISIBLE_DEVICES pins the set
   # Host-LOCAL gids (Arch assigns dynamically — not portable across boxes):
-  # render=987, video=983 on omnissiah. Verify: getent group render video,
+  # render=987, video=983. Verify: getent group render video,
   # then confirm the device owners: stat -c '%n %u:%g' /dev/kfd /dev/dri/*
   group_add: ["987", "983"]
   security_opt:
@@ -256,8 +256,8 @@ services:
   # edge network, like the gen slots). Disk-park only (rare swaps; pinned
   # host RAM is the scarce shared resource). Public instance: standard six
   # references (RUNBOOK → GPU fleet). Card index: tile 4, MEASURED (the x8
-  # PCIE6 card trained at position 4 in the KFD order, pushing the old tiles
-  # 4,5 → 5,6 — PCIe slot order != enumeration order; the GPU view + the
+  # PCIE6 card trained at position 4 in the KFD order — PCIe slot order !=
+  # enumeration order; the GPU view + the
   # Overview's per-tile BDF chips are the map — re-derive after any card
   # add/remove); the fallback below is a fallback (the GPU view's override wins).
   gpu-writer:
@@ -405,15 +405,15 @@ services:
       # Dockerfile diff, not as silent queueing). (Doctor enforces this
       # block as a NAMED allow-list — additions are a deliberate diff,
       # illegal members fail, and a guard key fails loudly. GRANIAN_HOST
-      # is NOT a member: the 2026-11-13 spike forced no host pin — both
+      # is NOT a member: no host pin has been needed — both
       # loopback families answered.)
       GRANIAN_BLOCKING_THREADS: "4"
     healthcheck:
       <<: *healthcheck-opts
       # The image ships NO HEALTHCHECK, and make update counts a
       # healthcheck-less running container as healthy — this test is the
-      # only health gate. Loopback family verified 2026-11-13 (127.0.0.1
-      # answers; [::1] does too — dual-stack, no GRANIAN_HOST pin).
+      # only health gate. Loopback verified: 127.0.0.1 answers, [::1] does
+      # too (dual-stack — no GRANIAN_HOST pin).
       test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/healthz"]
     volumes:
       # The image declares /etc/searxng as a VOLUME — a dropped or renamed

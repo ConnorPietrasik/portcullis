@@ -1,73 +1,49 @@
 """Gen job queue — the panel's image/video generation section (panel tab "Gen").
 
-Operator view: docs/RUNBOOK.md → "Gen".
-
 A GEN SLOT is a ``gpu-*`` fleet instance whose radiance config lists at least
-one model under ``/models/image/`` or ``/models/video/`` — the model's path
-gives its kind (the /models/{llm,image,video} layout is the contract). Slots
-are discovered from the deployed configs (``/opt/panel/gpu-configs/``, the
-repo copy in dev) — no second model registry to drift. A slot's config is
-GEN-ONLY: its gen model is the sole entry and stays resident — prompt
-enhancement runs OFF-SLOT, on the settings' ENHANCE TARGET (by default the
-gpu-writer instance's "writer" model — a public chat instance the engine
-reaches by container IP over the edge network, like the slots), so a slot's
-VRAM never serves the enhancer.
+one model under ``/models/image/`` or ``/models/video/`` (the /models/{llm,
+image,video} layout is the contract) — the gpu.private instances, discovered
+from the deployed configs (``/opt/panel/gpu-configs/``, the repo copy in dev)
+— no second model registry to drift. A slot's config is GEN-ONLY: its gen
+model is the sole entry and stays resident; prompt enhancement runs OFF-SLOT,
+on the settings' ENHANCE TARGET (default: the gpu-writer instance's "writer"
+model — a public chat instance the engine reaches by container IP, like the
+slots), so a slot's VRAM never serves the enhancer.
 
 Two state files (next to this file; /opt/panel-api/ in production), the
 gpu_pool.py pattern:
+- ``gen-settings.json`` (0600) — admin-editable from the Gen tab: purposes
+  (purpose key → model name), enhance (global toggle + per-gen-model prompt
+  + the enhance target: instance + model), gc_days.
+- ``gen-jobs.json`` (0600) — the FIFO: seq, jobs (id → record), order
+  (oldest first).
 
-- ``gen-settings.json`` (0600) — admin-editable from the Gen tab:
-  ``purposes`` (purpose key → model name), ``enhance`` (global toggle +
-  per-gen-model prompt — a model with no prompt skips enhancement — plus the
-  enhance target: ``instance`` + ``model``), ``gc_days``.
-- ``gen-jobs.json`` (0600) — the FIFO: ``seq``, ``jobs`` (id → record),
-  ``order`` (oldest first).
-
-Job lifecycle (states are the API's vocabulary):
-    queued → enhancing → queued → starting → loading → running → completed
-                        (no enhance, or an already-enhanced job, skips
-                        straight from the first queued to starting)
-  ``queued``      — awaiting a phase; ``enhanced_prompt`` set ⇒ the
-                    enhancement is done and only the gen phase remains.
-  ``enhancing``   — the enhance target is rewriting the prompt (one call;
-                    bringing the target up is part of this phase). OFF-SLOT:
-                    no slot is claimed or started — the gen lane is not
-                    involved, and the global enhance cap (not a slot's)
-                    gates it (see the admission rules below).
-  ``starting``    — claimed on a slot; the slot is being (re)started on its
-                    lane cards.
-  ``loading``     — slot up, waiting for the gen phase to be admitted (the
-                    slot is at its gen-phase cap — see below).
-  ``running``     — the gen request is in flight (image POST / video render;
-                    ``progress`` 0-100 for videos).
+Job lifecycle: queued → enhancing → queued → starting → loading → running →
+completed (a job without enhance skips straight from the first queued to
+starting). `enhanced_prompt` set ⇒ the enhancement is done and only the gen
+phase remains. `enhancing` is OFF-SLOT: no slot is claimed or started, and
+the global enhance cap (not a slot's) gates it.
 
 Admission — two independent caps, each checked against a fresh state read
 before every claim (the gen-phase one is re-checked before the gen request
 itself):
-
 - GEN PHASE (per slot, GEN_CAP): at most GEN_CAP jobs whose gen request is
-  on the slot (LOADING: admitted, about to be sent; RUNNING: in radiance) —
-  one in progress + one queued in radiance, which sequences the model's
-  work itself (the video model runs one denoise + one conditioning at a
-time). A STARTING flight (the slot booting) has no gen request yet and
-  consumes no gen-phase headroom. Enhancement runs off-slot (the enhance
-  target), so it never contends for the slot's VRAM either — nothing on the
-  slot blocks anything else (the pre-writer "no enhance while a gen request
-  is in flight" rule existed only because the in-slot LLM and the gen model
-  couldn't co-reside; with the in-slot LLM entry gone, it is moot).
+  on the slot (LOADING: admitted, about to be sent; RUNNING: in radiance)
+  — one in progress + one queued in radiance, which sequences the model's
+  work itself. A STARTING flight (the slot booting) has no gen request yet
+  and consumes no headroom. Enhancement runs off-slot, so it never contends
+  for the slot's VRAM either.
 - ENHANCEMENT (system-wide, GEN_ENHANCE_CAP): at most GEN_ENHANCE_CAP jobs
-  in ENHANCING — their rewrites all land on ONE entry (the settings'
-  enhance target), so the cap is global, not per slot. Enhancement runs
-  BEFORE the slot phase and off-slot (a different card): a queued job
-  enhances as soon as there is enhance headroom, without a slot being
-  claimed or started — the gen phase never waits for the enhancement, and
-  the enhancement never waits for the lane. The target's max-num-seqs
-  carries the cap (radiance queues excess sequences before 429ing).
+  in ENHANCING — their rewrites all land on ONE entry (the enhance target),
+  so the cap is global, not per slot. Enhancement runs BEFORE the slot
+  phase and off-slot (a different card): a queued job enhances as soon as
+  there is enhance headroom, without a slot being claimed or started. The
+  target's max-num-seqs carries the cap (radiance queues excess sequences
+  before 429ing).
 
-This module is pure logic + these files: no FastAPI, no panel-do, no HTTP —
-callers pass ``defs`` (panel-do gpu-fleet), ``live`` (panel-do gpu-live),
-``ledger`` (gpu_pool) and ``ips`` (edge) in, and run the privileged parts
-themselves.
+Pure logic + these files: no FastAPI, no panel-do, no HTTP — callers pass
+defs (gpu-fleet), live (gpu-live), ledger (gpu_pool) and ips (edge) in, and
+run the privileged parts themselves. Operator view: docs/RUNBOOK.md → "Gen".
 """
 
 from __future__ import annotations
@@ -116,20 +92,16 @@ KIND_DIRS = frozenset({"llm", "image", "video"})
 
 MODEL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,127}$")
 # No length caps on the user prompt or the enhancement prompts: the real cap
-# is per-model and in TOKENS (a video model's max_text — MiniMax-H3's is
-# 8192, its kMaxText — an image model's conditioning budget), and radiance
-# enforces it at SUBMIT with a 400 that lands in the job's error. That
-# failure IS the "too big" mark; the panel does not second-guess it in chars
-# (a video model exposes its cap as video_max_text on /v1/models).
+# is per-model and in TOKENS (a video model's max_text, an image model's
+# conditioning budget), and radiance enforces it at SUBMIT with a 400 that
+# lands in the job's error. That failure IS the "too big" mark; the panel
+# does not second-guess it in chars.
 MAX_JOBS_KEPT = 500  # history kept in the state file (newer survive a trim)
 
-# Concurrency caps (see the module docstring's admission rules).
-GEN_CAP = 2  # gen-phase flights per slot: one in progress + one queued in
-             # radiance (the model's own sequencing). Counts LOADING +
-             # RUNNING only — a STARTING flight has no gen request yet.
-GEN_ENHANCE_CAP = 8  # enhancement calls in flight on the enhance target
-                     # (system-wide — the target is a single entry, and its
-                     # max-num-seqs carries this).
+GEN_CAP = 2  # gen-phase flights per slot (LOADING + RUNNING; STARTING has no
+             # request yet — see the module docstring's admission rules)
+GEN_ENHANCE_CAP = 8  # enhancements in flight on the (single) enhance target
+                     # (system-wide — the target's max-num-seqs carries it)
 
 # Job states.
 QUEUED = "queued"
@@ -143,14 +115,13 @@ CANCELED = "canceled"
 IN_FLIGHT_STATES = frozenset({STARTING, ENHANCING, LOADING, RUNNING})
 GEN_PHASE_STATES = frozenset({LOADING, RUNNING})  # the gen request is on the slot — admission's count
 TERMINAL_STATES = frozenset({COMPLETED, FAILED, CANCELED})
-# The DELETE endpoint's cancel branch: everything not yet terminal. A queued
-# job has no task to interrupt — the mark IS the cancel; its record stands
-# (canceled) like an in-flight one's. Terminal records get deleted instead.
+# The DELETE endpoint's cancel branch: everything not yet terminal (a queued
+# job has no task to interrupt — the mark IS the cancel; terminal records
+# get deleted instead).
 CANCELLABLE_STATES = IN_FLIGHT_STATES | frozenset({QUEUED})
 
 # Param SHAPE guards only — never "too big": the model's own length/size
-# caps are radiance's to enforce, and its submit-time 400 (e.g. "seconds: ...
-# between X and Y") is the failure the job records.
+# caps are radiance's, and its submit-time 400 is the failure the job records.
 SIZE_RE = re.compile(r"^\d{2,4}x\d{2,4}$")
 
 
@@ -183,10 +154,8 @@ def _atomic_write(path: Path, text: str, mode: int) -> None:
 def _empty_settings() -> dict[str, Any]:
     return {
         "purposes": {},
-        # Enhance target: where prompt enhancement runs. Defaults match the
-        # shipped writer instance (the 7th card) — a deployment without it
-        # shows the misconfig in the UI (target not ok) and can repoint the
-        # target at any chat-capable instance in the Gen settings.
+        # Enhance target: where prompt enhancement runs (defaults to the
+        # shipped writer instance; repointable in Gen settings).
         "enhance": {"enabled": True, "prompts": {}, "instance": "gpu-writer", "model": "writer"},
         "gc_days": 14,
     }
@@ -356,7 +325,7 @@ def parse_slot_config(text: str) -> dict[str, dict[str, Any]]:
     """The ``models:`` section of a radiance config → name → {path, kind, tp}.
 
     Strict line-based (the repo owns this format and doctor checks it — no
-    YAML dependency in the host service). Unknown shapes are skipped, not
+    YAML dependency in the host service); unknown shapes are skipped, not
     fatal: a config the engine can't read simply exposes no models.
     """
     out: dict[str, dict[str, Any]] = {}
@@ -411,15 +380,12 @@ def build_instances(
     ledger: dict[str, Any],
     ips: dict[str, str],
 ) -> dict[str, dict[str, Any]]:
-    """The Gen section's view of the WHOLE fleet: every gpu-* instance with
+    """The Gen section's view of the whole fleet: every gpu-* instance with
     its models (name → kind, from the config), its llm entries (the enhance-
-    target candidates) and its card state. ``live``/``ips`` use the
-    gpu_pool/main.py row shapes. The gen SLOTS are the subset hosting an
-    image/video model (build_slots).
-
-    NOTE: this reads the on-disk configs (the running truth is the deployed
-    /opt/panel copy — panel-api runs as `panel`, which reads 0644 fine).
-    """
+    target candidates) and its card state. The gen SLOTS are the subset
+    hosting an image/video model (build_slots). Reads the on-disk configs
+    (the running truth is the deployed /opt/panel copy — panel reads 0644
+    fine)."""
     import gpu_pool  # local: keep the module importable without the fleet helpers
 
     out: dict[str, dict[str, Any]] = {}
@@ -610,12 +576,10 @@ def admission(
     jobs: dict[str, Any], slot: str, self_jid: Optional[str] = None
 ) -> tuple[bool, str]:
     """May a flight on ``slot`` take its GEN PHASE? The per-slot cap counts
-    GEN_PHASE_STATES only (GEN_CAP of them — one in progress + one queued in
-    radiance, the model's own sequencing): a STARTING flight (the slot
-    booting) has no gen request yet and consumes no headroom, and
-    enhancement runs off-slot (the enhance target, its own global cap), so
-    it never contends for the slot's VRAM either. ``self_jid`` excludes a
-    re-checking flight from its own count."""
+    GEN_PHASE_STATES only: a STARTING flight has no gen request yet, and
+    enhancement runs off-slot (its own global cap), so it never contends for
+    the slot's VRAM. ``self_jid`` excludes a re-checking flight from its own
+    count."""
     fl = [
         j
         for j in jobs.values()
@@ -629,9 +593,9 @@ def admission(
 def enhance_admission(jobs: dict[str, Any]) -> tuple[bool, str]:
     """May another job start its ENHANCEMENT? The system-wide cap on the
     ENHANCE TARGET's load: at most GEN_ENHANCE_CAP jobs in ENHANCING (their
-    rewrites all land on one entry, so the cap is global, not per slot).
-    The target is a different card from every slot — enhancement neither
-    waits for a lane nor holds one."""
+    rewrites all land on one entry, so the cap is global, not per slot). The
+    target is a different card from every slot — enhancement neither waits
+    for a lane nor holds one."""
     n = sum(1 for j in jobs.values() if j.get("state") == ENHANCING)
     if n >= GEN_ENHANCE_CAP:
         return False, f"the enhance target is at its cap ({GEN_ENHANCE_CAP})"
@@ -669,11 +633,9 @@ def claim_enhance(jid: str) -> Optional[dict[str, Any]]:
     (gated by enhance_admission's global cap, not a lane). The job's FIFO
     position is untouched (it rides the order list): on success it goes back
     to QUEUED with enhanced_prompt set, and the gen phase claims it in its
-    own position. Like claim_job the claim clears the error — a QUEUED job's
-    is a wait reason by construction (e.g. a structural enhance mark, whose
-    target is fine again by the time the phase is admitted). One critical
-    section, like claim_job. Call OUTSIDE
-    gen_lock()."""
+    own position. Like claim_job, the claim clears the error (a QUEUED job's
+    is a wait reason by construction). One critical section, like claim_job.
+    Call OUTSIDE gen_lock()."""
 
     def _m(job: dict[str, Any]) -> None:
         if job.get("state") != QUEUED:
@@ -720,16 +682,13 @@ def queue_wait_reason(
     CURRENT configs, when the wait would otherwise run in silence: a config
     drift since the job was queued (its model is no longer hosted), or a
     lane EVERY hosting slot is blocked on. The normal queue (the gen-phase
-    cap, a free or yieldable lane, a stop that didn't land) says nothing
-    and gets None. The engine marks the result on the record's error column
-    so the job row says why instead of a job quietly waiting forever; a
-    transient block (a busy holder that drains on its own) is marked too —
-    the mark rides until the claim, which clears it (claim_job: a QUEUED
-    job's error is a wait reason by construction). The enhance target's
-    structural reasons are marked UP FRONT by the tick's enhance branch (a
-    pending-enhance job never reaches the slot loop). None otherwise (the
-    caller then leaves the record's error alone — a re-queue's reason may
-    be riding it)."""
+    cap, a free or yieldable lane, a stop that didn't land) says nothing and
+    gets None. The engine marks the result on the record's error column so
+    the job row says why; a claim later clears it (claim_job). The enhance
+    target's structural reasons are marked UP FRONT by the tick's enhance
+    branch (a pending-enhance job never reaches the slot loop). None
+    otherwise (the caller leaves the record's error alone — a re-queue's
+    reason may be riding it)."""
     model = job.get("model") or ""
     hosting = [s for s in slots.values() if model in s["models"]]
     if not hosting:
@@ -762,33 +721,28 @@ def slot_status(
     size (0 in dev, where the engine is off).
 
     The LANE is the card set a start would actually take — gpu_pool.plan_start's
-    two branches:
-    * the SAVED set, when the plan's saved-set branch would take it (shape-
-      valid for the slot's card need and not fenced by a reservation for
-      another service): the yield reasons over ITS cards;
-    * else the FREE-GRAB — the set plan_start's fallback takes: the slot's
-      OWN reserved cards first, then the lowest unheld, then (only if still
-      short) the LOWEST cards the IDLE gen slots hold, until the need is met
-      (stopping them frees them; a card reserved for ANOTHER service is
-      fenced — the grab skips it). free_cards' own-first ordering is
-      mirrored EXACTLY, not approximated: an idle neighbour on a card the
-      grab would skip must not be stopped for nothing. A slot with NO usable
-      saved set (a fresh deploy never assigned it, a reservation fence, a
-      shape drift) rides this branch — the idle neighbours holding the cards
-      the grab would take are the yield set (the lazy-stop rule still
-      applies: a queued job that needs the lane stops them itself), and a
-      lane the pool can't cover even after the yield is BLOCKED — the
-      blocker names what holds the gap (a busy gen slot that drains on its
-      own, an LLM occupant to stop, a fenced card to unreserve) — instead
-      of the engine claiming the job and flapping a start it can't win.
+    two branches: the SAVED set when that branch would take it (shape-valid
+    for the slot's card need and not fenced by a reservation for another
+    service) — the yield reasons over ITS cards — else the FREE-GRAB: the
+    slot's OWN reserved cards first, then the lowest unheld, then (only if
+    still short) the LOWEST cards the IDLE gen slots hold, until the need is
+    met (a card reserved for ANOTHER service is fenced — the grab skips it).
+    free_cards' own-first ordering is mirrored EXACTLY, not approximated: an
+    idle neighbour on a card the grab would skip must not be stopped for
+    nothing. A slot with NO usable saved set (a fresh deploy never assigned
+    it, a reservation fence, a shape drift) rides this branch — the idle
+    neighbours holding the cards the grab would take are the yield set, and
+    a lane the pool can't cover even after the yield is BLOCKED — the
+    blocker names what holds the gap (a busy gen slot that drains on its
+    own, an LLM occupant to stop, a fenced card to unreserve) — instead of
+    the engine claiming the job and flapping a start it can't win.
 
     states: running | down | down-idle-stops | blocked. ``stops`` is
     non-empty ONLY in down-idle-stops — a blocked lane is not stopped into
     by any consumer (the tick, the engine's _gen_free_slot, the admin-start
-    path and the UI all gate on that state), and its blocker text names the
-    would-be stops anyway. Only a gen slot (a fleet instance with gen
-    models) is ever stoppable by the engine; an LLM instance or a busy gen
-    slot is a blocker, full stop.
+    path and the UI all gate on that state). Only a gen slot is ever
+    stoppable by the engine; an LLM instance or a busy gen slot is a
+    blocker, full stop.
     """
     reserved = reserved or {}
     out: dict[str, dict[str, Any]] = {}
@@ -828,12 +782,11 @@ def slot_status(
             # Free-grab lane: free_cards' own-first ordering (the slot's
             # reserved cards first, then the lowest unheld), topped up with
             # the LOWEST idle-gen-held cards until the need is met. A card
-            # reserved for ANOTHER service is fenced (the grab skips it —
-            # it is not free), and the top-up skips it for the same reason:
-            # a card an idle slot holds that is reserved for that slot ITSELF
-            # frees nothing the grab can take, so stopping the slot would be
-            # for nothing. The slot's OWN reserved cards are free here iff
-            # unheld, and sort first, exactly like the grab.
+            # reserved for ANOTHER service is fenced (the grab skips it), and
+            # the top-up skips it for the same reason: a card an idle slot
+            # holds that is reserved for that slot ITSELF frees nothing the
+            # grab can take. The slot's OWN reserved cards sort first, exactly
+            # like the grab.
             own = [c for c in range(cards_total) if c not in holds and reserved.get(c, {}).get("for") == name]
             rest = [c for c in range(cards_total) if c not in holds and reserved.get(c, {}).get("for") is None]
             idle = {
@@ -851,13 +804,9 @@ def slot_status(
                 st = "blocked"
                 who = ", ".join(stops) or "none"
                 # Name what holds the gap — the advice differs by kind: a
-                # busy gen slot drains on its own (the wait clears without
-                # an admin); an LLM occupant needs one stopped in the GPU
-                # view; a card reserved for ANOTHER service is fenced
-                # (unreserve it). (A gen slot in the gap is either fenced
-                # (named as such) or necessarily busy: every UNFENCED idle
-                # one is in the lane — the shortfall means the idle cards
-                # ran out.)
+                # busy gen slot drains on its own (no admin needed); an LLM
+                # occupant needs one stopped in the GPU view; a card
+                # reserved for ANOTHER service is fenced (unreserve it).
                 lane_set = set(lane)
                 gap_busy: dict[str, list[int]] = {}
                 gap_llm: dict[str, list[int]] = {}
@@ -900,8 +849,8 @@ def slot_status(
         if blockers:
             st = "blocked"
             # A blocked lane is never stopped into (see the states contract
-            # above) — the local `stops` already rode into the lane-short
-            # blocker's "who" text; the reported field stays strict.
+            # above) — the reported field stays strict (the would-be stops
+            # already ride in the lane-short blocker's "who" text).
             stops = []
         out[name] = {"state": st, "stops": sorted(stops), "blockers": blockers, "busy": busy}
     return out
@@ -946,9 +895,9 @@ def gc_old_artifacts(
     UI still shows must not point at a deleted file, so a stored record's
     artifact outlives ``days``. The record's other two exits: the DELETE
     endpoint removes its files with it (immediate), and a record trimmed by
-    the count cap orphans its file — which THIS pass then takes on the first
-    sweep after the file ages past ``days``. No size caps by design. Returns
-    the removed names (the caller audits)."""
+    the count cap orphans its file — which this pass takes on the first sweep
+    after the file ages past ``days``. No size caps by design. Returns the
+    removed names (the caller audits)."""
     now = now if now is not None else time.time()
     cutoff = now - days * 86400.0
     keep = keep_ids or frozenset()

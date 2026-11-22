@@ -1,15 +1,12 @@
 """Panel API — host-side FastAPI service behind panel.pietrasik.top/api.
 
-Defense in depth: Traefik runs Authelia forward-auth (admins only) and injects
-X-Panel-Token; this service re-verifies both independently. Everything
-privileged — container control included — goes through `sudo -n panel-do`
-(one code path, one journald audit trail); only sysfs//proc metric reads
-bypass it.
+Traefik (Authelia forward-auth + injected X-Panel-Token) is the outer gate;
+this service re-verifies both independently. All privileged work goes through
+`sudo -n panel-do`; only sysfs//proc metric reads bypass it.
 
-Runs as user `panel`, binds 172.17.0.1:8010 (docker0 gateway — reachable from
-the edge network, not the internet). PANEL_DEV=1 disables the PANEL auth
-checks for local development ONLY (loopback) — not the /v1/* LLM key gate
-(see the LLM section); the systemd unit never sets it.
+Binds 172.17.0.1:8010 (docker0 gateway: the edge network, not the internet).
+PANEL_DEV=1 skips the panel auth checks — local development only, never the
+/v1/* key gate; the systemd unit never sets it.
 """
 
 from __future__ import annotations
@@ -42,9 +39,8 @@ DEV_MODE = os.environ.get("PANEL_DEV") == "1"
 # Filesystems the Overview shows a storage row for (comma-separated; .env: PANEL_DISK_MOUNTS).
 DISK_MOUNTS = [m.strip() for m in os.environ.get("PANEL_DISK_MOUNTS", "/").split(",") if m.strip()]
 
-# LLM fallback router (llm.pietrasik.top → this service): the fleet's shared
-# API key is the gate, and the priority order lives in a small JSON file.
-# See the LLM section at the bottom of this file.
+# LLM fallback router (llm.pietrasik.top → this service): gated by LLM_API_KEY;
+# the priority order lives in LLM_SETTINGS_PATH. See the LLM section below.
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_SETTINGS_PATH = Path(os.environ.get("LLM_SETTINGS_PATH") or "/opt/panel-api/settings.json")
 if DEV_MODE:  # local development: keep the file in the checkout, not /opt
@@ -59,28 +55,22 @@ ARG_RE = re.compile(r"^[ -~]{1,128}$")  # mirrors panel-do's base arg validation
 ACTION_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 GROUP_SPLIT_RE = re.compile(r"[,\s]+")
 LIST_CACHE_TTL = 60.0
-CONTAINERS_CACHE_TTL = 3.0  # UI polls ~2s; sudo+docker spawn per miss is fine at this rate
+CONTAINERS_CACHE_TTL = 3.0  # the UI polls ~2s
 
 if DEV_MODE:
     print("!!! PANEL_DEV=1 — AUTH CHECKS DISABLED (local development only) !!!", flush=True)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Owns the LLM router's shared httpx client + background health probe."""
     global _gen_http, _llm_http
-    # GPU pool: seed the state files (ledger + override) before the boot
-    # oneshot or a compose render can want them. 02/03 already create them
-    # at install time; this is the belt-and-braces for a hand-removed file.
+    # Seed the pool's state files in case install (setup/02/03) never ran or
+    # a file was hand-removed.
     gpu_pool.ensure_state_files()
-    # read=300 s: normal streams emit bytes far more often than every 5 min,
-    # but a wedged instance that accepts TCP and then goes silent (ROCm init
-    # hang) must not park the client's request forever — the deadline fails
-    # it, and the passive cooldown + /health probe steer the next request
-    # down the list. connect capped at 5 s.
+    # read=300 s: a wedged instance (accepts TCP, goes silent on a ROCm init
+    # hang) must not park the client forever — the deadline fails it, and the
+    # cooldown + /health probe steer the next request down the list.
     _llm_http = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=5.0, read=300.0, pool=5.0))
-    # Gen section: its own client (a render can sit 30+ min on the read — the
-    # LLM client's 300 s ceiling would cut it off), stale-flight reap after a
-    # restart, and the engine task (see the Gen section).
+    # Gen: its own client — a render can sit 30+ min on the read.
     _gen_http = httpx.AsyncClient(timeout=httpx.Timeout(1800.0, connect=5.0, read=1800.0, pool=5.0))
     _gen_reap_stale()
     probe = asyncio.create_task(_llm_probe_loop())
@@ -109,8 +99,8 @@ def require_admin(
     remote_user: Optional[str] = Header(default=None),
     remote_groups: Optional[str] = Header(default=None),
 ) -> Optional[str]:
-    """Re-check the Traefik token + Authelia identity; return the username
-    (None in dev mode) for the audit line."""
+    """Re-check the Traefik-injected token + Authelia identity; returns the
+    username for the audit line (None in dev mode)."""
     if DEV_MODE:
         return None
     if not PANEL_TOKEN or not x_panel_token or not secrets.compare_digest(
@@ -125,12 +115,10 @@ def require_admin(
 
 
 # ──────────────────────────── metrics ────────────────────────────
-#
-# /sys + /proc reads only — no privileges, no subprocess. Everything the panel
-# cannot know from one sample (CPU %, net and disk throughput) is a difference
-# between two polls: the FIRST sample of a counter is null and the UI's 2 s
-# poll fills it a tick later. Nothing here raises — a metric that can't be read
-# is null (or absent), which the Overview renders as "—", never a 500.
+# /sys + /proc reads only — no privileges, no subprocess. Rates are deltas
+# between polls, so the first sample of a counter is null (the UI's 2 s poll
+# fills it). Nothing here raises: an unreadable metric is null/absent
+# (rendered "—"), never a 500.
 
 def _rd(path: str | Path, cast: Callable[[str], Any] = str, default: Any = None) -> Any:
     try:
@@ -157,16 +145,15 @@ def _temp(path: Optional[str]) -> Optional[float]:
     return v if isinstance(v, float) else None
 
 
-# Monotonic counters (jiffies, bytes, sectors) for _rate() below. A lock only
-# keeps concurrent pollers from reading each other's half-written sample — a
-# wrong-instantaneous-value race would be harmless, a KeyError would not.
+# Monotonic counters (jiffies, bytes, sectors) for _rate(). The lock guards
+# the dict itself; a racy read is a wrong rate, not a crash.
 _counters: dict[str, tuple[float, float]] = {}
 _counter_lock = threading.Lock()
 
 
 def _rate(key: str, value: float) -> Optional[float]:
-    """Per-second rate of a monotonic counter; None on a key's first sample or
-    after a reset (reboot, interface re-created — the counter went backwards)."""
+    """Per-second rate of a monotonic counter; None on the first sample or
+    after a reset (the counter went backwards)."""
     now = time.monotonic()
     with _counter_lock:
         prev = _counters.get(key)
@@ -182,7 +169,7 @@ KFD_NODES_DIR = "/sys/class/kfd/kfd/topology/nodes"
 
 
 def _bdf_of(path: str) -> Optional[str]:
-    """A drm sysfs path → its PCI BDF (the component above 'drm/'), None for
+    """A drm sysfs path → its PCI BDF (the component above 'drm/'); None for
     a virtual device or an unresolvable path."""
     parts = os.path.realpath(path).split("/")
     i = parts.index("drm") if "drm" in parts else -1
@@ -190,19 +177,15 @@ def _bdf_of(path: str) -> Optional[str]:
 
 
 def _rocr_indexes(cards: list[str]) -> Optional[dict[str, int]]:
-    """card name → ROCR device index, from the KFD topology sysfs — or None
-    to make the caller fall back to card-number order.
+    """card name → ROCR device index from the KFD topology sysfs, or None to
+    fall back to card-number order.
 
-    ROCm enumerates devices in KFD registration order, and the kernel exposes
-    exactly that order as /sys/class/kfd/kfd/topology/nodes/<id> — in id
-    order, with the HOST CPU occupying a node too (vendor_id 0, always
-    first), so ROCR device i is the (i+1)-th GPU node. The ROCm runtime reads
-    these same files (its own topology code), so this is the order itself,
-    not a proxy — no ROCm install, no /dev/kfd. A node maps to its card via
-    unique_id (decimal here, hex in the card's device dir) or
-    drm_render_minor (renderD<N> → BDF). None when the topology is absent
-    (older kernel), unreadable (the service user lacks kfd access), or a
-    node/card can't be placed — a half mapping is worse than the fallback.
+    ROCR device i is the (i+1)-th GPU in KFD node-id order — the host CPU
+    occupies a node too (vendor_id 0, always first). The ROCm runtime reads
+    these same files, so this is the enumeration itself, not a proxy. A node
+    maps to its card via unique_id or drm_render_minor. None when the
+    topology is absent/unreadable or any node can't be placed — a half
+    mapping is worse than the fallback.
     """
     nodes = sorted(
         (p for p in glob.glob(f"{KFD_NODES_DIR}/*") if os.path.basename(p).isdigit()),
@@ -247,20 +230,14 @@ def _rocr_indexes(cards: list[str]) -> Optional[dict[str, int]]:
 
 
 def amd_gpus() -> list[dict[str, Any]]:
-    """AMD GPU stats from sysfs — no ROCm / amd-smi needed.
+    """AMD GPU stats from sysfs (no ROCm / amd-smi).
 
-    Each entry carries `rocr_index`: the card's ROCR device number — what
-    ROCR_VISIBLE_DEVICES (and the GPU pool's tile indices) count in. The
-    kernel exposes the enumeration in the KFD topology sysfs (node id order,
-    host CPU node skipped) — the same files the ROCm runtime reads, so
-    _rocr_indexes() returns the exact order, not a proxy. The sysfs card NAME
-    is NOT that index: a non-GPU drm device can take a card slot (on this
-    host card0, so the seven R9700s are card1..card7 — joining the pool on the
-    name was off by one: tile 0 had no readings and every tile showed the
-    PREVIOUS card's). When the topology is unavailable or can't be fully
-    mapped, the index falls back to card-number order (probe order — the same
-    sequence KFD registers in). The list itself stays in card-number order
-    (the Overview renders it as-is); the pool view joins on rocr_index.
+    Each entry's `rocr_index` is what ROCR_VISIBLE_DEVICES (and the GPU
+    pool's tile indices) count in — the sysfs card NUMBER is not: a non-GPU
+    drm device can take a card slot, so the two disagree. Exact KFD order
+    when fully mappable, else card-number (probe) order (see
+    _rocr_indexes). The list stays in card-number order; the pool view joins
+    on rocr_index.
     """
     out: list[dict[str, Any]] = []
     for card in sorted(glob.glob("/sys/class/drm/card[0-9]*"), key=_natural_key):
@@ -271,8 +248,7 @@ def amd_gpus() -> list[dict[str, Any]]:
         if not hwmons and _rd(f"{dev}/gpu_busy_percent") is None:
             continue
         hw = hwmons[0] if hwmons else None
-        # No product_name on many kernels — the PCI id + slot are what make the
-        # two identical cards distinguishable in the UI.
+        # PCI id + slot: what makes two identical cards distinguishable.
         uevent = _rd(f"{dev}/uevent", default="") or ""
         ue = dict(
             line.split("=", 1) for line in uevent.splitlines() if "=" in line
@@ -291,8 +267,7 @@ def amd_gpus() -> list[dict[str, Any]]:
                 "vram_used_mib": _rd(f"{dev}/mem_info_vram_used", lambda v: int(v) // 2**20),
                 "vram_total_mib": _rd(f"{dev}/mem_info_vram_total", lambda v: int(v) // 2**20),
                 "power_w": _hwrd(hw, "power1_average", lambda v: round(int(v) / 1e6, 1)),
-                # The card's own power limit (some firmware only exposes the
-                # ceiling): lets the Overview show W as % of the allowed budget.
+                # the card's power limit (some firmware only exposes the ceiling)
                 "power_cap_w": _hwrd(hw, "power1_cap", lambda v: round(int(v) / 1e6, 1))
                 or _hwrd(hw, "power1_cap_max", lambda v: round(int(v) / 1e6, 1)),
                 "fan_rpm": _hwrd(hw, "fan1_input", int),
@@ -300,8 +275,7 @@ def amd_gpus() -> list[dict[str, Any]]:
                 "mem_clock_mhz": _hwrd(hw, "freq2_input", lambda v: int(v) // 10**6),
             }
         )
-    # rocr_index: the KFD topology order (exact) when it is readable and
-    # maps every card, else card-number order (probe order). See _rocr_indexes.
+    # rocr_index: exact KFD order when fully mappable, else card-number order.
     rocr = _rocr_indexes([e["card"] for e in out])
     if rocr is None:
         rocr = {e["card"]: i for i, e in enumerate(out)}
@@ -328,7 +302,7 @@ _cpu_model_cache = ""
 
 
 def _cpu_model() -> str:
-    """/proc/cpuinfo 'model name' — constant for the process's lifetime, so read once."""
+    """/proc/cpuinfo 'model name' — constant, so read once."""
     global _cpu_model_cache
     if _cpu_model_cache:
         return _cpu_model_cache
@@ -359,12 +333,7 @@ def _cpu_freq_mhz() -> Optional[float]:
 
 
 def cpu_block() -> dict[str, Any]:
-    """Everything the CPU itself reports: temp, utilisation, clock, task counts.
-
-    usage_pct is a Δ of /proc/stat's aggregate line (idle+iowait vs total
-    jiffies). procs_blocked > 0 means tasks stuck in uninterruptible IO — the
-    usual explanation for "everything is slow" and worth its own tile.
-    """
+    """CPU temp, utilisation (Δ of /proc/stat's aggregate line), clock, task counts."""
     out: dict[str, Any] = {
         "temp_c": cpu_temp_c(),
         "cores": _cpu_cores(),
@@ -418,11 +387,9 @@ def _meminfo() -> dict[str, int]:
 
 
 def ram(mi: dict[str, int]) -> dict[str, int]:
-    """RAM split so the segments ADD UP TO THE STICK: 'used' is memory the
-    kernel can't hand back (total − MemAvailable), 'cache' is reclaimable page
-    cache/buffers, 'free' is untouched. Calling page cache 'used' is the classic
-    way to make a healthy box look nearly full.
-    """
+    """RAM so the segments add up: 'used' = total − MemAvailable (the memory
+    the kernel can't hand back), 'cache' = reclaimable page cache, 'free' =
+    untouched."""
     total = mi.get("MemTotal", 0) // 1024
     if total <= 0:
         return {}
@@ -446,11 +413,8 @@ def swap(mi: dict[str, int]) -> dict[str, int]:
     return {"total_mib": total, "used_mib": max(0, total - mi.get("SwapFree", 0) // 1024)}
 
 
-# Interfaces the network tile must not count: loopback, and anything whose
-# traffic is already counted somewhere else — docker/veth/libvirt/k8s plumbing,
-# bridges, bonds, VLANs and tunnels (a stacked device is exactly one that has
-# lower_* symlinks next to it in /sys/class/net). Counting them alongside the
-# physical NIC double-counts and buries the real link.
+# Virtual interfaces (plumbing, bridges, stacked devices — the lower_*
+# symlink check) would double-count the physical NICs.
 NET_VIRTUAL_RE = re.compile(r"^(lo|docker|veth|br|virbr|vnet|tap|tun|wg|zt|kube|flannel|cali|cni|lxc|nerd|dummy|ifb|gre|gretap|ip6gre|sit|ppp)")
 
 
@@ -488,13 +452,8 @@ def _block_name(maj_min: str) -> str:
 
 
 def sensors() -> list[dict[str, Any]]:
-    """Every hwmon chip and its HOTTEST sensor, reported raw for the UI to curate.
-
-    Deliberately not filtered here: the kernel already tells us what a chip is
-    (nvme, spd5118 = DDR5 DIMM sensors, r8169 = NIC, …), and which of those are
-    worth a human's attention is a display decision. The API's job is to say
-    what the box knows; the Overview decides what it's worth showing.
-    """
+    """Every hwmon chip and its hottest sensor, raw — the Overview decides
+    what to show."""
     out: list[dict[str, Any]] = []
     for hm in sorted(glob.glob("/sys/class/hwmon/hwmon*"), key=_natural_key):
         chip = _rd(f"{hm}/name", default="") or ""
@@ -522,9 +481,8 @@ def nvme_temps() -> dict[str, float]:
 
 
 def _mountinfo() -> dict[str, dict[str, str]]:
-    """mountpoint → {device, fstype, block} from /proc/self/mountinfo (the last
-    entry for a mountpoint wins, which is the most specific one). Octal-escaped
-    spaces in paths aren't decoded — no configured mount uses them."""
+    """mountpoint → {device, fstype, block} from /proc/self/mountinfo; the
+    last entry for a mountpoint wins (the most specific)."""
     out: dict[str, dict[str, str]] = {}
     try:
         lines = Path("/proc/self/mountinfo").read_text().splitlines()
@@ -560,12 +518,9 @@ def _diskstats() -> dict[str, tuple[int, int]]:
 
 
 def disks() -> list[dict[str, Any]]:
-    """Usage per mount in DISK_MOUNTS. Every configured mount ALWAYS gets an
-    entry: stats, or an explicit error — an unmounted mountpoint makes statvfs
-    report the *containing* filesystem, so its absence must shout, not lie.
-    Each entry also says WHAT it is — block device, filesystem, and throughput
-    since the previous poll (model loads make a storage tile worth watching).
-    """
+    """Usage per mount in DISK_MOUNTS. Every configured mount gets an entry —
+    stats or an explicit error: an unmounted mountpoint makes statvfs report
+    the *containing* filesystem, so a silent skip would lie."""
     try:
         root_dev: Optional[int] = os.stat("/").st_dev
     except OSError:
@@ -580,8 +535,7 @@ def disks() -> list[dict[str, Any]]:
             "device": info.get("block") or os.path.basename(info.get("device", "")),
             "fstype": info.get("fstype", ""),
         }
-        # An NVMe that cooks throttles and dies young — the drive's own temp
-        # belongs next to its mount, not buried in a sensor dump.
+        # the drive's own temp, next to its mount
         drive = re.match(r"^(nvme\d+)", entry["device"] or "")
         if drive and drive.group(1) in temps:
             entry["temp_c"] = temps[drive.group(1)]
@@ -678,9 +632,7 @@ def health() -> dict[str, Any]:
 
 
 # ───────────────────────── containers ────────────────────────────
-# Container control is NOT a second privileged path — these are panel-do
-# actions (list-containers, start/stop/restart-container): same registry,
-# validation, and journald audit as every other action.
+# Container control goes through panel-do actions — no second privileged path.
 
 _containers_cache: dict[str, Any] = {"data": None, "at": 0.0}
 
@@ -709,13 +661,11 @@ def _container_view(x: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": cid,
         "name": display if display and display != "true" else (name or cid),
-        # compose service name (container label) — the UI joins this against
-        # /api/stack-services to find defined services whose container is gone.
+        # compose service name — the UI joins this against /api/stack-services
         "service": _cli_label_get(x.get("Labels") or "", "com.docker.compose.service"),
-        # Services view group (panel.category label); None/"" render as "Other".
+        # Services view group; None/"" render as "Other"
         "category": _cli_label_get(x.get("Labels") or "", CATEGORY_LABEL),
-        # gpu.private=true — no public host: the Services view must not render
-        # its dashboard link (the <sub>.pietrasik.top/open host does not exist).
+        # gpu.private=true — no public host, so no dashboard link
         "private": _cli_label_get(x.get("Labels") or "", PRIVATE_LABEL) == "true",
         "image": x.get("Image", ""),
         "state": x.get("State", "unknown"),
@@ -744,8 +694,8 @@ def _containers_fetch() -> list[dict[str, Any]]:
 
 def containers_cached() -> list[dict[str, Any]]:
     """Full `docker ps -a` objects (panel-do list-containers JSON), 3 s TTL.
-    Raw on purpose: /api/containers filters on the Labels field and the LLM
-    router's fleet view needs it too — the UI shape is _container_view()."""
+    Raw on purpose: /api/containers filters on Labels and the LLM router's
+    fleet view needs the raw form."""
     now = time.monotonic()
     if _containers_cache["data"] is not None and now - _containers_cache["at"] < CONTAINERS_CACHE_TTL:
         return _containers_cache["data"]
@@ -766,9 +716,8 @@ def _err_detail(proc: subprocess.CompletedProcess) -> str:
 
 
 def _audit(user: Optional[str], action: str, args: list[str], result: int | str, err: str = "") -> None:
-    """One journal line per privileged invocation (stdout → journald).
-    sudo's own log only says *panel* ran the command; this records the
-    triggering Authelia user and the outcome."""
+    """One journal line per privileged call (stdout → journald): sudo's log
+    only says *panel* ran it — this records the Authelia user + outcome."""
     line = (
         f"panel-api: audit user={user or 'dev'} action={action} "
         f"args={args!r} result={result}"
@@ -836,7 +785,7 @@ def container_action(cid: str, action: str, _admin: Optional[str] = Depends(requ
         raise HTTPException(400, f"action must be one of {sorted(CONTAINER_VERBS)}")
     if not CID_RE.match(cid):
         raise HTTPException(400, "bad container id")
-    name = f"{action}-container"
+    name = f"{action}-container"  # light checks here; panel-do re-validates
     meta = {a["name"]: a for a in panel_do_actions()}.get(name)
     timeout = min(int(meta.get("timeout_sec", 60)) + 10, 660) if meta else 70.0
     try:
@@ -863,10 +812,8 @@ _actions_cache: dict[str, Any] = {"data": None, "at": 0.0}
 
 
 def panel_do_actions() -> list[dict[str, Any]]:
-    """Action registry, straight from the horse's mouth: `panel-do --list`.
-
-    Cached ~60s so the UI can never drift from what the binary enforces.
-    """
+    """The action registry from `panel-do --list`, cached ~60 s — the UI can
+    never drift from what the binary enforces."""
     now = time.monotonic()
     if _actions_cache["data"] is not None and now - _actions_cache["at"] < LIST_CACHE_TTL:
         return _actions_cache["data"]
@@ -928,24 +875,17 @@ def run_action(name: str, body: ActionBody, _admin: Optional[str] = Depends(requ
 
 
 # ─────────────────────────────── updates ────────────────────────────
-# The stack's update lifecycle is panel-do's work (update-run / -force /
-# -report / -preview / -rollback — see panel-do/main.go). This section adds
-# only the HTTP shape and the MAJOR classification the dashboard badges off.
-# The long work is detached INSIDE the update script (its step 6 restarts
-# THIS service — the trigger must not be in its process tree), so every call
-# here returns in seconds. The update state file (/opt/panel/.update-state,
-# root-written) is the control plane: every run flips it to in-progress under
-# the lock BEFORE any gate (a pre-snapshot failure is left `failed` — nothing
-# applied, nothing to roll back), the snapshot step records repo_root
-# (+ repo_head) and the pre-update images, and update-report joins that
-# snapshot against the running stack.
+# The lifecycle lives in panel-do (update-run / -force / -report / -preview /
+# -rollback); this section is the HTTP shape + the MAJOR classification the
+# dashboard badges off. The long work is detached INSIDE the update script
+# (its step 6 restarts THIS service — the trigger must not be in its process
+# tree), so every call here returns in seconds.
 
 
 def _first_int(s: Optional[str]) -> Optional[int]:
-    """First digit run of a version-ish string: '3.7.9'→3, 'v3'→3,
-    '22-alpine'→22, '>=0.115,<1'→0. None when there are no digits at all
-    (`latest`, `stable-alpine`) — those lines have no major to compare
-    (RUNBOOK → Updates, "The lines")."""
+    """First digit run of a version-ish string ('3.7.9'→3, 'v3'→3,
+    '22-alpine'→22); None for lines with no major to compare (`latest`,
+    `stable-alpine`)."""
     if not s:
         return None
     m = re.search(r"\d+", s)
@@ -967,8 +907,7 @@ def _classify_change(old: str, new: str) -> str:
 
 
 def _image_tag(ref: str) -> str:
-    """'traefik:v3' → 'v3' — the comparable part (the registry host carries
-    no version)."""
+    """'traefik:v3' → 'v3' — the comparable part (the registry host carries no version)."""
     return ref.rsplit(":", 1)[1] if ":" in ref else ""
 
 
@@ -980,9 +919,9 @@ def _read_text_or_empty(p: str) -> str:
 
 
 def _parse_compose_images(text: str) -> dict[str, str]:
-    """service → image ref from a compose file. Line-based (this file is
-    hand-kept at 2/4-indent): an explicit `image:` wins, a `<<: *anchor` merge
-    resolves to the anchor's own image (the x-gpu-base pattern — gpu-* fleet
+    """service → image ref from a compose file. Line-based (the file is
+    hand-kept at 2/4-indent); an explicit `image:` wins, a `<<: *anchor` merge
+    resolves to the anchor's image (the x-gpu-base pattern — gpu-* fleet
     instances carry no image line of their own)."""
     anchors: dict[str, str] = {}
     images: dict[str, str] = {}
@@ -990,8 +929,8 @@ def _parse_compose_images(text: str) -> dict[str, str]:
     section = None
     service = None
     for raw in text.splitlines():
-        # inline comments stripped (compose allows `value # comment`) — the
-        # radiance line depends on it
+        # inline comments stripped (compose allows `value # comment`) —
+        # the radiance line depends on it
         line = raw.split(" #", 1)[0].rstrip()
         if not line.strip():
             continue
@@ -1058,18 +997,12 @@ def _npm_deps(text: str) -> dict[str, str]:
 
 
 def _classify_update_row(s: dict[str, Any], images: dict[str, str]) -> str:
-    """One update-report row (images = the deployed compose's service → image
-    refs, parsed once by the caller):
-      removed    — no container for the service after the update
-      unchanged  — running image is the pre-update image (byte-identical)
-      rebuilt    — a locally built image (no `image:` in compose): the
-                   version IS the build, there is no upstream to compare
-      major      — the registry image's leading version integer moved: a
-                   deliberate line edit — this is what the notification is for
-      minor      — same major, new version: a patch/minor release floated in
-      moved      — a registry image without a comparable version label
-                   (radiance / searxng `latest` — a new build moved)
-    """
+    """One update-report row's classification: removed (no container after
+    the update) / unchanged (byte-identical image) / rebuilt (locally built —
+    the build IS the version) / major (leading version integer moved) / minor
+    / moved (a registry image without a comparable label, e.g. `latest`).
+    images = the deployed compose's service → image refs, parsed once by the
+    caller."""
     if s.get("post_image") is None:
         return "removed"
     if s["post_image"] == s.get("pre_image"):
@@ -1141,11 +1074,11 @@ def _update_fetch(name: str) -> dict[str, Any]:
 
 
 def _update_action(name: str, user: Optional[str], timeout: float) -> dict[str, Any]:
-    """Run a fast (detached-launch) update action. Expected outcomes —
-    skipped-dirty, already running (panel-do exit 75, EX_TEMPFAIL) — come
-    back as ok:false with the skip message, not a 5xx: the UI renders them,
-    they are not server faults. (The timer's unit maps 75 → clean exit via
-    SuccessExitStatus; the reason stays in its journal.)"""
+    """Run a fast (detached-launch) update action. Expected skips (dirty
+    clone, already running — panel-do exit 75, EX_TEMPFAIL) come back as
+    ok:false with the skip message, not a 5xx: the UI renders them, they are
+    not server faults. (The timer's unit maps 75 → clean exit via
+    SuccessExitStatus.)"""
     try:
         proc = _sudo_panel_do(name, [], timeout)
     except subprocess.TimeoutExpired as e:
@@ -1165,16 +1098,14 @@ def _update_action(name: str, user: Optional[str], timeout: float) -> dict[str, 
 
 
 class UpdateRunBody(BaseModel):
-    # force = the panel's "run anyway" (the clone has uncommitted changes):
-    # panel-do's update-run-force (same gates, no dirty-skip).
+    # force = the panel's "run anyway" (dirty clone): panel-do update-run-force.
     force: bool = False
 
 
 @app.post("/api/update")
 def update_run(body: UpdateRunBody, _admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
-    # Returns in seconds: the panel-do action launches the update script
-    # DETACHED (it re-execs itself in a new session — the update's step 6
-    # restarts this very service, so the trigger cannot be in its tree).
+    # Returns in seconds: the action launches the script DETACHED (the update
+    # restarts this service — the trigger cannot be in its process tree).
     name = "update-run-force" if body.force else "update-run"
     return _update_action(name, _admin, 120.0)
 
@@ -1186,8 +1117,8 @@ def update_rollback(_admin: Optional[str] = Depends(require_admin)) -> dict[str,
 
 @app.get("/api/update")
 def update_status(_admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
-    # The dashboard's control-plane poll: the last update's before→after,
-    # classified here (the presentation layer — panel-do emits raw facts).
+    # The dashboard's control-plane poll; rows are classified here (panel-do
+    # emits raw facts).
     data = _update_fetch("update-report")
     images = _parse_compose_images(_read_text_or_empty("/opt/panel/docker-compose.yml"))
     for row in data.get("services", []):
@@ -1199,31 +1130,23 @@ def update_status(_admin: Optional[str] = Depends(require_admin)) -> dict[str, A
 def update_preview(_admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
     data = _update_fetch("update-preview")
     data["changes"] = _preview_changes(data)
-    # `files` is the raw line files panel-do read from the clone (the diff
-    # input just consumed, ~20 KB) — not dashboard data. Stripping it keeps
-    # the payload from riding every poll to a phone on metered data.
+    # `files` is the raw diff input (~20 KB) — not dashboard data.
     data.pop("files", None)
     return data
 
 
 # ─────────────────────────── LLM fallback router ─────────────────────────────
 # llm.pietrasik.top → this service (router in traefik/dynamic/llm.yml). Routes
-# OpenAI-style /v1/* to the FIRST instance that's up in the admin-configured
-# priority order (panel Settings → "llm.pietrasik.top"). Strictly single-active
-# — the point is "the best model I'm serving right now", never load-split.
+# OpenAI-style /v1/* to the FIRST up instance in the admin-configured order
+# (panel Settings) — strictly single-active, never load-split.
 #
-# Auth is the same gate as the per-instance subdomains: Authorization: Bearer
-# with LLM_API_KEY. No Authelia here — API clients speak bearer tokens, and
-# forward-auth is cookie-based (see the gpu.yml header). /v1/models needs no
-# special handling: it simply proxies to the active instance. The gate is
-# NOT bypassed by PANEL_DEV=1 (unlike the panel endpoints): local dev of
-# the router needs LLM_API_KEY set to any non-empty value.
+# Gate: Bearer LLM_API_KEY, same as the per-instance subdomains. No Authelia
+# (API clients, not browsers); NOT bypassed by PANEL_DEV=1 (local dev of the
+# router needs LLM_API_KEY set to any non-empty value).
 #
-# Security: the order holds compose SERVICE names (gpu-<name> — what the
-# traefik rules and `make rollback` use), validated against the live gpu-*
-# containers and resolved to edge-network IPs server-side — the config
-# (and its admin) can never name an arbitrary host address, so there is no
-# SSRF surface beyond the fleet the admin already fully controls.
+# The order holds compose service names, validated against the live gpu-*
+# containers and resolved to edge IPs server-side — no arbitrary host, so no
+# SSRF surface beyond the fleet.
 
 LLM_PROBE_INTERVAL_S = 30.0  # background /health refresh per instance
 LLM_PROBE_TIMEOUT_S = 3.0  # /health budget (connect+read)
@@ -1231,18 +1154,15 @@ LLM_STALE_AFTER_S = 90.0  # a cached "up" older than this forces an on-demand re
 LLM_COOLDOWN_S = 30.0  # passive: a failed proxied request parks the instance this long
 LLM_MAX_ORDER = 8
 # Hard cap on /v1 request bodies (bytes). Buffering is intrinsic to the
-# fallback router: the serving instance is picked per request, and a 5xx
-# from the first choice must fall through to the next — so the whole body
-# sits in panel-api's RAM before any forward. That makes the cap a
-# memory-exhaustion guard on this internet-facing, bearer-gated endpoint:
-# without it, a leaked key or a buggy client could trickle gigabytes in
-# and OOM the host service that also runs the whole admin surface. Sized
-# for coding-agent workloads: base64 images inflate ~33%, and one request
-# can carry several multi-MB crops (screenshot/OCR-style work).
+# fallback router (the instance is picked per request, and a 5xx must fall
+# through to the next), so the whole body sits in RAM before any forward —
+# this caps a leaked-key/buggy-client memory attack on an internet-facing
+# endpoint. 64 MB covers coding-agent workloads (base64 images inflate ~33%,
+# one request can carry several multi-MB crops).
 LLM_MAX_BODY = 64 * 1024 * 1024
 GPU_NAME_RE = re.compile(r"^gpu-[a-z0-9][a-z0-9-]{0,62}$")
 
-# Stripped in both directions: RFC 7230 §6.1 hop-by-hop + content-length
+# Stripped in both directions: RFC 7230 hop-by-hop + content-length
 # (recomputed by starlette) + accept-encoding (forced identity, so upstream
 # bytes pass through untransmuted).
 HOP_BY_HOP = frozenset(
@@ -1287,8 +1207,8 @@ def _llm_save(order: list[str]) -> None:
 
 
 def _edge_ips() -> dict[str, str]:
-    """Container name → edge-network IPv4 (panel-do edge-ips, 5 s cache).
-    Empty on failure (e.g. the edge network was deleted) — instances then
+    """Container name → edge-network IPv4 (panel-do edge-ips, 5 s cache);
+    empty on failure (e.g. the edge network was deleted) — instances then
     simply report down, never a wrong IP."""
     now = time.monotonic()
     if _edge_ips_cache["data"] is not None and now - _edge_ips_cache["at"] < EDGE_IPS_TTL:
@@ -1298,8 +1218,7 @@ def _edge_ips() -> dict[str, str]:
         proc = _sudo_panel_do("edge-ips", [], 20.0)
         if proc.returncode == 0:
             data = json.loads(proc.stdout or "{}")
-            # docker renders an EMPTY .Containers map as `null` on some
-            # versions — an empty fleet, not a parse error.
+            # docker renders an empty .Containers map as null on some versions
             if isinstance(data, dict):
                 for ep in data.values():
                     name = (ep.get("Name") or "").lstrip("/")
@@ -1318,9 +1237,9 @@ def _llm_mark(name: str, up: bool, err: str = "") -> None:
 
 
 def _llm_fresh_down(name: str) -> bool:
-    """Knows it's down, recently — skip it (avoids 5 s connect hangs on a
-    wedged instance). Once stale, the proxy tries it anyway (connection-
-    refused fails in ms), so the probe loop dying can't wedge failover."""
+    """Knows it's down, recently — skip it (avoids connect hangs on a wedged
+    instance). Once stale, the proxy tries it anyway (connection-refused
+    fails in ms), so a dead probe loop can't wedge failover."""
     h = _llm_health.get(name)
     now = time.monotonic()
     return bool(h and not h["up"] and now - h["at"] < LLM_PROBE_INTERVAL_S)
@@ -1362,16 +1281,12 @@ async def _llm_probe_loop() -> None:
 
 
 def _gpu_fleet() -> list[dict[str, str]]:
-    """All gpu-* containers (running or stopped) as {name, container, display, state}.
-
-    `name` is the identifier the order holds: the compose SERVICE name
-    (gpu-27b — the same name the traefik rules, the RUNBOOK and `make
-    rollback WHAT=…` use) when the container carries the compose service
-    label, else the bare container name (a hand-`docker run`-ed gpu-*).
-    NOT the docker container name — compose prefixes it (panel-gpu-27b),
-    so keying on it would find nothing on the deployed stack.
-    `container` is that docker name: the key _edge_ips() maps to an IP.
-    """
+    """All gpu-* containers (running or stopped) as {name, container, display,
+    state}. `name` is the compose SERVICE name (what the order, the traefik
+    rules and `make rollback` use) when the label is present, else the
+    container name (a hand-`docker run`-ed gpu-*); `container` is the docker
+    name _edge_ips() maps to an IP — compose prefixes it (panel-gpu-27b), so
+    keying on it would find nothing on the deployed stack."""
     out: list[dict[str, str]] = []
     for x in containers_cached():
         raw_names = x.get("Names") or ""
@@ -1388,8 +1303,7 @@ def _gpu_fleet() -> list[dict[str, str]]:
                 if not (f["state"] == "running" and state != "running"):
                     out.pop(i)
                 break
-        # Same display fallback as _container_view: a bare `panel.manage=true`
-        # label is a marker, not a name.
+        # a bare `panel.manage=true` label is a marker, not a display name
         display = _cli_label_get(x.get("Labels") or "", MANAGE_LABEL)
         out.append(
             {
@@ -1413,7 +1327,8 @@ def _gpu_ip_by_name(fleet: list[dict[str, str]], ips: dict[str, str]) -> dict[st
 
 
 def _llm_status_view(order: list[str]) -> tuple[dict[str, str], Optional[str]]:
-    """(status per name, active name) — active = what the next request hits now."""
+    """(status per name, active name) — active mirrors the proxy's first
+    candidate: anything not freshly parked."""
     status: dict[str, str] = {}
     active: Optional[str] = None
     for name in order:
@@ -1422,19 +1337,14 @@ def _llm_status_view(order: list[str]) -> tuple[dict[str, str], Optional[str]]:
             status[name] = "up" if h["up"] else "down"
         else:
             status[name] = "unknown"
-        # Mirror the proxy's first CANDIDATE — anything not freshly parked —
-        # not just fresh-up: within a probe cycle the proxy also tries
-        # unknown/stale names, so "active" should say what the next request
-        # hits first (steady state: identical to the first fresh-up).
         if active is None and not _llm_fresh_down(name):
             active = name
     return status, active
 
 
 async def _llm_stream(upstream: httpx.Response) -> StreamingResponse:
-    # location is stripped too: a 3xx (which the LLM servers practically
-    # never return) would carry an internal http://<edge-ip>:8000 Location —
-    # never forward an internal address to the client.
+    # location stripped too: a 3xx would carry an internal http://<edge-ip>
+    # Location — never forward an internal address to the client.
     headers = {
         k: v
         for k, v in upstream.headers.items()
@@ -1455,17 +1365,14 @@ def require_forward_auth_admin(
     remote_user: Optional[str] = Header(default=None),
     remote_groups: Optional[str] = Header(default=None),
 ) -> Optional[str]:
-    """Like require_admin minus X-Panel-Token: the fleet-open router carries
-    auth-chain only (a browser can't hold the panel token, and /open must
-    not be reachable WITH one off-panel). On the routed path Traefik strips
+    """require_admin minus X-Panel-Token, for the fleet-open router (a browser
+    can't hold the panel token). On the routed path Traefik strips
     client-supplied Remote-* headers, so their presence proves the request
-    passed forward-auth. The 172.17.0.1 bind itself is reachable from any
-    edge container, and there the headers are NOT stripped: a bare hit
-    401s, but one that spoofs Remote-User/Remote-Groups gets the key. That
-    is the price of a path with no secret gate (a browser can't hold the
-    panel token) — accepted, since such an attacker already sits on the
-    fleet's own network. The Authelia wildcard admits any user to the path,
-    so admins-only is enforced HERE — same boundary as the panel."""
+    passed forward-auth. Caveat: the 172.17.0.1 bind is reachable from any
+    edge container, where the headers are NOT stripped — a spoofed
+    Remote-User gets the key; accepted (docs/ARCHITECTURE.md), since such an
+    attacker already sits on the fleet's own network. Admins-only is enforced
+    here, as in the panel."""
     if DEV_MODE:
         return None
     if not remote_user:
@@ -1477,19 +1384,17 @@ def require_forward_auth_admin(
 
 @app.get("/open", include_in_schema=False)
 def llm_dashboard_open(_admin: Optional[str] = Depends(require_forward_auth_admin)):
-    """Key bootstrap for the radiance dashboards: https://<sub>.pietrasik.top/open
-    (panel Services view → the dashboard link per instance). The dashboard
-    HTML is public on every instance host, but its data calls need the
-    bearer key and the page only reads it from its OWN origin's localStorage
-    — no URL param, and a panel page can't write cross-origin. This one-line
-    page, served on the instance's own origin by this service (which holds
-    LLM_API_KEY), writes it and bounces to /. no-store: the key must never
-    sit in a browser cache (it lands in localStorage — exactly where typing
-    it into the header field would put it)."""
+    """Key bootstrap for the radiance dashboards: https://<sub>.pietrasik.top/open.
+    The dashboard HTML is public on every instance host, but its data calls
+    need the bearer key and the page only reads it from its OWN origin's
+    localStorage — no URL param, and a panel page can't write cross-origin.
+    This one-line page, served on the instance's own origin by this service
+    (which holds LLM_API_KEY), writes it and bounces to /.
+    no-store: the key must never sit in a browser cache (localStorage is
+    exactly where typing it into the header field would put it)."""
     if not LLM_API_KEY:
         raise HTTPException(503, "LLM_API_KEY not configured (fleet not set up)")
-    # .replace: a key containing </script> would close the inline script early
-    # in the browser — \u003c decodes to the same character in the JS string.
+    # </script> in the key would close the inline script early in the browser
     key_json = json.dumps(LLM_API_KEY).replace("<", "\\u003c")
     html = (
         "<!doctype html><meta charset=utf-8><title>opening radiance…</title>"
@@ -1502,41 +1407,30 @@ def llm_dashboard_open(_admin: Optional[str] = Depends(require_forward_auth_admi
 
 
 # ─────────────────────────── search gate (forwardAuth) ──────────────────────
-# /gate/search — Traefik forwardAuth target for search.pietrasik.top.
-# Answers EXACTLY 200 / 401 / 503, never 3xx: forwardAuth forwards the
-# request to searxng only when the answer is in [200, 300) and copies every
-# other status — 3xx included — + body to the client verbatim (a 3xx would
-# arrive as a redirect the client follows). 503 means "LLM_API_KEY not
-# configured" (fleet never set up) — with the key present the gate answers
-# 200/401 only, so a direct probe failing on 503 is attributable (RUNBOOK →
-# Web search → status table).
+# /gate/search — Traefik forwardAuth target for search.pietrasik.top. Answers
+# EXACTLY 200/401/503, never 3xx: forwardAuth copies any other status + body
+# to the client verbatim (a 3xx would arrive as a redirect the client
+# follows). 503 = LLM_API_KEY not configured (fleet never set up).
 #
 # Key reuse is an owner decision: the gate authenticates with the SAME
-# LLM_API_KEY as the /v1 router (trade-offs recorded in
-# docs/ARCHITECTURE.md: no search-only rotation — rotating the key re-
-# creates the gpu-* containers; a leaked key grants search too). Bearer AND
-# Basic (username ignored, constant-time on the key bytes) — Basic exists
-# for mcp-searxng, which is Basic-only. open_metrics must never be set to
-# this key (see compose/searxng/settings.yml) — the doctor's /metrics→404
-# probe makes that structural.
+# LLM_API_KEY as /v1 (trade-offs in docs/ARCHITECTURE.md — rotating the key
+# re-creates the gpu-* containers; a leaked key grants search too). Bearer
+# AND Basic (username ignored, constant-time on the key bytes) — Basic
+# exists for mcp-searxng, which is Basic-only. open_metrics must never be
+# set to this key (see compose/searxng/settings.yml) — the doctor's
+# /metrics→404 probe makes that structural.
 #
 # Placement: ROOT, never /api. This handler deliberately carries NO
 # require_admin (it is a key checker) — under /api it would ride the
 # panel-api router, whose panel-secret middleware auto-injects the token for
-# whatever Authelia session arrives (admins only — and the key's own holder
-# — but a machine-facing key endpoint should have no browser-routable path
-# at all, and one future panel.yml edit changes that). At ROOT no router on
-# the panel host forwards to it: the panel-web router matches the host but
-# serves the SPA, and only PathPrefix(/api) hits panel-api — the gate is
-# internet-unreachable except via search.'s forwardAuth. /open is the
-# root-level include_in_schema=False precedent. The doctor pins the negative
-# reachability (panel-host /gate/search must answer Authelia/panel-web, never
-# gate JSON).
+# whatever Authelia session arrives. At root, nothing on the panel host
+# forwards to it: the panel-web router serves the SPA, and only
+# PathPrefix(/api) hits panel-api — the gate is internet-unreachable except
+# via search.'s forwardAuth. The doctor pins the negative: panel-host
+# /gate/search must answer Authelia/panel-web, never gate JSON.
 #
 # Reads ONLY Authorization; never consults Remote-*; NOT bypassed by
-# PANEL_DEV=1 (the /v1 precedent). The forwardAuth subrequest is GET by
-# default (preserveRequestMethod is unset repo-wide); the all-methods
-# declaration is hardening for the direct probe, not a router requirement.
+# PANEL_DEV=1 (the /v1 precedent).
 
 
 def _search_key_ok(authorization: str | None) -> bool:
@@ -1546,8 +1440,8 @@ def _search_key_ok(authorization: str | None) -> bool:
         return False
     t = token.strip()
     if scheme.lower() == "bearer":
-        # .encode() like require_admin: compare_digest(str, str) raises
-        # TypeError on non-ASCII — a 500 where a 401 belongs.
+        # compare_digest(str, str) raises TypeError on non-ASCII — a 500
+        # where a 401 belongs (hence the .encode() pairs throughout).
         return secrets.compare_digest(t.encode(), LLM_API_KEY.encode())
     if scheme.lower() == "basic":
         try:
@@ -1590,16 +1484,14 @@ async def llm_proxy(path: str, request: Request):
     if not (
         LLM_API_KEY
         and scheme.lower() == "bearer"
-        # .encode() like require_admin: compare_digest(str, str) raises
-        # TypeError on non-ASCII — a 500 where a 401 belongs.
         and secrets.compare_digest(token.strip().encode(), LLM_API_KEY.encode())
     ):
         return JSONResponse(
             {"error": {"message": "Invalid API key.", "type": "invalid_request_error", "code": "invalid_api_key"}},
             status_code=401,
         )
-    # Stream-cap: stop reading at LLM_MAX_BODY instead of buffering the whole
-    # upload first (a full buffer makes the cap decorative).
+    # Stream-cap: stop reading at LLM_MAX_BODY (a full buffer makes the cap
+    # decorative).
     body = bytearray()
     async for chunk in request.stream():
         body += chunk
@@ -1645,9 +1537,9 @@ async def llm_proxy(path: str, request: Request):
             reasons.append(f"{name}: {type(e).__name__}")
             continue
         if upstream.status_code >= 500:
-            # The instance answered but can't serve (model loading, OOM, …):
-            # a 5xx means it didn't process the request, so park it and fall
-            # through to the next rather than bouncing the client.
+            # 5xx = the instance answered but didn't process the request —
+            # park it and fall through to the next rather than bounce the
+            # client.
             await upstream.aclose()
             _llm_mark(name, False, f"HTTP {upstream.status_code}")
             _llm_down_until[name] = time.monotonic() + LLM_COOLDOWN_S
@@ -1702,21 +1594,18 @@ def llm_settings_put(body: LLMSettingsBody, _admin: Optional[str] = Depends(requ
 
 
 # ─────────────────────────── GPU pool ────────────────────────────────────────
-# The GPU view (panel tab "GPUs"): which cards each fleet instance runs on,
-# a pool with free/held per card, auto-grab (lowest free set, sized by the
-# instance's gpu.cards label — radiance 2.x has no --tp left to read), and
-# the boot-autostart list.
+# The GPU view: which cards each fleet instance runs on, the pool's
+# free/held per card, auto-grab, autostart, and card reservations.
 #
-# State split: the LEDGER (gpu_pool.py / gpu-pool.json)
-# is intent — panel-api + the boot oneshot write it, under the flock in
-# gpu_pool.gpu_lock(). The OVERRIDE (gpu-pool-override.yml) is its compose
-# projection (ROCR_VISIBLE_DEVICES per instance); every compose render that
-# can create/recreate a fleet container includes it (panel-do gpu-apply / gpu-stop,
-# COMPOSE_STACK in setup/common.sh) so `make update` recreates keep the
-# assignment. LIVE holds come from the containers themselves (panel-do
-# gpu-live) — the ledger is never consulted for "what is up".
-# All privileged work below is panel-do (gpu-fleet / gpu-live / gpu-apply /
-# gpu-stop); this section only computes + persists state.
+# State split: the LEDGER (gpu_pool.py / gpu-pool.json) is intent — written
+# by panel-api + the boot oneshot under gpu_pool.gpu_lock(). The OVERRIDE
+# (gpu-pool-override.yml) is its compose projection (ROCR_VISIBLE_DEVICES per
+# instance); every compose render that can create/recreate a fleet container
+# includes it (invariant 7) so `make update` recreates keep the assignment.
+# LIVE holds come from the containers themselves (panel-do gpu-live) — the
+# ledger is never consulted for "what is up". Privileged work is panel-do
+# (gpu-fleet / gpu-live / gpu-apply / gpu-stop); this section only computes
+# + persists state.
 
 
 def _panel_do_json(action: str, timeout: float) -> Any:
@@ -1737,7 +1626,7 @@ def _fleet_defs() -> list[dict[str, Any]]:
     """The fleet's static half (panel-do gpu-fleet): {name, display, cards}.
     Fresh, not cached — it feeds the override PRUNE, and a stale fleet set
     would let a removed service's entry linger in the override (a phantom
-    service with no image would then break every compose render)."""
+    service with no image would break every compose render)."""
     data = _panel_do_json("gpu-fleet", 25.0)
     if not isinstance(data, list):
         raise HTTPException(502, "gpu-fleet: expected a JSON array")
@@ -1760,8 +1649,7 @@ def _gpu_pool_view(
     """The GPU view's shape: pool (live holds + reservations) + instances
     (ledger ∪ live). `assigned` (ledger) and `holding` (live) are shown
     separately — drift between them means an apply failed or a hand-run
-    compose diverged. ``gpus`` is amd_gpus(): its len is the pool size and
-    its per-tile BDFs feed the reservation drift warning."""
+    compose diverged."""
     cards_total = len(gpus)
     bdf_by_index = {
         e["rocr_index"]: e["pci_slot"]
@@ -1774,8 +1662,8 @@ def _gpu_pool_view(
         svc, st = row.get("service"), row.get("state", "unknown")
         if not isinstance(svc, str) or not isinstance(st, str):
             continue
-        # a recreated service leaves its old container in `ps -a` — prefer the
-        # holding state, same rule as _gpu_fleet()
+        # a recreated service leaves its old container in `ps -a` — prefer
+        # the holding state, same rule as _gpu_fleet()
         cur = state_by_service.get(svc)
         if cur is None or (st in gpu_pool.HOLDING_STATES and cur not in gpu_pool.HOLDING_STATES):
             state_by_service[svc] = st
@@ -1822,8 +1710,8 @@ def _gpu_pool_view(
 
 
 def _gpu_pool_now() -> dict[str, Any]:
-    """Fresh view after a mutation (the UI polls anyway; this makes the
-    response self-consistent without a second round-trip)."""
+    """Fresh view after a mutation — self-consistent response, no second
+    round-trip."""
     defs = _fleet_defs()
     live = _live_fleet()
     with gpu_pool.gpu_lock():
@@ -1834,7 +1722,7 @@ def _gpu_pool_now() -> dict[str, Any]:
 
 def _panel_do_checked(name: str, args: list[str], user: Optional[str]) -> None:
     """Run a panel-do action; audit + raise on failure (the GPU endpoints'
-    shared privileged tail — same shape as the container actions)."""
+    shared privileged tail)."""
     meta = {a["name"]: a for a in panel_do_actions()}.get(name)
     timeout = min(int(meta.get("timeout_sec", 60)) + 10, 660) if meta else 330
     try:
@@ -1859,8 +1747,8 @@ def _check_gpu_name(service: str) -> None:
 
 
 def _gpus_plan_start_checked(service: str) -> tuple[dict[str, Any], list[int]]:
-    """The locked plan + save + override-sync of a GPU-aware start (the
-    shared core of gpus_start and its idle-stop retry). Raises ValueError
+    """The locked plan + save + override-sync of a GPU-aware start (the shared
+    core of gpus_start and its idle-stop retry). Raises ValueError
     (user-ready) on conflict, like gpu_pool.plan_start."""
     with gpu_pool.gpu_lock():
         ledger = gpu_pool.load_ledger()
@@ -1881,26 +1769,21 @@ def _gen_idle_conflict_stops(
 ) -> list[str]:
     """The IDLE gen slots whose cards would block this start — the Gen
     section's lazy-stop rule applied to an admin's explicit start, on the
-    SAME lane the engine's tick yields (the two paths must agree: the Gen
-    tab shows the badge this list names, and a queued job's start takes the
-    same set). A drained gen slot yields; a busy gen slot or any LLM
-    instance never does (the start fails as before — the shortage named,
-    the holders in the GPUs view). The stops come back only when they would
-    actually cover the lane (slot_status state down-idle-stops): a lane the
-    yield can't cover (a busy holder, a fenced card, a pool short even after
-    the yield) is NOT stopped into — the stop would free cards the grab
-    still can't take, and the engine's tick makes the same call.
+    same lane the engine's tick yields (a queued job's start takes the same
+    set). A drained gen slot yields; a busy slot or any LLM instance never
+    does (the start fails as before — the shortage named, the holders in the
+    GPUs view). The stops come back only when they would actually cover the
+    lane (slot_status down-idle-stops) — a lane the yield can't cover (a
+    busy holder, a fenced card, a pool short even after the yield) is NOT
+    stopped into.
 
     The lane: for a gen slot, slot_status's — the saved set when usable,
-    else the FREE-GRAB lane (a start without a usable saved set grabs the
-    lowest free set, topped up by the idle yield — so a start of an
-    UNASSIGNED slot yields its idle neighbours too, instead of failing on a
-    pool the yield would cover). For any other instance (an LLM),
-    start_preference's set instead: the saved set when it is shape-valid,
-    EVEN while held (stopping those holders is exactly what makes
-    plan_start take the saved set back — the coupling to plan_start's
-    selection rule is documented in start_preference), else the free set,
-    whose cards are free by construction and hold nothing stoppable."""
+    else the FREE-GRAB lane (an unassigned slot yields its idle neighbours
+    too, instead of failing on a pool the yield would cover). For any other
+    instance (an LLM), start_preference's set — the saved set when it is
+    shape-valid, EVEN while held (stopping those holders is exactly what
+    makes plan_start take the saved set back), else the free set (its cards
+    are free by construction and hold nothing stoppable)."""
     if gpu_pool.is_running(live, service):
         return []
     if gpu_pool.cards_needed(defs, service) is None:
@@ -1929,9 +1812,8 @@ def gpus_view(_admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
     defs = _fleet_defs()
     live = _live_fleet()
     with gpu_pool.gpu_lock():
-        # reload under the lock (a writer can't slip in between) and
-        # re-render the override — self-healing prune of removed services,
-        # a no-op write when already in sync.
+        # reload under the lock + re-render the override — self-healing
+        # prune of removed services, a no-op write when already in sync.
         ledger = gpu_pool.load_ledger()
         gpu_pool.sync_override(ledger, {d["name"] for d in defs if isinstance(d.get("name"), str)})
     return _gpu_pool_view(amd_gpus(), defs, live, ledger)
@@ -1944,8 +1826,8 @@ class GpuAssignBody(BaseModel):
 
 @app.post("/api/gpus/assign")
 def gpus_assign(body: GpuAssignBody, _admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
-    """Assign cards to an instance and (re)create it on them — GPU env only
-    exists at container creation, so "set cards" and "run on them" are one
+    """Assign cards and (re)create the instance on them — GPU env only exists
+    at container creation, so "set cards" and "run on them" are one
     operation. Running instance → brief downtime (the model reloads)."""
     _check_gpu_name(body.service)
     spec = body.gpus.strip()
@@ -1976,18 +1858,14 @@ class GpuServiceBody(BaseModel):
 
 @app.post("/api/gpus/start")
 def gpus_start(body: GpuServiceBody, _admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
-    """GPU-aware start (also the "create + start" path for a
-    container-less instance): the saved set when it is free, else the lowest
-    free set — never a raw `docker start`, which would reuse the create-time
-    env and could resurrect cards another instance now owns. A conflict with
-    an IDLE gen slot yields to the start (that slot is stopped — it is idle,
-    no job is in flight on it, nothing is lost): the yield lane is the
-    engine's (slot_status's — the slot's saved set, or the FREE-GRAB lane
-    when it has no usable one, so a start of an unassigned slot yields its
-    idle neighbours the same way a queued job's start does); a lane the
-    yield can't cover (a busy holder, an LLM occupant, a fenced card, a
-    short pool) is not stopped into — the start fails with the shortage
-    named (the GPUs view names the holders)."""
+    """GPU-aware start (also the create+start path for a container-less
+    instance): the saved set when it is free, else the lowest free set —
+    never a raw `docker start`, which would reuse the create-time env and
+    could resurrect cards another instance now owns. A conflict with an IDLE
+    gen slot yields to the start (that slot is stopped — it is idle, nothing
+    in flight); a lane the yield can't cover (a busy holder, an LLM occupant,
+    a fenced card, a short pool) is not stopped into — the start fails with
+    the shortage named."""
     _check_gpu_name(body.service)
     user = _admin
     stopped: list[str] = []
@@ -1996,19 +1874,11 @@ def gpus_start(body: GpuServiceBody, _admin: Optional[str] = Depends(require_adm
             _ledger, gpus = _gpus_plan_start_checked(body.service)
             break
         except ValueError as e:
-            # Conflict path: does the yield cover the lane (slot_status
-            # down-idle-stops — every blocking card held by an IDLE gen
-            # slot)? Then the Gen section's lazy-stop rule applies to this
-            # explicit start — stop them and re-plan once (the freed cards
-            # cover the grab, so the re-plan is the lane, not a lucky set).
-            # A lane the yield can't cover (a busy holder, an LLM occupant,
-            # a fenced card, a short pool) is not stopped into: fail as
-            # before (the shortage is named; the GPUs view names the
-            # holders). Each stop is FRESH-RECHECKED per holder (a docker
-            # stop takes seconds, and a claim can land on a still-idle
-            # holder in the window — _gen_free_slot makes the same call);
-            # a holder that went busy is left up, and the re-plan is the
-            # arbiter (it fails as before when the lane no longer covers).
+            # Conflict path: if the yield covers the lane (every blocking
+            # card held by an IDLE gen slot), stop them and re-plan once.
+            # Each stop is fresh-rechecked — a claim can land on a still-idle
+            # holder in the window; a busy holder is left up and the re-plan
+            # is the arbiter.
             with gpu_pool.gpu_lock():
                 ledger = gpu_pool.load_ledger()
                 defs = _fleet_defs()
@@ -2017,13 +1887,8 @@ def gpus_start(body: GpuServiceBody, _admin: Optional[str] = Depends(require_adm
             if not stops or attempt == 1:
                 raise HTTPException(400, str(e)) from e
             for st in stops:
-                # Per-holder FRESH check, like the engine's _gen_free_slot:
-                # a claim can land on a still-idle holder between the
-                # snapshot above and this stop (docker stops take seconds)
-                # — a busy holder is not stopped; the re-plan is the
-                # arbiter.
                 if gen_jobs.flights_on_slot(gen_jobs.load_jobs()["jobs"], st):
-                    continue
+                    continue  # went busy since the snapshot — the re-plan is the arbiter
                 _panel_do_checked("gpu-stop", [st], user)  # audited as the admin's start
                 if st not in stopped:
                     stopped.append(st)
@@ -2049,8 +1914,7 @@ class GpuAutostartBody(BaseModel):
 @app.post("/api/gpus/autostart")
 def gpus_autostart(body: GpuAutostartBody, _admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
     """Toggle the boot-autostart list (applied by gpu-autostart.service on
-    boot, in list order; overlaps are resolved there by re-grabbing — see
-    the warnings in the response)."""
+    boot, in list order; overlaps are resolved there by re-grabbing)."""
     _check_gpu_name(body.service)
     with gpu_pool.gpu_lock():
         ledger = gpu_pool.load_ledger()
@@ -2068,9 +1932,9 @@ def gpus_autostart(body: GpuAutostartBody, _admin: Optional[str] = Depends(requi
 class GpuReserveBody(BaseModel):
     """Dedicate a card to one instance (the physically-odd card — e.g. the
     PCIe5 x8 one — that must never be mixed into the others' pool): the
-    auto-grab never hands it to another instance, an explicit assign of it
-    by another is refused, and the owner's own grab lands on it first.
-    ``for`` is an alias (reserved word)."""
+    auto-grab never hands it out, another instance's explicit assign is
+    refused, and the owner's own grab lands on it first. ``for`` is an
+    alias (reserved word)."""
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -2081,10 +1945,10 @@ class GpuReserveBody(BaseModel):
 
 @app.post("/api/gpus/reserve")
 def gpus_reserve(body: GpuReserveBody, _admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
-    """Reserve a card for one instance (GPU view). The BDF is captured at
-    reserve time: the view WARNS when the tile's BDF later moves — a card
-    add/remove renumbers the tiles, so an un-warned reservation could point
-    at the wrong physical card. Re-reserving the same owner re-records it."""
+    """Reserve a card. The BDF is captured at reserve time: the view WARNS
+    when the tile's BDF later moves — a card add/remove renumbers the tiles,
+    so an un-warned reservation could point at the wrong physical card.
+    Re-reserving the same owner re-records it."""
     _check_gpu_name(body.for_service)
     note = body.note.strip()[:200]
     gpus = amd_gpus()
@@ -2130,50 +1994,44 @@ def gpus_unreserve(body: GpuUnreserveBody, _admin: Optional[str] = Depends(requi
 
 
 # ───────────────────────────── Gen (image/video) ─────────────────────────────
-# The panel's own generation section (panel tab "Gen"): one FIFO of jobs,
-# served by the GEN SLOTS — gpu-* instances whose radiance config hosts an
-# image/video model (gen_jobs.py discovers them from the deployed configs;
-# they are the gpu.private instances: no router, reachable by container IP
-# only, like the LLM router talks to the fleet). Each slot is gen-ONLY: its
-# gen model is the sole config entry and stays resident — prompt ENHANCEMENT
-# runs off-slot, on the settings' enhance target (default: the gpu-writer
-# instance's "writer" model — a PUBLIC chat instance on the 7th card; the
-# engine reaches it by container IP over the edge network, exactly like the
-# slots, and starts it via the same panel-do gpu-apply when needed).
+# The panel's Gen section: one FIFO of jobs, served by the GEN SLOTS — the
+# gpu.private instances (no public host; make doctor asserts it), discovered
+# from the deployed radiance configs, reached by container IP like the LLM
+# router. Each slot is gen-ONLY: its gen model is the sole config entry and
+# stays resident. Prompt ENHANCEMENT runs off-slot, on the settings' enhance
+# target (default: the gpu-writer instance's "writer" entry), which the
+# engine starts via the same panel-do gpu-apply when needed.
 #
-# Internal-only by construction for the SLOTS: they have no public host
-# (make doctor asserts it), and every endpoint here rides the same admin
-# gate as the rest of the panel. V2 exposes the SAME job API to the servitor
-# agent on /machine/gen/* behind the LLM bearer key — no second queue.
+# Every endpoint here rides the admin gate; V2 exposes the SAME job API to
+# the servitor on /machine/gen/* behind the LLM bearer key — no second queue.
 #
-# The engine is one background task (a ~2 s tick, the single scheduler) plus
-# one asyncio task per in-flight job. Every state transition goes through
-# gen_jobs (flock + atomic file), so a panel-api restart loses nothing: a
-# video with a radiance id re-attaches to its poll (radiance kept the job);
-# a pre-request flight (starting/enhancing/loading — the gen request never
-# reached the slot) is re-queued and resumes; only a RUNNING request in
-# flight (an image, or a video whose id was never recorded) fails.
+# The engine is one background task (~2 s tick, the single scheduler) + one
+# task per in-flight job. Every state transition goes through gen_jobs
+# (flock + atomic file), so a panel-api restart loses nothing: a video with a
+# radiance id re-attaches to its poll (radiance kept the job); a pre-request
+# flight (starting/enhancing/loading — the gen request never reached the
+# slot) is re-queued and resumes; only a RUNNING request in flight (an image,
+# or a video whose id was never recorded) fails.
 #
-# Radiance contract (upstream, ref/radiance): images — synchronous
+# Radiance contract (upstream, ref/radiance): images — sync
 # POST /v1/images/generations, response_format b64_json ONLY (url is refused);
 # videos — POST /v1/videos → {id, status}, GET /v1/videos/{id} →
-# status(queued|in_progress|completed|failed)+progress(0-100),
+# status(queued|in_progress|completed|failed) + progress(0-100),
 # GET /v1/videos/{id}/content → the MP4 (?variant=thumbnail → first frame),
-# DELETE /v1/videos/{id} → cancel. Cancel has a second, connection-level path:
-# an ABNORMALLY CLOSED response sets the ticket's cancel flag (upstream's
-# on_close handler — the same flag the video DELETE sets), so dropping an
-# in-flight request retires the render at the next pass boundary;
-# _gen_await_request uses this for the synchronous calls.
-# Auth: Bearer LLM_API_KEY — the slots' and the writer's RADIANCE_API_KEY is
-# the same fleet key (one rotation, zero plumbing).
+# DELETE /v1/videos/{id} → cancel. Cancel has a second, connection-level
+# path: an abnormally closed response sets the ticket's cancel flag (the same
+# flag the video DELETE sets), so dropping an in-flight request retires the
+# render at the next pass boundary — _gen_await_request uses this for the
+# synchronous calls. Auth: Bearer LLM_API_KEY (the slots' and the writer's
+# RADIANCE_API_KEY is the same fleet key).
 #
-# Admission (two caps — see gen_jobs): per slot, at most GEN_CAP jobs in
-# the GEN PHASE (one in progress + one queued in radiance — the model's own
+# Admission (two caps — see gen_jobs): per slot, at most GEN_CAP jobs in the
+# GEN PHASE (one in progress + one queued in radiance — the model's own
 # sequencing; a starting flight consumes no headroom); system-wide, at most
 # GEN_ENHANCE_CAP enhancements in flight on the enhance target. Enhancement
 # runs BEFORE the slot phase and OFF-SLOT (a different card): a queued job
-# enhances as soon as there is enhance headroom, without a slot being
-# claimed or started.
+# enhances as soon as there is enhance headroom, without a slot being claimed
+# or started.
 
 GEN_ARTIFACT_DIR = Path(
     os.environ.get("GEN_ARTIFACT_DIR")
@@ -2184,12 +2042,12 @@ GEN_SLOT_START_TIMEOUT_S = 600.0  # container start + engine boot budget per job
 GEN_VIDEO_POLL_S = 5.0
 GEN_CANCEL_POLL_S = 2.0  # how fast an in-flight radiance request notices a cancel (drop → the slot's ticket cancel)
 # Request budgets vs the slot's LOAD: radiance's /health is 200 from PROCESS
-# start (a stuck device is the only 503), so a request to a freshly
-# (re)started slot can sit out its entry load — warm-up is still loading from
-# disk and the request is held until its entry is resident, up to the slot's
-# scheduler.load-timeout (300 s on the tp1 slots, 600 s on gpu-gentp2, the
-# fleet's largest). Every budget below is that load wait + headroom, never a
-# cap on the work itself (the image call's 1800 s is load + a 30+ min render).
+# start (a stuck device is the only 503), so a request to a freshly (re)
+# started slot can sit out its entry load — warm-up is still loading from
+# disk and is held until resident, up to the slot's scheduler.load-timeout
+# (300 s on the tp1 slots, 600 s on gpu-gentp2, the fleet's largest). Every
+# budget below is that load wait + headroom, never a cap on the work itself
+# (the image call's 1800 s is load + a 30+ min render).
 GEN_SLOT_LOAD_WAIT_S = 600.0  # the fleet's largest scheduler.load-timeout (gpu-gentp2)
 GEN_ENHANCE_TIMEOUT_S = GEN_SLOT_LOAD_WAIT_S + 300.0
 GEN_VIDEO_SUBMIT_TIMEOUT_S = GEN_SLOT_LOAD_WAIT_S + 300.0
@@ -2207,8 +2065,8 @@ class _GenError(Exception):
 class _JobCanceled(Exception):
     """The job was canceled (or deleted) while its radiance request was in
     flight — the request task was dropped. Not a failure: the record is
-    already canceled (terminal-sticky), and the video tail — the only caller
-    that holds a radiance id to retire — does its own cleanup."""
+    already canceled (terminal-sticky); the video tail — the only caller that
+    holds a radiance id to retire — does its own cleanup."""
 
 
 def _gen_auth() -> dict[str, str]:
@@ -2223,8 +2081,8 @@ def _gen_world() -> dict[str, Any]:
 
     DEV_MODE has no panel-do: defs come from the repo's compose file (the
     same gpu.cards/labels panel-do gpu-fleet reads on the server), live and
-    ips are empty — slots then show down/unreachable, and the engine stays
-    off, so the endpoints + state files are fully exercisable locally."""
+    ips are empty — slots show down/unreachable and the engine stays off,
+    so the endpoints + state files are fully exercisable locally."""
     if DEV_MODE:
         defs, live, ips = _fleet_defs_dev(), [], {}
     else:
@@ -2237,10 +2095,9 @@ def _gen_world() -> dict[str, Any]:
     slots = gen_jobs.build_slots(instances)
     store = gen_jobs.load_jobs()
     holds = gpu_pool.live_holds(live)
-    # The lane math needs the pool (0 in dev — no /sys, and the engine is
-    # off there) + the reservation fence (a card reserved for another
-    # service is not free for a grab — slot_status's free-grab lane mirrors
-    # gpu_pool.free_cards, fence AND own-first ordering).
+    # Lane math: pool size (0 in dev — no /sys, engine off) + the reservation
+    # fence (a card reserved for another service is not free — the free-grab
+    # lane mirrors gpu_pool.free_cards, fence AND own-first ordering).
     cards_total = 0 if DEV_MODE else len(amd_gpus())
     return {
         "defs": defs,
@@ -2258,9 +2115,8 @@ def _gen_world() -> dict[str, Any]:
 
 
 def _gen_enhance_target(settings: dict[str, Any], instances: dict[str, Any]) -> dict[str, Any]:
-    """The settings' enhance target resolved against the current fleet: the
-    (instance, model) the engine runs prompts through (default: the
-    gpu-writer instance's "writer" entry). ``ok`` False carries a user-ready
+    """The settings' enhance target resolved against the current fleet
+    (default: gpu-writer's "writer" entry). ``ok`` False carries a user-ready
     reason — create 400s on it, and a queued enhance job rides it as its
     structural wait reason (a config drift, like a vanished model)."""
     e = settings.get("enhance") or {}
@@ -2281,9 +2137,9 @@ def _gen_enhance_target(settings: dict[str, Any], instances: dict[str, Any]) -> 
 
 
 def _fleet_defs_dev() -> list[dict[str, Any]]:
-    """DEV_MODE fleet defs: the repo's compose gpu-* blocks (name +
-    gpu.cards + panel.manage) — the local stand-in for panel-do gpu-fleet,
-    which needs the server's sudo."""
+    """DEV_MODE fleet defs from the repo's compose file (name + gpu.cards +
+    panel.manage) — the local stand-in for panel-do gpu-fleet (which needs
+    the server's sudo)."""
     import re as _re
 
     try:
@@ -2307,10 +2163,9 @@ def _fleet_defs_dev() -> list[dict[str, Any]]:
 
 async def _gen_mark(jid: str, **fields: Any) -> Optional[dict[str, Any]]:
     """Set fields on a job. Terminal states are sticky — a late task can't
-    overwrite canceled/completed/failed (a cancel racing a finish keeps the
-    cancel only if it landed first; the UI polls either way). Async: the
-    state file is sync file IO — the engine's tasks never touch it on the
-    event loop (the endpoints do, running in the threadpool)."""
+    overwrite canceled/completed/failed. Async: the state file is sync file
+    IO — the engine's tasks never touch it on the event loop (the endpoints
+    do, running in the threadpool)."""
 
     def _m(job: dict[str, Any]) -> None:
         if job["state"] in gen_jobs.TERMINAL_STATES:
@@ -2322,13 +2177,10 @@ async def _gen_mark(jid: str, **fields: Any) -> Optional[dict[str, Any]]:
 
 def _gen_requeue(jid: str, reason: str) -> None:
     """Back to QUEUED without its slot claim — the slot start conflicted (a
-    card got held between the tick's claim and this attempt), which is a
-    lane condition, not a job fault: the next tick re-evaluates (the slot's
-    status then says blocked — wait for the holder — or the lane is free).
-    A permanent conflict (docker down, cards short) re-queues with the same
-    reason every tick; the reason rides the record's error field so the job
-    row says why it waits. Terminal-sticky like _gen_mark (a cancel that
-    landed first wins; the record stays)."""
+    card got held between the tick's claim and this attempt): a lane
+    condition, not a job fault, so the next tick re-evaluates. The reason
+    rides the record's error field so the job row says why it waits.
+    Terminal-sticky like _gen_mark."""
 
     def _m(job: dict[str, Any]) -> None:
         if job["state"] in gen_jobs.TERMINAL_STATES:
@@ -2343,13 +2195,12 @@ def _gen_requeue(jid: str, reason: str) -> None:
 
 def _gen_reap_stale() -> None:
     """Startup: no in-flight tasks exist in this process. A RUNNING job with
-    a radiance id survives (the tick re-attaches its poll — radiance kept
-    the video); the pre-request in-flight states (STARTING/ENHANCING/
-    LOADING — the gen request never reached the slot) are lossless to re-run
-    → back to QUEUED, slot claim released (the slot start is idempotent, the
-    enhancement simply runs again); only a RUNNING request that was in flight
-    in the dead process (an image, or a video whose submit had not recorded
-    its id — an orphan on the slot) → failed, with a say-so."""
+    a radiance id survives (the tick re-attaches its poll — radiance kept the
+    video); the pre-request in-flight states (STARTING/ENHANCING/LOADING) are
+    lossless to re-run → back to QUEUED, slot claim released (the slot start
+    is idempotent, the enhancement simply runs again); only a RUNNING request
+    that was in flight in the dead process (an image, or a video whose submit
+    had not recorded its id — an orphan on the slot) → failed, with a say-so."""
     now = time.time()
     with gen_jobs.gen_lock():
         store = gen_jobs.load_jobs()
@@ -2365,10 +2216,6 @@ def _gen_reap_stale() -> None:
                 job["error"] = "panel-api restarted mid-job"
                 job["finished_at"] = now
             else:
-                # STARTING / ENHANCING / LOADING: nothing irrevocable was
-                # sent (the enhance is off-slot and simply runs again; the
-                # gen request never reached the slot) — re-run it, don't
-                # fail it.
                 job["state"] = gen_jobs.QUEUED
                 job["slot"] = None  # the next tick re-picks a candidate
                 job["started_at"] = None
@@ -2383,11 +2230,10 @@ def _gen_reap_stale() -> None:
 
 def _gen_start_instance(service: str) -> None:
     """GPU-aware start of ANY gpu-* instance the engine needs — a gen slot
-    (its lane cards) or the enhance target (its own card): the saved set
-    when free, else the lowest free — then gpu-apply (idempotent: a no-op
-    on an already-up container, so the admin/engine race can't
-    double-start). Raises RuntimeError (user-ready) on conflict — the job
-    records it."""
+    (its lane cards) or the enhance target: the saved set when free, else
+    the lowest free — then gpu-apply (idempotent: a no-op on an already-up
+    container, so the admin/engine race can't double-start). Raises
+    RuntimeError (user-ready) on conflict — the job records it."""
     try:
         _gpus_plan_start_checked(service)
     except ValueError as e:
@@ -2399,11 +2245,10 @@ def _gen_start_instance(service: str) -> None:
 
 
 def _gen_instance_up(name: str) -> tuple[bool, str]:
-    """(running, edge IP) for ONE instance — the health-wait's poll. gpu-live
-    (one panel-do spawn) + the cached edge-ips, not the full world (fleet
-    defs + every slot's config): a cold-load wait polls this every 3 s, and
-    N concurrent waiters would otherwise N× the tick's two-spawn world
-    build."""
+    """(running, edge IP) for ONE instance — the health-wait's poll. One
+    panel-do spawn + the cached edge-ips, not the full world: a cold-load
+    wait polls this every 3 s, and N concurrent waiters would N× the tick's
+    two-spawn world build."""
     row = next(
         (
             r
@@ -2420,10 +2265,9 @@ def _gen_instance_up(name: str) -> tuple[bool, str]:
 async def _gen_wait_instance_health(name: str, jid: str, budget_s: float) -> str:
     """Poll a fleet instance's /health until up; returns its edge IP.
     RuntimeError (user-ready) on budget exhaustion — the job fails with it.
-    Returns "" when the job left in-flight while waiting
-    (canceled/deleted) — the caller re-checks the record and drops out; a
-    canceled job shouldn't pay out the full 10 min for an instance that no
-    longer needs to be up."""
+    Returns "" when the job left in-flight while waiting (canceled/deleted)
+    — the caller drops out; a canceled job shouldn't pay out the full budget.
+    """
     deadline = time.monotonic() + budget_s
     last = "waiting for the container"
     while time.monotonic() < deadline:
@@ -2445,18 +2289,16 @@ async def _gen_wait_instance_health(name: str, jid: str, budget_s: float) -> str
 
 async def _gen_free_slot(sname: str) -> bool:
     """Stop the IDLE gen slots holding ``sname``'s lane cards (the lazy-stop
-    rule in action — the holder is idle, nothing in flight is lost). The
-    lane is slot_status's: the slot's saved set, or the FREE-GRAB lane when
-    the slot has no usable one (an unassigned slot still yields its idle
-    neighbours — the queued job needs the cards the grab would take). Re-
-    verify the slot is then startable. The stop is the engine's one
-    preemption, and it only ever touches gen slots with no in-flight job —
-    re-checked against a FRESH read at stop time, because the caller's tick
-    world is a snapshot taken before this tick's own claims: an earlier claim
-    in the same tick may have just landed a job on a holder that looked idle,
-    and stopping it would kill that job (the admin-start path does the same
-    per-holder fresh check in gpus_start, for the same reason — its docker
-    stops take seconds, a window a claim can land in).
+    rule — the holder is idle, nothing in flight is lost), then re-verify the
+    slot is startable. The lane is slot_status's: the slot's saved set, or
+    the FREE-GRAB lane when it has no usable one (an unassigned slot still
+    yields its idle neighbours — the queued job needs the cards the grab
+    would take). The stop is the engine's one preemption, and it only ever
+    touches gen slots with no in-flight job — re-checked against a FRESH read
+    at stop time, because the caller's world is a snapshot from before this
+    tick's own claims: an earlier claim in the same tick may have just
+    landed a job on a holder that looked idle. (gpus_start does the same
+    per-holder fresh check.)
     """
     w = await asyncio.to_thread(_gen_world)
     st = w["status"].get(sname)
@@ -2485,20 +2327,19 @@ async def _gen_free_slot(sname: str) -> bool:
 async def _gen_await_request(coro, jid: str) -> Any:
     """Await a long radiance request, dropping it when the job is canceled or
     deleted in the meantime (re-checked every GEN_CANCEL_POLL_S — the record
-    read hops to a thread, like the poll loops). The drop closes the connection, and
-    radiance treats an abnormally closed response as a cancel (the ticket's
-    flag), so the slot retires the render at its next pass boundary instead of
-    burning it out. Raises _JobCanceled on the drop; the request's own errors
-    propagate unchanged (the caller's terminal-sticky mark makes them no-ops
-    after a racing cancel).
+    read hops to a thread, like the poll loops). The drop closes the
+    connection, and radiance treats an abnormally closed response as a cancel
+    (the ticket's flag), so the slot retires the render at its next pass
+    boundary instead of burning it out. Raises _JobCanceled on the drop; the
+    request's own errors propagate unchanged (the caller's terminal-sticky
+    mark makes them no-ops after a racing cancel).
 
     NOT used for the video submit: the tail's poll loop DELETEs the radiance
     side within GEN_VIDEO_POLL_S of a cancel — dropping the submit itself
     would orphan a video radiance registered before the connection dropped
     (its id would never be known). A canceled submit simply lands, records
-    its id, and the next poll tick retires it (its timeout carries the same
-    cold-load wait as the other budgets — it is quick once the entry is
-    resident)."""
+    its id, and the next poll tick retires it.
+    """
     task = asyncio.ensure_future(coro)
     try:
         while True:
@@ -2522,9 +2363,9 @@ async def _gen_await_request(coro, jid: str) -> Any:
 
 async def _gen_enhance_call(base: str, model: str, user_prompt: str, instruction: str) -> str:
     """One non-streaming chat completion against the enhance target (the
-    settings' instance + model — default: the writer's "writer" entry). The
-    per-gen-model ``instruction`` is the admin's enhancement prompt (Gen
-    settings); the result replaces the user prompt for the gen request."""
+    settings' instance + model). The per-gen-model ``instruction`` is the
+    admin's enhancement prompt; the result replaces the user prompt for the
+    gen request."""
     if not model:
         raise _GenError("no enhance model configured (Gen settings)")
     r = await _gen_http.post(
@@ -2629,10 +2470,10 @@ async def _gen_video_cancel(base: str, vid: str) -> None:
 
 def _gen_write_artifact(job: dict[str, Any], data: bytes, thumb: Optional[bytes]) -> dict[str, Any]:
     """Write under GEN_ARTIFACT_DIR (this host service's artifact dir, user
-    panel; the same dir is ro on panel-web at /gen — the UI's static URLs).
-    Sync (file IO) — callers await it via asyncio.to_thread. Files are pinned
-    0644: panel-web's nginx reads them as a NON-panel user, so the mode must
-    not ride panel's umask (a 077 umask would 403 every artifact in the UI)."""
+    panel; ro on panel-web at /gen — the UI's static URLs). Sync (file IO) —
+    callers await it via asyncio.to_thread. Files are pinned 0644: panel-web
+    reads them as a NON-panel user, so the mode must not ride panel's umask
+    (a 077 umask would 403 every artifact in the UI)."""
 
     def put(path: Path, payload: bytes) -> None:
         path.write_bytes(payload)
@@ -2727,13 +2568,13 @@ async def _gen_video_tail(jid: str, base: str, final_prompt: str) -> None:
 async def _gen_enhance_phase(jid: str) -> None:
     """One job's ENHANCEMENT — off-slot, on the settings' enhance target:
     bring the target up if needed (part of this phase) → the rewrite → back
-    to QUEUED with enhanced_prompt set (the gen phase then claims its slot
-    in the next tick, in the job's own FIFO position). No slot is claimed or
-    started: the target is a different card, so the enhancement neither
-    waits for the lane nor holds one. A target lane condition (its card
-    held, docker down) or a settings drift re-queues with the reason (the
-    tick's structural check marks it again until fixed); a cancel while here
-    is already terminal (the marks below are no-ops)."""
+    to QUEUED with enhanced_prompt set (the gen phase then claims its slot in
+    the next tick, in the job's own FIFO position). No slot is claimed or
+    started: the target is a different card, so the enhancement neither waits
+    for the lane nor holds one. A target lane condition (its card held, docker
+    down) or a settings drift re-queues with the reason (the tick's structural
+    check marks it again until fixed); a cancel while here is already terminal
+    (the marks below are no-ops)."""
     try:
         job = await asyncio.to_thread(gen_jobs.get_job, jid)
         if job is None or job["state"] != gen_jobs.ENHANCING:
@@ -2741,9 +2582,9 @@ async def _gen_enhance_phase(jid: str) -> None:
         settings = await asyncio.to_thread(gen_jobs.load_settings)
         instruction = (settings["enhance"].get("prompts") or {}).get(job["model"], "")
         if not instruction:
-            # The door refuses it at create; this is a settings drift since
-            # the claim — re-queue (the tick's structural check marks the
-            # reason again until the prompt is back).
+            # Settings drift since the claim — re-queue; the tick's
+            # structural check marks the reason again until the prompt is
+            # back.
             await asyncio.to_thread(
                 _gen_requeue, jid, f"no enhancement prompt configured for {job['model']!r} (Gen settings)"
             )
@@ -2751,17 +2592,17 @@ async def _gen_enhance_phase(jid: str) -> None:
         w = await asyncio.to_thread(_gen_world)
         et = w["enhance_target"]
         if not et["ok"]:
-            # Structural (the target drifted out of the fleet since the
-            # claim) — re-queue with the reason; the tick's structural
-            # check marks it again until the settings are fixed.
+            # The target drifted out of the fleet since the claim —
+            # re-queue with the reason; the tick marks it again until the
+            # settings are fixed.
             await asyncio.to_thread(_gen_requeue, jid, f"enhance target unavailable: {et['reason']}")
             return
         if not (et["running"] and et["ip"]):
             try:
                 await asyncio.to_thread(_gen_start_instance, et["instance"])
             except RuntimeError as e:
-                # Its card is held / docker down — a lane condition, not a
-                # job fault: re-queue; the next tick retries.
+                # A lane condition (card held, docker down), not a job
+                # fault — re-queue; the next tick retries.
                 await asyncio.to_thread(_gen_requeue, jid, f"waiting for the enhance target: {e}")
                 return
         et_ip = await _gen_wait_instance_health(et["instance"], jid, GEN_SLOT_START_TIMEOUT_S)
@@ -2798,10 +2639,9 @@ async def _gen_enhance_phase(jid: str) -> None:
 
 async def _gen_run_job(jid: str, slot: str) -> None:
     """One job's gen-phase flight on ``slot``: (re)start the slot if needed
-    → the gen request (with the enhanced prompt, if the enhance phase ran
-    it — that ran OFF-SLOT, on the settings' enhance target, BEFORE this
-    phase) → the artifact. State is durable (gen_jobs); a failure lands in
-    the record, never in this task's exit."""
+    → the gen request (with the enhanced prompt, if the enhance phase ran it)
+    → the artifact. State is durable (gen_jobs); a failure lands in the
+    record, never in this task's exit."""
     try:
         job = await asyncio.to_thread(gen_jobs.get_job, jid)
         if job is None:
@@ -2820,9 +2660,9 @@ async def _gen_run_job(jid: str, slot: str) -> None:
                     # Start conflict (a card got held between the tick's claim
                     # and this attempt, or the lane is short) — not a job
                     # fault: re-queue it. The next tick re-evaluates through
-                    # the slot status (blocked → wait; idle holder → it gets
-                    # stopped; free → it starts). A transient docker failure
-                    # rides the same path and simply retries.
+                    # the slot status (blocked → wait; idle holder → stopped;
+                    # free → it starts). A transient docker failure rides the
+                    # same path and simply retries.
                     await asyncio.to_thread(_gen_requeue, jid, f"waiting for the lane: {e}")
                     return
         base_ip = await _gen_wait_instance_health(slot, jid, GEN_SLOT_START_TIMEOUT_S)
@@ -2833,12 +2673,11 @@ async def _gen_run_job(jid: str, slot: str) -> None:
         base = f"http://{base_ip}:8000"
         await _gen_mark(jid, error=None)  # backstop — the claim already cleared the wait reason
         # 2. the prompt — the enhanced one, if the enhance phase ran it
-        #    (off-slot, on the settings' enhance target, BEFORE this phase:
-        #    a different card, so neither phase waited on the other).
+        #    (that ran off-slot, on the settings' enhance target, before this
+        #    phase)
         final_prompt = job.get("enhanced_prompt") or job["prompt"]
-        # 3. gen-phase admission (the per-slot cap on the GEN PHASE — a
-        #    second gen flight on the same slot is admitted and gens in
-        #    parallel; radiance sequences the model's work)
+        # 3. gen-phase admission (the per-slot cap; radiance sequences the
+        #    model's work)
         while True:
             j = await asyncio.to_thread(gen_jobs.get_job, jid)
             if j is None or j["state"] == gen_jobs.CANCELED:
@@ -2917,9 +2756,8 @@ async def _gen_tick() -> None:
     # state view is reloaded PER JOB: a claim made earlier in this tick must
     # be visible to the next job's admission check, or a cap would be
     # over-admitted within one tick. Two phases per job: the enhancement
-    # first (off-slot, the global enhance cap — no slot claimed or started;
-    # a different card, so the gen lane neither waits for it nor blocks
-    # it), then the gen phase (the slot's gen-phase cap).
+    # first (off-slot, the global enhance cap — no slot claimed or started),
+    # then the gen phase (the slot's gen-phase cap).
     prompts = (await asyncio.to_thread(gen_jobs.load_settings))["enhance"].get("prompts") or {}
     for jid in w["store"]["order"]:
         jobs = (await asyncio.to_thread(gen_jobs.load_jobs))["jobs"]
@@ -2980,20 +2818,19 @@ async def _gen_tick() -> None:
             _gen_tasks[jid] = asyncio.create_task(_gen_run_job(jid, sname))
             break
         else:
-            # no candidate admitted it this tick. The transient reasons (the
+            # No candidate admitted it this tick. The transient reasons (the
             # gen-phase cap, a stop that didn't land) are the normal queue —
             # no say-so. The waits that would otherwise run in silence get
-            # marked on the record's error column (queued-only — a cancel
-            # that landed in the window wins; a later claim clears the
-            # error — claim_job): a config drift since the job was queued
-            # (its model is no longer hosted), or a lane EVERY hosting slot
-            # is blocked on — an LLM occupant, or a pool that can't cover
-            # the slot even after the idle yield (structural — an admin
-            # clears it), or a busy holder that drains on its own
+            # marked on the record's error column (queued-only — a later
+            # claim clears the error, see claim_job): a config drift since
+            # the job was queued (its model is no longer hosted), or a lane
+            # EVERY hosting slot is blocked on — an LLM occupant, or a pool
+            # that can't cover the slot even after the idle yield (structural
+            # — an admin clears it), or a busy holder that drains on its own
             # (transient — the mark rides until the claim, see
-            # queue_wait_reason). The enhance
-            # target's structural reasons are marked up front in the enhance
-            # branch above — a pending-enhance job never gets here.
+            # queue_wait_reason). The enhance target's structural reasons are
+            # marked up front in the enhance branch above — a pending-enhance
+            # job never gets here.
             reason = gen_jobs.queue_wait_reason(job, slots, status)
             if reason:
                 def _m(j, _r=reason):

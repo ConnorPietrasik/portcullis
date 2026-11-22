@@ -1,67 +1,45 @@
 """GPU pool — the ledger, the compose override, and the allocation math.
 
+State split:
+- LEDGER (gpu-pool.json): intent — each instance's card set (allocations),
+  the boot-autostart list, and card RESERVATIONS (card index → {for, note,
+  bdf}). Writers: panel-api + the boot oneshot, serialized on gpu_lock().
+- OVERRIDE (gpu-pool-override.yml): the ledger's compose projection
+  (ROCR_VISIBLE_DEVICES per instance), rendered ONLY from the ledger. Every
+  compose render that can create/recreate a fleet container includes it
+  (invariant 7); the base file's card set stays the fallback for a fully
+  hand-run compose. Allocations for services no longer in the fleet are
+  pruned from the override on every render but kept in the ledger: inert
+  there, and re-adding a block under the same name re-uses the old set
+  instead of silently grabbing new cards.
+- LIVE (panel-do gpu-live): which cards are held right now, read from the
+  running containers' env — never from the ledger. A stopped instance holds
+  nothing; the API view shows both (assigned vs holding) so drift is visible.
+
+Pool indices are ROCR indices — what ROCR_VISIBLE_DEVICES counts in — NOT
+sysfs drm card numbers (a non-GPU drm device can take a card slot; see
+amd_gpus() in main.py for the join).
+
+A RESERVATION dedicates a card to one instance (e.g. the physically-odd x8
+card): every auto-grab path (allocate "auto", plan_start, plan_boot,
+start_preference) treats a card reserved for ANOTHER service as NOT free —
+plan_start/plan_boot's saved-set branch is fenced the same way
+(_saved_set_usable): a saved set containing such a card is stale w.r.t. the
+reservation (it predates the dedication) and the start/boot falls back to
+the reservation-aware grab, so a card add that renumbers the tiles under a
+saved set can't silently re-point an instance at the dedicated card. An
+explicit assign of the card to another service is refused; the owner's own
+grab lands on its reserved cards FIRST (a dedication, not just a fence). A
+reservation holds no cards itself — a CONSTRAINT, never written to the
+override — and a stale one keeps fencing the card (safer than opening it)
+until an admin unreserves. Each reservation records the card's BDF at
+reserve time; the view warns when the tile's BDF later moves (a card
+add/remove renumbers the tiles, so an un-warned reservation could point at
+the wrong physical card).
+
+Pure logic + the two state files: no FastAPI, no /sys reads, no panel-do
+calls — callers pass defs (gpu-fleet), live (gpu-live), cards_total.
 Operator view: docs/RUNBOOK.md → "GPU fleet" → "GPU pool".
-
-- Each fleet instance (compose service ``gpu-*``) needs a fixed number of
-  cards (its ``gpu.cards`` label — radiance 2.x takes no flags, so the label
-  is the pool's only source; panel-do ``gpu-fleet`` errors without it). The
-  pool is
-  the host's whole card set (panel-api counts it from /sys). Pool indices
-  are ROCR indices — what ROCR_VISIBLE_DEVICES counts in — NOT sysfs drm
-  card numbers: on this host a non-GPU drm device takes card0, so the seven
-  GPUs are card1..card7 (panel-api's metrics carry each card's rocr_index —
-  its ROCR device number from the KFD topology — for exactly this join; see
-  ``amd_gpus`` in main.py).
-- The LEDGER (``gpu-pool.json`` next to this file in production:
-  /opt/panel-api/) is the durable state: each instance's current card set
-  (``allocations``) + the boot-autostart list (``autostart``) + card
-  RESERVATIONS (``reserved``: card index → {for, note, bdf}). panel-api and
-  the boot oneshot (gpu_autostart.py) are the only writers; they serialize
-  on ``gpu_lock()``.
-- A RESERVATION dedicates a card to one instance — for a card that is
-  physically different from the rest (e.g. PCIe5 x8 instead of x16) and must
-  never be mixed into the others' pool. Semantics:
-  * every auto-grab path (allocate "auto", plan_start, plan_boot,
-    start_preference) treats a card reserved for ANOTHER service as NOT free;
-    plan_start/plan_boot's SAVED-SET branch is fenced the same way (_saved_
-    set_usable): a saved set containing a card reserved for another service
-    is STALE w.r.t. the reservation (it predates the dedication) and the
-    start/boot falls back to the reservation-aware grab — a card add that
-    renumbers the tiles under a saved set can't silently re-point an
-    instance at the dedicated card;
-  * an explicit assign of the card to another service is refused, owner +
-    note named;
-  * the reserving service's OWN grab lands on its reserved cards FIRST (a
-    dedication, not just a fence: a first start of the owner with no saved
-    set takes its card, not the lowest pool card);
-  * the owner may still take other free cards, and a reservation holds no
-    cards itself — it is a CONSTRAINT, never written to the OVERRIDE.
-  Each reservation records the card's BDF (PCI_SLOT_NAME) at reserve time:
-  the view warns when the tile's BDF later moves, when the owner leaves the
-  fleet, when the card left the pool, or when a hand-run compose pinned a
-  foreign instance on it — a card add/remove renumbers the tiles (PCIe slot
-  order != enumeration order), so an un-warned reservation could silently
-  re-point at the wrong physical card. A stale reservation keeps fencing the
-  card (safer than opening it) until an admin unreserves it.
-- The OVERRIDE (``gpu-pool-override.yml``, same directory) is a compose
-  ``-f`` file pinning ROCR_VISIBLE_DEVICES per instance, rendered ONLY from
-  the ledger (never hand-edited). Every compose invocation that can create
-  or recreate a fleet container includes it (panel-do gpu-apply/gpu-stop/
-  start-service, COMPOSE_STACK in setup/common.sh), so a ``make update``
-  recreate never silently reverts an instance to the card set committed in the
-  base file — which stays as the fallback default for a fully hand-run
-  compose (no override -f). Allocations for services no longer in the fleet
-  are pruned from the OVERRIDE on every render but kept in the LEDGER:
-  inert there, and re-adding a block under the same name re-uses the old
-  set instead of silently grabbing new cards.
-- LIVE state (which cards are actually held right now) is read from the
-  running containers' env via panel-do ``gpu-live`` — never from the
-  ledger. A stopped instance holds nothing. The API view shows both
-  (assigned vs holding) so drift is visible, not silent.
-
-This module is pure logic + these two files: no FastAPI, no /sys reads, no
-panel-do calls. Callers pass ``defs`` (panel-do gpu-fleet), ``live``
-(panel-do gpu-live) and ``cards_total`` in.
 """
 
 from __future__ import annotations
@@ -76,7 +54,7 @@ from typing import Any, Iterator, Optional
 DEV_MODE = os.environ.get("PANEL_DEV") == "1"
 
 # Production lives under /opt/panel-api (panel-owned); dev mode keeps the
-# files in the checkout, like the LLM order settings (main.py).
+# files in the checkout, like the LLM settings (main.py).
 LEDGER_PATH = Path(
     os.environ.get("GPU_POOL_LEDGER_PATH")
     or ("gpu-pool.json" if DEV_MODE else "/opt/panel-api/gpu-pool.json")
@@ -169,13 +147,10 @@ def save_ledger(ledger: dict[str, Any]) -> None:
 
 
 def render_override(allocations: dict[str, list[int]], fleet: set[str]) -> str:
-    """The override as YAML: ROCR_VISIBLE_DEVICES per instance.
-
-    Only services that exist in the CURRENT fleet are written — an entry for
-    a removed service would make compose merge a phantom service (no image)
-    into every render. Empty allocation → an empty services map, which is a
-    valid no-op override.
-    """
+    """ROCR_VISIBLE_DEVICES per instance, for services in the CURRENT fleet
+    only — an entry for a removed service would make compose merge a phantom
+    service (no image) into every render. Empty allocation → a no-op
+    `services: {}`."""
     lines = [
         "# Generated by panel-api (GPU pool) — do not edit by hand.",
         "# Card sets live in the ledger (gpu-pool.json); this file is its",
@@ -200,7 +175,7 @@ def render_override(allocations: dict[str, list[int]], fleet: set[str]) -> str:
 def sync_override(ledger: dict[str, Any], fleet: set[str]) -> bool:
     """Re-render the override from the ledger (pruned to the fleet); writes
     only when the content changed. Returns True when it wrote. Call inside
-    gpu_lock(). The GET endpoint calls this too — self-healing prune."""
+    gpu_lock()."""
     content = render_override(ledger["allocations"], fleet)
     try:
         if OVERRIDE_PATH.read_text() == content:
@@ -245,8 +220,7 @@ def parse_cards(spec: str) -> list[int]:
 def live_holds(live: list[dict[str, Any]]) -> dict[int, str]:
     """card index → holding service, from the containers that are actually
     up. A recreate leaves the old container in `ps -a`, so only holding
-    states count; the first holding row wins a card (in practice there is
-    one holding container per service)."""
+    states count; the first holding row wins a card."""
     holds: dict[int, str] = {}
     for row in live:
         if row.get("state") not in HOLDING_STATES:
@@ -279,9 +253,8 @@ def holding_of(live: list[dict[str, Any]], service: str) -> list[int]:
 
 
 def cards_needed(defs: list[dict[str, Any]], service: str) -> Optional[int]:
-    """The instance's card count (its gpu.cards label — required; the ``or 1``
-    is belt-and-braces, panel-do gpu-fleet errors on a missing label); None
-    when the service isn't a fleet instance in the deployed compose."""
+    """The instance's card count (its gpu.cards label); None when the
+    service isn't a fleet instance in the deployed compose."""
     for d in defs:
         if d.get("name") == service:
             return int(d.get("cards") or 1)
@@ -294,9 +267,8 @@ def free_cards(
     reserved: Optional[dict[int, dict[str, Any]]] = None,
     for_service: Optional[str] = None,
 ) -> list[int]:
-    """Cards no one is holding — the ``for_service``'s OWN reserved cards
-    first, then the rest. A card reserved for ANOTHER service is not free
-    (the reservation fences it from everyone else's auto-grab — see the
+    """Cards no one is holding — the for_service's OWN reserved cards first,
+    then the rest. A card reserved for ANOTHER service is not free (see the
     module docstring for the full semantics)."""
     reserved = reserved or {}
     own: list[int] = []
@@ -313,12 +285,11 @@ def free_cards(
 
 
 def _new_ledger(ledger: dict[str, Any], allocations: dict[str, list[int]]) -> dict[str, Any]:
-    """The ledger a plan/allocate returns to its caller — a FULL copy: the
-    caller save_ledger()s the return verbatim, so EVERY key must ride along.
-    Dropping one silently rewrites the ledger without it, and the next
-    load_ledger() coerces the gap to {} — a 'reserved' fence lost this way
-    reopens its card to every auto-grab (the dedicated card is no longer
-    dedicated)."""
+    """A FULL copy of the ledger for a plan's return: the caller save_ledger()
+    s the return verbatim, so EVERY key must ride along. Dropping one
+    silently rewrites the ledger without it (the next load coerces the gap to
+    {}), and a 'reserved' fence lost this way reopens its card to every
+    auto-grab."""
     return {
         "allocations": allocations,
         "autostart": list(ledger["autostart"]),
@@ -348,12 +319,10 @@ def _saved_set_usable(
 ) -> bool:
     """``saved`` is a set plan_start/plan_boot's saved-set branch may take:
     shape-valid AND free of cards reserved for ANOTHER service. A
-    reservation made AFTER the set was saved fences it — the set predates
-    the dedication (on this host a card add renumbered the tiles under a
-    saved set), so taking it would put the instance on a card the fence
-    exists to keep off it. The start/boot falls back to the reservation-
-    aware grab instead. The owner's OWN reserved cards are fine (that is
-    the dedication)."""
+    reservation made AFTER the set was saved fences it — taking it would put
+    the instance on a card the fence exists to keep off it; the start/boot
+    falls back to the reservation-aware grab instead. The owner's OWN
+    reserved cards are fine (that is the dedication)."""
     if not _valid_set(saved, n, cards_total):
         return False
     reserved = ledger["reserved"]
@@ -388,10 +357,8 @@ def allocate(
     spec: str,
 ) -> tuple[dict[str, Any], list[int]]:
     """Plan one explicit/auto assignment. ``spec`` is "auto" or "0,1,2".
-
-    Raises ValueError with a user-ready message. Returns (new_ledger,
-    gpus); the caller owns the lock, save, override, and the apply.
-    """
+    Raises ValueError (user-ready). Returns (new_ledger, gpus); the caller
+    owns the lock, save, override, and the apply."""
     n = cards_needed(defs, service)
     if n is None:
         raise ValueError(f"{service} is not a gpu-* instance in the deployed compose")
@@ -414,8 +381,7 @@ def allocate(
             who = ", ".join(f"{c} (held by {holds[c]})" for c in conflicts)
             raise ValueError(f"card(s) in use: {who}")
         # a card reserved for ANOTHER service is fenced even while idle —
-        # that is the whole point of the reservation (the x8 card must not
-        # be hand-mixed into the x16 pool any more than auto-grabbed).
+        # that is the whole point of the reservation.
         fenced = sorted(
             c for c in gpus if (r := ledger["reserved"].get(c)) and r["for"] != service
         )
@@ -479,11 +445,8 @@ def start_preference(
     stoppable — only the saved lane's holders, drained, can turn a
     conflicting start into a successful one. If plan_start's saved-set rule
     changes, this must change with it: a preference no re-plan would pick
-    stops warm slots for nothing.
-
-    The fallback is reservation-aware like plan_start's (a card reserved for
-    another service is not in the set; the owner's own reserved cards sort
-    first)."""
+    stops warm slots for nothing. The fallback is reservation-aware like
+    plan_start's."""
     n = cards_needed(defs, service)
     if n is None:
         raise ValueError(f"{service} is not a gpu-* instance in the deployed compose")
@@ -538,9 +501,8 @@ def plan_boot(
 
 
 def autostart_warnings(ledger: dict[str, Any]) -> list[str]:
-    """Human-readable warnings about the boot-autostart set (never fatal —
-    the boot planner resolves overlaps by re-grabbing; this is the
-    visibility)."""
+    """Warnings about the boot-autostart set (never fatal — the boot planner
+    resolves overlaps by re-grabbing; this is the visibility)."""
     out: list[str] = []
     alloc = ledger["allocations"]
     auto = ledger["autostart"]
@@ -564,12 +526,12 @@ def autostart_warnings(ledger: dict[str, Any]) -> list[str]:
 
 
 def assignment_warnings(defs: list[dict[str, Any]], ledger: dict[str, Any]) -> list[str]:
-    """Human-readable warnings for SAVED sets whose count no longer matches
-    the instance's card need (its gpu.cards) — e.g. after a config edit
-    without a re-assign. A GPU-aware start self-heals (plan_start re-grabs
-    the right count and records it), but a hand-run compose would pin the
-    old count and the engine would fail to load. Never fatal — reassign
-    (auto) or fix the flag."""
+    """Warnings for SAVED sets whose count no longer matches the instance's
+    card need (its gpu.cards) — e.g. after a config edit without a
+    re-assign. A GPU-aware start self-heals (plan_start re-grabs the right
+    count and records it), but a hand-run compose would pin the old count
+    and the engine would fail to load. Never fatal — reassign (auto) or fix
+    the label."""
     out: list[str] = []
     alloc = ledger["allocations"]
     for d in defs:
@@ -599,16 +561,15 @@ def reservation_warnings(
     holds: dict[int, str],
     bdf_by_index: dict[int, str],
 ) -> list[str]:
-    """Human-readable warnings for RESERVATIONS that have gone stale — the
-    card left the pool, the tile's BDF moved (both: a card add/remove
-    renumbered the tiles, so the dedication may point at the wrong physical
-    card), the owner left the fleet, a hand-run compose pinned a foreign
-    instance on the card, or ANOTHER instance's saved set still names the
-    card (its next start falls back to the reservation-aware grab — the
-    fence wins; reassign it to clean the ledger). Never fatal: the
+    """Warnings for RESERVATIONS that have gone stale — the card left the
+    pool, the tile's BDF moved (a card add/remove renumbered the tiles — the
+    dedication may point at the wrong physical card), the owner left the
+    fleet, a hand-run compose pinned a foreign instance on the card, or
+    another instance's saved set still names it (its next start falls back
+    to the reservation-aware grab — the fence wins). Never fatal: the
     reservation KEEPS fencing the card (safer than opening it to the
-    auto-grab) until an admin unreserves it. The GPU view calls this on
-    every poll, so a hardware change can't silently re-point a dedication."""
+    auto-grab) until an admin unreserves. Called on every GPU-view poll, so
+    a hardware change can't silently re-point a dedication."""
     out: list[str] = []
     names = {d.get("name") for d in defs}
     for card in sorted(ledger["reserved"]):
@@ -638,10 +599,9 @@ def reservation_warnings(
                 f"card {card} is reserved for {r['for']} but held by {holder} — a hand-run compose "
                 f"pinned it there: stop the holder (or unreserve) so the reservation is not fiction"
             )
-        # A SAVED set (the ledger's intent) of another instance that still
-        # names the card: _saved_set_usable makes its next start/boot fall
-        # back to a free set — this names the drift until it is re-assigned
-        # (auto), so the view stops showing a set the pool would not take.
+        # A SAVED set of another instance that still names the card:
+        # _saved_set_usable makes its next start/boot fall back to a free
+        # set — this names the drift until it is re-assigned (auto).
         for name, saved in ledger.get("allocations", {}).items():
             if name != r["for"] and isinstance(saved, list) and card in saved:
                 out.append(
