@@ -274,7 +274,7 @@ services:
       - /models/llm:/models/llm:ro
       - ./gpu-configs/gpu-writer.yaml:/etc/radiance/radiance.yaml:ro
     labels:
-      - panel.manage=Writer (hemmingway + gemma) # Services view name (no card set — it moves)
+      - panel.manage=Writer # Services view name (no card set — it moves)
       - panel.category=LLM
       - gpu.cards=1 # == tp in gpu-configs/gpu-writer.yaml (doctor cross-checks)
 
@@ -305,7 +305,7 @@ services:
       - /models/image:/models/image:ro
       - ./gpu-configs/gpu-gentp1a.yaml:/etc/radiance/radiance.yaml:ro
     labels:
-      - panel.manage=Gen image krea-2 (tp1a) # Services view name (no card set — it moves)
+      - panel.manage=Gen TP1-A # Services view name (no card set — it moves)
       - gpu.cards=1 # == tp in gpu-configs/gpu-gentp1a.yaml (doctor cross-checks)
       - gpu.private=true # no public host — the Gen section is the consumer
       - panel.category=Gen # Services view group (non-LLM model classes get their own)
@@ -320,7 +320,7 @@ services:
       - /models/image:/models/image:ro # shallow <<: this list replaces the anchor's
       - ./gpu-configs/gpu-gentp1b.yaml:/etc/radiance/radiance.yaml:ro
     labels:
-      - panel.manage=Gen image krea-2 (tp1b) # Services view name (no card set — it moves)
+      - panel.manage=Gen TP1-B # Services view name (no card set — it moves)
       - gpu.cards=1 # == tp in gpu-configs/gpu-gentp1b.yaml
       - gpu.private=true
       - panel.category=Gen # Services view group (non-LLM model classes get their own)
@@ -334,7 +334,7 @@ services:
       - /models/video:/models/video:ro # shallow <<: this list replaces the anchor's
       - ./gpu-configs/gpu-gentp2.yaml:/etc/radiance/radiance.yaml:ro
     labels:
-      - panel.manage=Gen video minimax-h3 (tp2) # Services view name (no card set — it moves)
+      - panel.manage=Gen TP2 # Services view name (no card set — it moves)
       - gpu.cards=2 # == tp in gpu-configs/gpu-gentp2.yaml
       - gpu.private=true
       - panel.category=Gen # Services view group (non-LLM model classes get their own)

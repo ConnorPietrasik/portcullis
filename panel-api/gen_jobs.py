@@ -90,7 +90,7 @@ RESERVED_MODEL_NAMES = frozenset(PURPOSE_KEYS) | {"edit"}
 # /models layout: the 2nd path component of a model path is its class.
 KIND_DIRS = frozenset({"llm", "image", "video"})
 
-MODEL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,127}$")
+MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,127}$")  # entry names may carry case (Krea2, Minimax-H3-T2V)
 # No length caps on the user prompt or the enhancement prompts: the real cap
 # is per-model and in TOKENS (a video model's max_text, an image model's
 # conditioning budget), and radiance enforces it at SUBMIT with a 400 that

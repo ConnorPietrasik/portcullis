@@ -28,6 +28,6 @@ scheduler:
   drain-timeout: 30s
   warm-up: true # load the entry at start so the first job pays no disk load
 models:
-  krea-2-raw-iq8r: # image gen (12.9B DiT, IQ8R) — the engine sizes image
+  Krea2: # image gen (12.9B DiT, IQ8R) — the engine sizes image
     model: /models/image/krea-2-raw-iq8r.rad # models itself (batch/context from the largest pass)
     tp: 1 # == the block's gpu.cards (doctor cross-checks)

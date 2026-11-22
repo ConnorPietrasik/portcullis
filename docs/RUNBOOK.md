@@ -599,12 +599,12 @@ image/video) makes it a plain instance.
 
 | slot | cards | lane fallback | generator | host-mib |
 |---|---|---|---|---|
-| `gpu-gentp1a` | 1 | 5 | `krea-2-raw-iq8r` (16.4 GiB, image) | 24576 |
-| `gpu-gentp1b` | 1 | 6 | `krea-2-raw-iq8r` (16.4 GiB, image) | 24576 |
-| `gpu-gentp2` | 2 | 5,6 | `minimax-h3-i8` (62.7 GiB, video) | 73728 |
+| `gpu-gentp1a` | 1 | 5 | `Krea2` (16.4 GiB, image) | 24576 |
+| `gpu-gentp1b` | 1 | 6 | `Krea2` (16.4 GiB, image) | 24576 |
+| `gpu-gentp2` | 2 | 5,6 | `Minimax-H3-T2V` (62.7 GiB, video) | 73728 |
 
 Both tp1 slots are identical and run concurrently (disjoint cards, same config — one krea-2 job each).
-`minimax-h3-i8` is 98% of the pair as a FILE — it fits only because of
+`minimax-h3-i8.rad` is 98% of the pair as a FILE — it fits only because of
 `vision-tower-placement: ram` (the ViT towers sit in host RAM, which `host-mib` budgets — the value
 in the config file, not the container env). No pre-flight check: if it doesn't
 fit, the first boot fails and says so.

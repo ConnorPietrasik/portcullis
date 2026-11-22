@@ -33,7 +33,7 @@ scheduler:
   drain-timeout: 30s
   warm-up: true # load the entry at start so the first job pays no disk load
 models:
-  minimax-h3-i8: # video with sound — int8 on the two-card pair; the 32B text
+  Minimax-H3-T2V: # video with sound — int8 on the two-card pair; the 32B text
     model: /models/video/minimax-h3-i8.rad # encoder runs INSIDE this entry (VCOND)
     tp: 2 # == the block's gpu.cards (doctor cross-checks)
     vision-tower-placement: ram # the vision tower's RAM home — what makes the

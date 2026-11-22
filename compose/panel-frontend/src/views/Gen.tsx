@@ -46,7 +46,7 @@ function Cards({ xs }: { xs: number[] | null }) {
 // unknown models get no note, and radiance's submit-time 400 stays the
 // authority (it names the model's own limits).
 const MODEL_NOTES: Record<string, string> = {
-  'minimax-h3-i8':
+  'Minimax-H3-T2V':
     'video 5.17–14.38 s (24 fps, 7–20 chunks; request rounds up to a chunk ≈ 0.71 s) · with sound · sides ×32, ≥ 256 px, ≤ 1344×768 area, aspect ≤ 4:1 · prompt ≤ 8192 tokens',
 }
 
