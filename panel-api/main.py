@@ -1999,7 +1999,7 @@ def gpus_unreserve(body: GpuUnreserveBody, _admin: Optional[str] = Depends(requi
 # from the deployed radiance configs, reached by container IP like the LLM
 # router. Each slot is gen-ONLY: its gen model is the sole config entry and
 # stays resident. Prompt ENHANCEMENT runs off-slot, on the settings' enhance
-# target (default: the gpu-writer instance's "writer" entry), which the
+# target (default: the gpu-writer instance's "Writer" entry), which the
 # engine starts via the same panel-do gpu-apply when needed.
 #
 # Every endpoint here rides the admin gate; V2 exposes the SAME job API to
@@ -2116,12 +2116,12 @@ def _gen_world() -> dict[str, Any]:
 
 def _gen_enhance_target(settings: dict[str, Any], instances: dict[str, Any]) -> dict[str, Any]:
     """The settings' enhance target resolved against the current fleet
-    (default: gpu-writer's "writer" entry). ``ok`` False carries a user-ready
+    (default: gpu-writer's "Writer" entry). ``ok`` False carries a user-ready
     reason — create 400s on it, and a queued enhance job rides it as its
     structural wait reason (a config drift, like a vanished model)."""
     e = settings.get("enhance") or {}
     inst = e.get("instance") or "gpu-writer"
-    model = e.get("model") or "writer"
+    model = e.get("model") or "Writer"
     out: dict[str, Any] = {"instance": inst, "model": model, "running": False, "ip": "", "ok": False, "reason": ""}
     row = instances.get(inst)
     if row is None:

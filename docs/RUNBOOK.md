@@ -616,21 +616,21 @@ models, both `tp: 1`, disk-park only (`park: {ram: never}` — pinned host RAM i
 resource). Only ONE of the two fits the card's VRAM at a time; there is deliberately NO
 `priority` on either entry (neither "always wins"): a model at work keeps its cards (its demand
 waits for the other to finish — a switch is bounded by the config's `drain-timeout`), and between
-sessions the cheaper-to-reload one (writer) yields first. Listing `writer` FIRST makes it the
+sessions the cheaper-to-reload one (Writer) yields first. Listing `Writer` FIRST makes it the
 resident one right after boot (the warm-up loads later-in-file entries first and the last loaded
 parks the earlier one — see the config's header):
 
 | entry (the /v1 `model` name) | file (`/models/llm/`) | role |
 |---|---|---|
-| `writer` | `hemmingway-1.5-iq4r-s-tool-tail-mtp-gptq.rad` | the Gen section's prompt enhancement (listed first → loads last in the warm-up → resident after boot) |
-| `uncensored` | `gemma4-31b-heretic-ara-a4.rad` | unfiltered chat (100k ceiling, thinking on by default) |
+| `Writer` | `hemmingway-1.5-iq4r-s-tool-tail-mtp-gptq.rad` | the Gen section's prompt enhancement (listed first → loads last in the warm-up → resident after boot) |
+| `Uncensored` | `gemma4-31b-heretic-ara-a4.rad` | unfiltered chat (100k ceiling, thinking on by default) |
 
 Standard six name references (RUNBOOK → GPU fleet: compose block, config, router pair, fleet-open
 host). `panel.category=LLM`, so it is also eligible for the `llm.pietrasik.top` fallback order (LLM
 settings — your call). The Gen section's ENHANCE TARGET (Gen settings) names the instance + model by
-default (`gpu-writer` / `writer`); the engine reaches it by container IP over the edge network, starts
+default (`gpu-writer` / `Writer`); the engine reaches it by container IP over the edge network, starts
 it via the same `gpu-apply` when a job needs it, and the target can be repointed at ANY chat-capable
-instance in the settings (e.g. `uncensored` on the same instance, or a 27b instance) — a misconfigured
+instance in the settings (e.g. `Uncensored` on the same instance, or a 27b instance) — a misconfigured
 target shows in the Gen tab and 400s at the door.
 
 **Card index (MEASURED — re-derive after any card add/remove):** the pool is ROCR-index based and
@@ -693,7 +693,7 @@ mkdir -p /models/llm /models/image /models/video
 
 - **Job = model + prompt + (video: seconds) + (both: size, seed).** `model` is a purpose key
   (`image` / `video` — mapped to exact models in the tab's settings, admin-editable) or an exact
-  model name. Enhancement (the enhance target — default: the writer's `writer` model — rewrites the
+  model name. Enhancement (the enhance target — default: the writer's `Writer` model — rewrites the
   prompt first, off-slot) is per-job, defaulted by the settings' global toggle; a model without a
   configured prompt can't be enhanced (the checkbox says so), and the server refuses `enhance: true`
   for one — it is not a silent skip at the door.
@@ -751,7 +751,7 @@ mkdir -p /models/llm /models/image /models/video
   after they age past gc_days.
 - **Settings** (Gen tab, or `PUT /api/gen/settings`): the purpose→model map, the global enhance
 toggle, the per-model enhancement prompts, the ENHANCE TARGET (instance + model — default
-`gpu-writer` / `writer`), the GC age. State lives in `/opt/panel-api/gen-settings.json`
+`gpu-writer` / `Writer`), the GC age. State lives in `/opt/panel-api/gen-settings.json`
 (panel 0600) + `/opt/panel-api/gen-jobs.json` (queue + jobs, 0600) — both in the update snapshot,
 like the LLM router's settings.
 - **V2 (servitor):** the same endpoints re-exposed under `/machine/gen/*` with the bearer

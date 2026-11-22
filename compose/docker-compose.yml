@@ -213,9 +213,9 @@ services:
   # The writer (the 7th card, the odd one out): PCIe5 x8 instead of x16 —
   # the LOAD traffic is ~half speed, but inference is VRAM-bandwidth-bound,
   # so the always-resident chat models live here (the swapping gen slots
-  # keep the x16 cards). Multi-model = radiance's router: "writer" +
-  # "uncensored", picked by the /v1 `model` name. The Gen section's prompt
-  # enhancement targets the "writer" entry (Gen settings → enhance target).
+  # keep the x16 cards). Multi-model = radiance's router: "Writer" +
+  # "Uncensored", picked by the /v1 `model` name. The Gen section's prompt
+  # enhancement targets the "Writer" entry (Gen settings → enhance target).
   # Disk-park only (pinned host RAM is the scarce shared resource).
   # Card index: tile 4, MEASURED (PCIe slot order != enumeration order; the
   # GPU view + the Overview's per-tile BDF chips are the map — re-derive

@@ -6,7 +6,7 @@ image,video} layout is the contract) — the gpu.private instances, discovered
 from the deployed configs (``/opt/panel/gpu-configs/``, the repo copy in dev)
 — no second model registry to drift. A slot's config is GEN-ONLY: its gen
 model is the sole entry and stays resident; prompt enhancement runs OFF-SLOT,
-on the settings' ENHANCE TARGET (default: the gpu-writer instance's "writer"
+on the settings' ENHANCE TARGET (default: the gpu-writer instance's "Writer"
 model — a public chat instance the engine reaches by container IP, like the
 slots), so a slot's VRAM never serves the enhancer.
 
@@ -156,7 +156,7 @@ def _empty_settings() -> dict[str, Any]:
         "purposes": {},
         # Enhance target: where prompt enhancement runs (defaults to the
         # shipped writer instance; repointable in Gen settings).
-        "enhance": {"enabled": True, "prompts": {}, "instance": "gpu-writer", "model": "writer"},
+        "enhance": {"enabled": True, "prompts": {}, "instance": "gpu-writer", "model": "Writer"},
         "gc_days": 14,
     }
 

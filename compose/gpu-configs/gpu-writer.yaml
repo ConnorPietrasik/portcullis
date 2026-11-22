@@ -9,7 +9,7 @@
 #
 # Multi-model = radiance's router: both entries serve :8000 and /v1 routes
 # by the `model` name. The Gen section's prompt enhancement targets the
-# "writer" entry (Gen settings → enhance target; the engine reaches this
+# "Writer" entry (Gen settings → enhance target; the engine reaches this
 # instance by container IP over the edge network, like the gen slots).
 # Only ONE of the two fits the card's VRAM at a time — the other parks to
 # its .rad on disk (park: {ram: never} on both: pinned host RAM is the
@@ -18,10 +18,10 @@
 # Residency: NO `priority` on either entry (both default 0) — neither
 # "always wins". A model AT WORK is protected (eviction drains it first,
 # bounded by drain-timeout); between IDLE models the one that costs least
-# to restore yields first (upstream's tiebreak — here "writer", the small
+# to restore yields first (upstream's tiebreak — here "Writer", the small
 # one). Listing order still fixes the BOOT instant: the warm-up loads the
 # unpinned entries lowest-priority first, LATER IN THE FILE FIRST among
-# equals — the LAST loaded is the resident one. "writer" is listed first
+# equals — the LAST loaded is the resident one. "Writer" is listed first
 # (loads last) so the enhance path pays no restore right after boot.
 # The fit question (does one max-length sequence's KV fit beside the
 # weights?) is answered by the first boot: the startup report's `vram
@@ -47,7 +47,7 @@ scheduler:
   drain-timeout: 30s # the bound on a mid-session switch (residency above)
   warm-up: true # load both at start (the second loaded parks the first to disk)
 models:
-  writer: # hemmingway 1.5 IQ4R (tool-calling, MTP)
+  Writer: # hemmingway 1.5 IQ4R (tool-calling, MTP)
     model: /models/llm/hemmingway-1.5-iq4r-s-tool-tail-mtp-gptq.rad
     aliases: [default] # model-less requests land here (the instance's default)
     tp: 1 # == the block's gpu.cards (doctor cross-checks — this is the file's first tp:)
@@ -62,7 +62,7 @@ models:
     draft-coupling: on
     kv-cache-dtype: i8 # K/V as int8 — halves what a token of context costs in VRAM
     park: {ram: never}
-  uncensored: # gemma 31B a4 — the unfiltered chat entry
+  Uncensored: # gemma 31B a4 — the unfiltered chat entry
     model: /models/llm/gemma4-31b-heretic-ara-a4.rad
     tp: 1
     # A CEILING, not a preallocation: the KV pool is the budget-resolved

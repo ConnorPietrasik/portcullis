@@ -111,7 +111,7 @@ the fleet's own `LLM_API_KEY` as bearer (no new key: a slot is a fleet instance,
 edge-network property — any edge container can reach a slot's :8000 unkeyed — is the same class as
 the LLM instances'. A key is the gate; the segment is trusted by construction, as everywhere else
 on the bridge). Prompt enhancement is OFF-SLOT: the engine runs it on the settings' ENHANCE TARGET
-(default: the `gpu-writer` instance's `writer` entry — a standard PUBLIC fleet instance, the 7th
+(default: the `gpu-writer` instance's `Writer` entry — a standard PUBLIC fleet instance, the 7th
 card, `writer.pietrasik.top`, with the normal six name references and the same bearer gate as every
 fleet host) over the same container-IP data path, starting it via the same `gpu-apply` when needed;
 the target (instance + model) is a Gen setting, repointable at any chat-capable instance, and a
