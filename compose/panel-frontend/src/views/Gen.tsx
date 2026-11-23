@@ -470,7 +470,7 @@ function JobCard({
               ↓
             </a>
           )}
-          <button type="button" title={inf ? 'cancel' : 'delete'} onClick={onRemove}>
+          <button type="button" title="delete" onClick={onRemove}>
             ✕
           </button>
         </span>
@@ -546,8 +546,8 @@ function JobModal({
       width={1000}
       footer={
         <>
-          <button className="danger" disabled={busy} onClick={() => onRemove(job)}>
-            {IN_FLIGHT.has(job.state) ? 'cancel' : 'delete'}
+          <button className="danger solid" disabled={busy} onClick={() => onRemove(job)}>
+            delete
           </button>
           {job.artifact && (
             <a href={job.artifact.url} download>

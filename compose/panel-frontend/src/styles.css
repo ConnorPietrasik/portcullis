@@ -91,6 +91,19 @@ button.danger:hover {
   border-color: var(--red);
 }
 
+/* solid dark red at rest — a destructive button that reads as one without
+   hovering (the gen job's "delete") */
+button.danger.solid {
+  background: color-mix(in srgb, var(--red) 20%, var(--bg));
+  border-color: color-mix(in srgb, var(--red) 50%, var(--line));
+  color: color-mix(in srgb, var(--red) 55%, var(--fg));
+}
+
+button.danger.solid:hover {
+  background: color-mix(in srgb, var(--red) 30%, var(--bg));
+  border-color: var(--red);
+}
+
 main {
   padding-top: 18px;
 }

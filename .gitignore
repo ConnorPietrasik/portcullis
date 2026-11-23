@@ -39,3 +39,6 @@ acme.json
 
 # reference stuff to avoid re-downloading every time
 ref/
+
+# demo tool screenshots — regenerated on demand (shot.mjs), never a source
+tools/demo/screens/
