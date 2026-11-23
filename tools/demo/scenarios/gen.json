@@ -1,0 +1,8 @@
+[
+  { "name": "gen", "tab": "Gen", "wait": 2600 },
+  { "name": "gen-select", "then": "document.querySelector('.jobs-bar .selall')?.click(); 'ok'", "wait": 800 },
+  { "name": "gen-job", "then": "(() => { document.querySelector('.modal .modal-x')?.click(); const c = [...document.querySelectorAll('.jc:not(.inf)')].find(x => x.querySelector('.jkind')?.textContent === 'image') ?? document.querySelector('.jc:not(.inf)'); c?.querySelector('.jbody')?.click(); return 'ok' })()", "wait": 1400 },
+  { "name": "gen-settings", "then": "(() => { document.querySelector('.modal .modal-x')?.click(); document.querySelector('.bar > button:last-child')?.click(); return 'ok' })()", "wait": 1400 },
+  { "name": "gen-prompts", "then": "document.querySelectorAll('.modal h3 .seg button')[1]?.click(); 'ok'", "wait": 1100 },
+  { "name": "gen-tour", "then": "(() => { document.querySelector('.modal .modal-x')?.click(); const cbs = [...document.querySelectorAll('.jcheck input')]; for (let i = 1; i < cbs.length; i++) cbs[i].click(); return 'ok' })()", "full": true, "wait": 1200 }
+]

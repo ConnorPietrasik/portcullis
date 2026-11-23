@@ -15,12 +15,15 @@ import asyncio
 import base64
 import glob
 import json
+import mimetypes
 import os
 import re
 import secrets
 import subprocess
+import tempfile
 import threading
 import time
+import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -29,6 +32,7 @@ import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.background import BackgroundTask
 
 import gen_jobs
 import gpu_pool
@@ -2051,6 +2055,61 @@ GEN_CANCEL_POLL_S = 2.0  # how fast an in-flight radiance request notices a canc
 GEN_SLOT_LOAD_WAIT_S = 600.0  # the fleet's largest scheduler.load-timeout (gpu-gentp2)
 GEN_ENHANCE_TIMEOUT_S = GEN_SLOT_LOAD_WAIT_S + 300.0
 GEN_VIDEO_SUBMIT_TIMEOUT_S = GEN_SLOT_LOAD_WAIT_S + 300.0
+# The batch endpoints (remove/archive) take the whole selection: no id or
+# size cap. The admin double gate is the authorization, one operator is the
+# audience, and the selection itself comes from the windowed gallery (a page
+# of history + the in-flight set), so a limit would only make a big explicit
+# selection fail or silently shrink.
+
+
+GEN_ZIP_PREFIX = "panel-gen-zip-"  # the temp archive's name (the sweep's key)
+_GEN_ZIP_INFLIGHT: set[str] = set()  # names being written/served right now
+_GEN_ZIP_SWEEP_GRACE_S = 300.0  # never reap a file this young (mkstemp→add span)
+_GEN_ZIP_SWEEP_MAX_AGE_S = 86400.0  # even an in-flight name: a day of streaming is over
+
+
+def _gen_unlink(path: str) -> None:
+    """Post-response cleanup of the temp archive (FileResponse background)."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _gen_archive_done(tmp: str) -> None:
+    """Post-response cleanup: unlink the temp archive and release its hold."""
+    _GEN_ZIP_INFLIGHT.discard(os.path.basename(tmp))  # the set holds names, not paths
+    _gen_unlink(tmp)
+
+
+def _gen_sweep_zips() -> list[str]:
+    """Reap the temp archives whose response never finished (a hard kill) or
+    whose write died without cleanup — the age GC skips non-job-* names on
+    purpose, so the leftovers get their own pass. Only the archive endpoint
+    writes a GEN_ZIP_PREFIX name, and it holds every live one in
+    _GEN_ZIP_INFLIGHT until the response is done: an unreferenced file past
+    the grace is a leak, a referenced one past the hard cap is a stuck
+    response (a truncated download beats a permanent file). The grace and the
+    cap keep this sweep from racing the endpoint: that mkstemp→add span and
+    this listdir run in different threads and share no lock."""
+    now = time.time()
+    removed: list[str] = []
+    try:
+        entries = list(GEN_ARTIFACT_DIR.iterdir())
+    except OSError:
+        return removed
+    for p in entries:
+        if not p.name.startswith(GEN_ZIP_PREFIX):
+            continue
+        limit = _GEN_ZIP_SWEEP_GRACE_S if p.name not in _GEN_ZIP_INFLIGHT else _GEN_ZIP_SWEEP_MAX_AGE_S
+        try:
+            if now - p.stat().st_mtime < limit:
+                continue
+            p.unlink()
+            removed.append(p.name)
+        except OSError:
+            continue
+    return removed
 
 _gen_http: Optional[httpx.AsyncClient] = None  # created in lifespan
 _gen_tasks: dict[str, asyncio.Task] = {}  # job id → in-flight task
@@ -2880,6 +2939,11 @@ async def _gen_engine_loop() -> None:
                 removed = await asyncio.to_thread(gen_jobs.gc_old_artifacts, GEN_ARTIFACT_DIR, days, keep)
                 if removed:
                     _audit(None, "gen-gc", [f"{len(removed)} file(s) older than {days}d"], 0, " ".join(removed)[:200])
+                # The archive temps' own pass — the age GC above skips their
+                # names on purpose (see _gen_sweep_zips).
+                removed_zips = await asyncio.to_thread(_gen_sweep_zips)
+                if removed_zips:
+                    _audit(None, "gen-zip-sweep", removed_zips, 0, " ".join(removed_zips)[:200])
             except Exception as e:  # noqa: BLE001
                 print(f"gen artifact GC failed: {type(e).__name__}: {e}", flush=True)
 
@@ -2926,18 +2990,35 @@ def _gen_validate_params(kind: str, params: dict[str, Any]) -> dict[str, Any]:
 
 @app.get("/api/gen")
 def gen_overview(_admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
+    """The tab's small half: slots, settings, counts and the in-flight set.
+    Never the whole store — the history is a windowed /api/gen/jobs (the tab
+    polls from phones on metered lines, so the page, not the store, is the
+    unit of transfer). The in-flight set is the queue (whatever the operator
+    queued — the create path is deliberately uncapped) plus the in-flight
+    jobs, which the admission caps bound (GEN_CAP per slot + GEN_ENHANCE_CAP
+    system-wide); the store cap (MAX_JOBS_KEPT) bounds the whole. The gallery
+    merges it into whatever page it is showing, subject to that page's
+    filter/search."""
     w = _gen_world()
     settings = gen_jobs.load_settings()
-    queued = [w["jobs"][i] for i in w["store"]["order"] if i in w["jobs"] and w["jobs"][i]["state"] == gen_jobs.QUEUED]
-    recent = [w["jobs"][i] for i in reversed(w["store"]["order"]) if i in w["jobs"]][:30]
+    jobs = [w["jobs"][i] for i in w["store"]["order"] if i in w["jobs"]]
+    active = [j for j in jobs if j["state"] not in gen_jobs.TERMINAL_STATES]
     return {
         "slots": [{**row, "status": w["status"][row["name"]]} for row in sorted(w["slots"].values(), key=lambda r: r["name"])],
         # the whole fleet (the settings' enhance-target picks an instance +
         # one of its llm models from here)
         "instances": [row for row in w["instances"].values() if row["llms"]],
         "enhance_target": w["enhance_target"],
-        "queue": queued,
-        "jobs": recent,
+        "active": active,
+        # whole-store counts (the gallery's filter tabs) — counting is cheap,
+        # the records are not what the wire needs
+        "counts": {
+            "all": len(jobs),
+            "active": len(active),
+            "image": sum(1 for j in jobs if j["kind"] == "image"),
+            "video": sum(1 for j in jobs if j["kind"] == "video"),
+            "failed": sum(1 for j in jobs if j["state"] in (gen_jobs.FAILED, gen_jobs.CANCELED)),
+        },
         "models": gen_jobs.known_models(w["slots"]),
         "purposes": settings["purposes"],
         "enhance": settings["enhance"],
@@ -2974,12 +3055,84 @@ def gen_job_create(body: GenJobBody, _admin: Optional[str] = Depends(require_adm
     return job
 
 
+GEN_JOB_FILTERS = ("all", "active", "image", "video", "failed")
+
+
+def _gen_job_seq(jid: str) -> Optional[int]:
+    """The store sequence a job id carries (job-000123 → 123) — the page
+    cursor: ids are minted in order, so seq order IS history order. None for
+    a non-minted id (a hand-edited store file): the page skips it — it has no
+    place on the seq line the cursor walks — the single-job GET still reaches
+    it by name."""
+    try:
+        return int(jid.rsplit("-", 1)[1])
+    except ValueError:
+        return None
+
+
 @app.get("/api/gen/jobs")
-def gen_jobs_list(limit: int = 50, _admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
-    store = gen_jobs.load_jobs()
+def gen_jobs_list(
+    limit: int = 50,
+    cursor: int = 0,
+    q: str = "",
+    filter: str = "all",  # noqa: A002 — query param named after the UI's filter tabs
+    _admin: Optional[str] = Depends(require_admin),
+) -> dict[str, Any]:
+    """One window of the job history, newest first — the gallery's page.
+    `cursor` resumes BEFORE the record with that seq (the previous page's
+    `next`); `q` is a case-insensitive substring over id/model/prompt/
+    enhanced prompt; `filter` is one of GEN_JOB_FILTERS (active = anything
+    not terminal, failed includes canceled — the UI's tab semantics). The
+    scan is over the capped store (MAX_JOBS_KEPT), so even a full-history
+    search is a few hundred dict checks."""
     limit = max(1, min(limit, 200))
-    out = [store["jobs"][i] for i in reversed(store["order"]) if i in store["jobs"]][:limit]
-    return {"jobs": out}
+    cursor = max(0, cursor)
+    if filter not in GEN_JOB_FILTERS:
+        raise HTTPException(400, f"filter: one of {', '.join(GEN_JOB_FILTERS)}")
+    needle = q.strip().lower()[:200]
+    store = gen_jobs.load_jobs()
+
+    def matches(j: dict[str, Any]) -> bool:
+        if filter == "active" and j["state"] in gen_jobs.TERMINAL_STATES:
+            return False
+        if filter == "image" and j["kind"] != "image":
+            return False
+        if filter == "video" and j["kind"] != "video":
+            return False
+        if filter == "failed" and j["state"] not in (gen_jobs.FAILED, gen_jobs.CANCELED):
+            return False
+        if needle:
+            hay = f"{j['id']} {j['model']} {j['prompt']} {j.get('enhanced_prompt') or ''}".lower()
+            if needle not in hay:
+                return False
+        return True
+
+    out: list[dict[str, Any]] = []
+    last: Optional[int] = None  # seq of the last job on this page
+    for jid in reversed(store["order"]):
+        j = store["jobs"].get(jid)
+        if not j:
+            continue
+        s = _gen_job_seq(jid)
+        if s is None:
+            continue
+        if cursor > 0 and s >= cursor:
+            continue
+        if not matches(j):
+            continue
+        if len(out) == limit:
+            # A full page with an older match: the next cursor is the seq of
+            # the LAST job returned — resume BEFORE it: the `>=` skip then
+            # drops exactly this page's records (the cursor names one of
+            # them), so the next page starts at the older match — no dupes,
+            # no gaps. (A cursor naming a match BEYOND the page would skip
+            # that match next pass and it would never surface.) The scan
+            # stops at a full page — there is no match between the cursor
+            # and the page's end to look for.
+            return {"jobs": out, "next": last}
+        out.append(j)
+        last = s
+    return {"jobs": out, "next": None}
 
 
 @app.get("/api/gen/jobs/{jid}")
@@ -2992,6 +3145,15 @@ def gen_job_get(jid: str, _admin: Optional[str] = Depends(require_admin)) -> dic
 
 @app.delete("/api/gen/jobs/{jid}")
 def gen_job_delete(jid: str, _admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
+    return {"ok": True, "action": _gen_remove(jid, _admin)}
+
+
+def _gen_remove(jid: str, user: Optional[str]) -> str:
+    """One job, the DELETE semantics in one place (this endpoint and the batch
+    one share it): cancellable → marked canceled (the record stays as
+    history), terminal → record + artifact files gone. Returns "canceled",
+    "deleted" or "done" (it finished while the cancel was in flight); 404
+    when the job is unknown."""
     job = gen_jobs.get_job(jid)
     if not job:
         raise HTTPException(404, "no such job")
@@ -3016,15 +3178,98 @@ def gen_job_delete(jid: str, _admin: Optional[str] = Depends(require_admin)) -> 
         try:
             gen_jobs.update_job(jid, _m)
         except RuntimeError:
-            return {"ok": True}  # went terminal while canceling — nothing to cancel
-        _audit(_admin, "gen-job-cancel", [jid], 0)
-    else:
-        # Terminal: delete the record + its artifact files (the GC would take
-        # them by age anyway; this is the "clear from history" path).
-        gen_jobs.remove_job(jid)
-        _gen_delete_artifacts(job)
-        _audit(_admin, "gen-job-delete", [jid], 0)
-    return {"ok": True}
+            return "done"  # went terminal while canceling — nothing to cancel
+        _audit(user, "gen-job-cancel", [jid], 0)
+        return "canceled"
+    # Terminal: delete the record + its artifact files (the GC would take
+    # them by age anyway; this is the "clear from history" path).
+    gen_jobs.remove_job(jid)
+    _gen_delete_artifacts(job)
+    _audit(user, "gen-job-delete", [jid], 0)
+    return "deleted"
+
+
+class GenBatchBody(BaseModel):
+    ids: list[str] = []
+
+
+@app.post("/api/gen/jobs/remove")
+def gen_jobs_remove(body: GenBatchBody, _admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
+    """Batch cancel/delete — every id through the same _gen_remove path as the
+    single endpoint (in flight or queued → cancel, terminal → record + files).
+    No cap: the selection is what the operator picked, and the store bounds
+    it. Every id gets an answer — an unknown one fails per id, never aborting
+    the rest."""
+    ids = list(dict.fromkeys(body.ids))
+    if not ids:
+        raise HTTPException(400, "no job ids")
+    results = []
+    for jid in ids:
+        try:
+            results.append({"id": jid, "ok": True, "action": _gen_remove(jid, _admin)})
+        except HTTPException as e:
+            results.append({"id": jid, "ok": False, "error": str(e.detail)})
+    return {"results": results}
+
+
+@app.post("/api/gen/jobs/archive")
+def gen_jobs_archive(body: GenBatchBody, _admin: Optional[str] = Depends(require_admin)) -> FileResponse:
+    """Batch download: the selected jobs' artifacts in one ZIP (stored, not
+    deflated — PNG/MP4 are already compressed) plus a prompts.txt manifest, so
+    a folder of pictures carries the prompts that made it. No size cap (the
+    selection is explicit; the store bounds it); files gone from disk (age
+    GC, a delete) are skipped; nothing to pack is a 404."""
+    ids = list(dict.fromkeys(body.ids))
+    if not ids:
+        raise HTTPException(400, "no job ids")
+    store = gen_jobs.load_jobs()
+    rows = [store["jobs"][i] for i in ids if i in store["jobs"]]
+    files: list[tuple[dict[str, Any], Path]] = []
+    for job in rows:
+        url = (job.get("artifact") or {}).get("url") or ""
+        if not url:
+            continue
+        path = GEN_ARTIFACT_DIR / url.rsplit("/", 1)[-1]
+        if path.is_file():
+            files.append((job, path))
+    if not files:
+        raise HTTPException(404, "no artifacts to download (nothing selected has one on disk)")
+    # The temp ZIP lands in the artifact dir, not /tmp (which may be a RAM
+    # disk): the age GC skips it (non-job-* name) and the nginx allowlist can
+    # never serve it (job-* names only). The BackgroundTask unlinks it after
+    # the response; what a hard kill leaves behind, the engine's zip sweep
+    # takes (the in-flight hold keeps a live file out of that reach).
+    GEN_ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=GEN_ZIP_PREFIX, suffix=".zip", dir=GEN_ARTIFACT_DIR)
+    os.close(fd)
+    _GEN_ZIP_INFLIGHT.add(os.path.basename(tmp))
+    try:
+        with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_STORED) as zf:
+            for _j, path in files:
+                zf.write(path, arcname=path.name)
+            # the manifest covers exactly what is in the zip — a file the age
+            # GC took is not packed, so it is not listed
+            manifest = []
+            for job, _p in files:
+                when = time.strftime("%Y-%m-%d %H:%M", time.localtime(job["created_at"]))
+                manifest.append(
+                    f"[{job['id']}] {job['model']} ({job['kind']}) — {when}\n"
+                    f"  prompt:   {job['prompt']}\n"
+                    + (f"  enhanced: {job['enhanced_prompt']}\n" if job.get("enhanced_prompt") else "")
+                    + f"  params:   {json.dumps(job.get('params') or {}, sort_keys=True)}\n"
+                )
+            zf.writestr("prompts.txt", "\n".join(manifest))
+    except OSError as e:
+        _GEN_ZIP_INFLIGHT.discard(os.path.basename(tmp))
+        _gen_unlink(tmp)
+        raise HTTPException(500, f"archive failed: {type(e).__name__}: {e}") from e
+    _audit(_admin, "gen-archive", [f"{len(files)} file(s)"], 0)
+    return FileResponse(
+        tmp,
+        media_type="application/zip",
+        filename=f"panel-gen-{time.strftime('%Y%m%d-%H%M%S')}.zip",
+        background=BackgroundTask(_gen_archive_done, tmp),
+    )
 
 
 @app.get("/api/gen/jobs/{jid}/content")
@@ -3041,6 +3286,28 @@ def gen_job_content(jid: str, _admin: Optional[str] = Depends(require_admin)):
     if not path.is_file():
         raise HTTPException(410, "artifact removed (GC)")
     return FileResponse(path, media_type=job["artifact"].get("mime") or "application/octet-stream")
+
+
+# Dev loop only: panel-web's nginx serves /gen/* from the ro bind in
+# production (invariant: artifacts are served only through that allowlisted
+# location), but the vite dev proxy has no nginx to lean on — this route is
+# its stand-in, with the same job-* name allowlist. It can never exist on the
+# server: PANEL_DEV is local development only, and the systemd unit never
+# sets it.
+_GEN_ARTIFACT_NAME_RE = re.compile(r"^job-[0-9]+(-thumb)?\.(png|jpg|jpeg|webp|webm|mp4)$")
+
+
+if DEV_MODE:
+
+    @app.get("/gen/{name}")
+    def gen_artifact_dev(name: str, _admin: Optional[str] = Depends(require_admin)):
+        if not _GEN_ARTIFACT_NAME_RE.match(name):
+            raise HTTPException(404, "no such artifact")
+        path = GEN_ARTIFACT_DIR / name
+        if not path.is_file():
+            raise HTTPException(404, "no such artifact")
+        mime, _ = mimetypes.guess_type(name)
+        return FileResponse(path, media_type=mime or "application/octet-stream")
 
 
 class GenSettingsBody(BaseModel):

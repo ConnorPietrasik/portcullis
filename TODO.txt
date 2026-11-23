@@ -1,5 +1,4 @@
 Add image / video edit stuff
-Do a total update to the Gen UI. "Prompt" shouldn't clear on submit (multiple of the same prompt are perfectly valid), the "jobs" thing needs checkboxes + batch actions (download, delete), enhanced jobs should save their enhanced prompt so that they can be seen and canceled if it sucks / reviewed to improved the enhance system prompt, the settings part is just ugly (scattered horizonatally without even being consistent about label positioning), the "slots" section is bloat considering the GPUs tab is better and one click away, etc.
 Add servitor image/video integration
 - `/machine/gen/*` route alias over the same handlers + bearer gate
   (`compare_digest`, not dev-bypassed) — no handler rework.

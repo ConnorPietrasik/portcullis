@@ -1,0 +1,6 @@
+[
+  { "name": "actions", "tab": "Actions", "wait": 2600 },
+  { "name": "actions-run", "then": "(() => { const r=[...document.querySelectorAll('.arow')].find(x=>x.querySelector('.an')?.textContent.trim()==='gpu-fleet'); r?.querySelector('.actrls button:last-child')?.click(); return 'ok' })()", "wait": 1600 },
+  { "name": "actions-confirm", "then": "(() => { const r=[...document.querySelectorAll('.arow')].find(x=>x.querySelector('.an')?.textContent.trim()==='prune-docker'); r?.querySelector('.actrls button:last-child')?.click(); return 'ok' })()", "wait": 1200 },
+  { "name": "actions-args", "then": "(() => { document.querySelector('.modal .modal-x')?.click(); const r=[...document.querySelectorAll('.arow')].find(x=>x.querySelector('.an')?.textContent.trim()==='gpu-stop'); const s=r?.querySelector('.aarg'); if (s) { s.value='gpu-gentp2'; s.dispatchEvent(new Event('change',{bubbles:true})); } return 'ok' })()", "wait": 1200 }
+]

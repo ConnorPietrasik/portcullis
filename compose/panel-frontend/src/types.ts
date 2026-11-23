@@ -131,6 +131,10 @@ export interface StackService {
 export interface ActionInfo {
   name: string
   summary: string
+  /** the panel-do registry's display section (gpu · containers · services ·
+   *  updates · servitor) — a stale binary reports none, so the view falls
+   *  back to deriving it from the name */
+  group?: string
   arity: number
   patterns: string[]
   timeout_sec: number
@@ -333,15 +337,34 @@ export interface GenModelInfo {
   slots: string[]
 }
 
+export interface GenCounts {
+  all: number
+  active: number
+  image: number
+  video: number
+  failed: number
+}
+
+/** one page of the job history (GET /api/gen/jobs) */
+export interface GenPage {
+  jobs: GenJob[]
+  /** seq to pass as `cursor` for the next page — null at the end */
+  next: number | null
+}
+
 export interface GenOverview {
   slots: GenSlot[]
   /** fleet instances with llm entries (the enhance-target candidates) */
   instances: GenInstance[]
   enhance_target: GenEnhanceTarget
-  /** queued jobs, oldest first */
-  queue: GenJob[]
-  /** recent jobs, newest first (in-flight included) */
-  jobs: GenJob[]
+  /** the in-flight set (anything not terminal) — the queue (uncapped at
+   *  creation, whatever the operator queued) plus the capped in-flight;
+   *  the store cap MAX_JOBS_KEPT bounds the whole. Merged into the gallery
+   *  page through its current filter/search, so a long render keeps its
+   *  progress bar wherever you are on a tab that shows it */
+  active: GenJob[]
+  /** whole-store counts (the gallery's filter tabs) */
+  counts: GenCounts
   /** model name → info (the address space: purposes must point here) */
   models: Record<string, GenModelInfo>
   purposes: Record<string, string>

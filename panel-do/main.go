@@ -40,6 +40,10 @@ type RunFunc func(ctx context.Context, args []string, logf func(string, ...any))
 
 type Action struct {
 	Summary string
+	// Group is the Actions view's section ("gpu", "containers", …). Pure
+	// display metadata — it gates nothing, and the registry stays the only
+	// whitelist there is.
+	Group   string
 	Args    []*regexp.Regexp // one pattern per required arg; exact arity enforced
 	Timeout time.Duration
 	Confirm bool // surfaced to the UI ("are you sure" dialogs)
@@ -144,6 +148,7 @@ func usageExit(code int) {
 type actionInfo struct {
 	Name       string   `json:"name"`
 	Summary    string   `json:"summary"`
+	Group      string   `json:"group"`
 	Arity      int      `json:"arity"`
 	Patterns   []string `json:"patterns"`
 	TimeoutSec int      `json:"timeout_sec"`
@@ -158,7 +163,7 @@ func printRegistryJSON() {
 		for _, p := range a.Args {
 			pats = append(pats, p.String())
 		}
-		out = append(out, actionInfo{n, a.Summary, len(a.Args), pats, int(a.Timeout.Seconds()), a.Confirm})
+		out = append(out, actionInfo{n, a.Summary, a.Group, len(a.Args), pats, int(a.Timeout.Seconds()), a.Confirm})
 	}
 	json.NewEncoder(os.Stdout).Encode(out) //nolint:errcheck — stdout only
 }
@@ -1338,6 +1343,7 @@ func servitorDoctor(ctx context.Context, args []string, logf func(string, ...any
 var registry = map[string]Action{
 	"restart-service": {
 		Summary: "Restart a systemd service",
+		Group:   "services",
 		Args:    []*regexp.Regexp{unitNameRe},
 		Timeout: 30 * time.Second,
 		Confirm: true,
@@ -1345,6 +1351,7 @@ var registry = map[string]Action{
 	},
 	"prune-docker": {
 		Summary: "Prune dangling images + build cache (never containers or networks)",
+		Group:   "containers",
 		Args:    nil,
 		Timeout: 5 * time.Minute,
 		Confirm: true,
@@ -1352,6 +1359,7 @@ var registry = map[string]Action{
 	},
 	"list-containers": {
 		Summary: "List all containers (JSON Lines on stdout)",
+		Group:   "containers",
 		Args:    nil,
 		Timeout: 15 * time.Second,
 		Confirm: false,
@@ -1359,6 +1367,7 @@ var registry = map[string]Action{
 	},
 	"list-services": {
 		Summary: "Deployed compose services with the panel.manage label (JSON on stdout)",
+		Group:   "services",
 		Args:    nil,
 		Timeout: 15 * time.Second,
 		Confirm: false,
@@ -1366,6 +1375,7 @@ var registry = map[string]Action{
 	},
 	"start-service": {
 		Summary: "Create + start a deployed compose service (revives a pruned one)",
+		Group:   "services",
 		Args:    []*regexp.Regexp{serviceNameRe},
 		Timeout: 5 * time.Minute, // detached start is seconds; 5m only covers a missing-image pull
 		Confirm: true,
@@ -1373,6 +1383,7 @@ var registry = map[string]Action{
 	},
 	"edge-ips": {
 		Summary: "edge-network endpoints: containerID → {Name, IPv4Address} (JSON on stdout)",
+		Group:   "containers",
 		Args:    nil,
 		Timeout: 15 * time.Second,
 		Confirm: false,
@@ -1380,6 +1391,7 @@ var registry = map[string]Action{
 	},
 	"start-container": {
 		Summary: "Start a stopped container (12-hex ID)",
+		Group:   "containers",
 		Args:    []*regexp.Regexp{containerIDRe},
 		Timeout: 60 * time.Second,
 		Confirm: false,
@@ -1387,6 +1399,7 @@ var registry = map[string]Action{
 	},
 	"stop-container": {
 		Summary: "Stop a running container (12-hex ID)",
+		Group:   "containers",
 		Args:    []*regexp.Regexp{containerIDRe},
 		Timeout: 60 * time.Second,
 		Confirm: true,
@@ -1394,6 +1407,7 @@ var registry = map[string]Action{
 	},
 	"restart-container": {
 		Summary: "Restart a container (12-hex ID)",
+		Group:   "containers",
 		Args:    []*regexp.Regexp{containerIDRe},
 		Timeout: 90 * time.Second,
 		Confirm: true,
@@ -1401,6 +1415,7 @@ var registry = map[string]Action{
 	},
 	"gpu-fleet": {
 		Summary: "Fleet instances + cards needed (JSON on stdout)",
+		Group:   "gpu",
 		Args:    nil,
 		Timeout: 20 * time.Second,
 		Confirm: false,
@@ -1408,6 +1423,7 @@ var registry = map[string]Action{
 	},
 	"gpu-live": {
 		Summary: "Live fleet containers: state + ROCR_VISIBLE_DEVICES holds (JSON on stdout)",
+		Group:   "gpu",
 		Args:    nil,
 		Timeout: 20 * time.Second,
 		Confirm: false,
@@ -1415,6 +1431,7 @@ var registry = map[string]Action{
 	},
 	"gpu-apply": {
 		Summary: "(Re)create + start a gpu-* instance on the override's GPU set",
+		Group:   "gpu",
 		Args:    []*regexp.Regexp{gpuServiceRe},
 		Timeout: 5 * time.Minute, // detached start is seconds; 5m covers a missing-image pull
 		Confirm: true,
@@ -1422,6 +1439,7 @@ var registry = map[string]Action{
 	},
 	"gpu-stop": {
 		Summary: "Stop a gpu-* instance (container kept, cards released)",
+		Group:   "gpu",
 		Args:    []*regexp.Regexp{gpuServiceRe},
 		Timeout: 90 * time.Second,
 		Confirm: true,
@@ -1429,6 +1447,7 @@ var registry = map[string]Action{
 	},
 	"update-run": {
 		Summary: "Launch the gated stack update (detached; skips when the clone has uncommitted changes)",
+		Group:   "updates",
 		Args:    nil,
 		Timeout: 5 * time.Minute,
 		Confirm: true,
@@ -1436,6 +1455,7 @@ var registry = map[string]Action{
 	},
 	"update-run-force": {
 		Summary: "Launch the gated stack update even with uncommitted clone changes (detached)",
+		Group:   "updates",
 		Args:    nil,
 		Timeout: 5 * time.Minute,
 		Confirm: true,
@@ -1443,6 +1463,7 @@ var registry = map[string]Action{
 	},
 	"update-report": {
 		Summary: "Last update's before→after: state + live images + version labels + log tail (JSON)",
+		Group:   "updates",
 		Args:    nil,
 		Timeout: 30 * time.Second,
 		Confirm: false,
@@ -1450,6 +1471,7 @@ var registry = map[string]Action{
 	},
 	"update-preview": {
 		Summary: "What the next update would apply: clone git facts + line files (JSON)",
+		Group:   "updates",
 		Args:    nil,
 		Timeout: 30 * time.Second,
 		Confirm: false,
@@ -1457,6 +1479,7 @@ var registry = map[string]Action{
 	},
 	"update-rollback": {
 		Summary: "Full rollback to the last update's snapshot (detached; re-gated)",
+		Group:   "updates",
 		Args:    nil,
 		Timeout: 5 * time.Minute,
 		Confirm: true,
@@ -1464,6 +1487,7 @@ var registry = map[string]Action{
 	},
 	"autoupdate-toggle": {
 		Summary: "Enable (on) or disable (off) the daily auto-update timer",
+		Group:   "updates",
 		Args:    []*regexp.Regexp{regexp.MustCompile(`^(on|off)$`)},
 		Timeout: 30 * time.Second,
 		Confirm: true,
@@ -1471,6 +1495,7 @@ var registry = map[string]Action{
 	},
 	"servitor-status": {
 		Summary: "Servitor VM state + guest /healthz probe (read-only)",
+		Group:   "servitor",
 		Args:    nil,
 		Timeout: 30 * time.Second,
 		Confirm: false,
@@ -1478,6 +1503,7 @@ var registry = map[string]Action{
 	},
 	"servitor-vm-restart": {
 		Summary: "Reboot the servitor VM (planned; boot reconciliation handles the unclean path)",
+		Group:   "servitor",
 		Args:    nil,
 		Timeout: 60 * time.Second,
 		Confirm: true,
@@ -1485,6 +1511,7 @@ var registry = map[string]Action{
 	},
 	"servitor-sync": {
 		Summary: "Push the host checkout (config/lib/app + key slice) into the servitor VM; never blocks a run",
+		Group:   "servitor",
 		Args:    nil,
 		// 10 min: the post-deploy doctor now ends with one live run that
 		// makes the agent search the web (a real model call; ~1–5 min,
@@ -1499,6 +1526,7 @@ var registry = map[string]Action{
 	},
 	"servitor-doctor": {
 		Summary: "Run the servitor deploy doctor (guest certification + firewall probes + live prompt + live search)",
+		Group:   "servitor",
 		Args:    nil,
 		// 10 min: the live run (one prompt that searches the web; 300 s
 		// budget) is a real model call; the static checks are seconds.

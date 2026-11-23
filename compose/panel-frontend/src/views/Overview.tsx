@@ -657,7 +657,7 @@ function TileLoad({
           // the tick at 1.0 shows where that line is instead of pretending.
           const frac = cores > 0 && v != null ? v / cores : null
           return (
-            <span className="bar" key={k} title={`load ${k}: ${num(v, 2)}${cores ? ` = ${num(frac, 2)} per thread` : ''}`}>
+            <span className="lbar" key={k} title={`load ${k}: ${num(v, 2)}${cores ? ` = ${num(frac, 2)} per thread` : ''}`}>
               <em>{k}</em>
               <Meter pct={frac} tone={toneOf(frac, T.loadPerCore.warn, T.loadPerCore.crit)} ticks={[1]} />
             </span>

@@ -20,7 +20,9 @@ import json
 import random
 import re
 import sys
+import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOST = "127.0.0.1"
@@ -90,30 +92,33 @@ INSTANCES = [
 
 # The action registry, verbatim from panel-do/main.go (sorted, like --list).
 ACTIONS = [
-    ("autoupdate-toggle", "Enable (on) or disable (off) the daily auto-update timer", [r"^(on|off)$"], 30, True),
-    ("edge-ips", "edge-network endpoints: containerID → {Name, IPv4Address} (JSON on stdout)", [], 15, False),
-    ("gpu-apply", "(Re)create + start a gpu-* instance on the override's GPU set", [r"^gpu-[a-z0-9][a-z0-9-]{0,62}$"], 300, True),
-    ("gpu-fleet", "Fleet instances + cards needed (JSON on stdout)", [], 20, False),
-    ("gpu-live", "Live fleet containers: state + ROCR_VISIBLE_DEVICES holds (JSON on stdout)", [], 20, False),
-    ("gpu-stop", "Stop a gpu-* instance (container kept, cards released)", [r"^gpu-[a-z0-9][a-z0-9-]{0,62}$"], 90, True),
-    ("list-containers", "List all containers (JSON Lines on stdout)", [], 15, False),
-    ("list-services", "Deployed compose services with the panel.manage label (JSON on stdout)", [], 15, False),
-    ("prune-docker", "Prune dangling images + build cache (never containers or networks)", [], 300, True),
-    ("restart-container", "Restart a container (12-hex ID)", [r"^[0-9a-f]{12}$"], 90, True),
-    ("restart-service", "Restart a systemd service", [r"^[a-zA-Z0-9][a-zA-Z0-9._@-]*\.service$"], 30, True),
-    ("servitor-doctor", "Run the servitor deploy doctor (guest certification + firewall probes + live prompt + live search)", [], 600, False),
-    ("servitor-status", "Servitor VM state + guest /healthz probe (read-only)", [], 30, False),
-    ("servitor-sync", "Push the host checkout (config/lib/app + key slice) into the servitor VM; never blocks a run", [], 600, True),
-    ("servitor-vm-restart", "Reboot the servitor VM (planned; boot reconciliation handles the unclean path)", [], 60, True),
-    ("start-container", "Start a stopped container (12-hex ID)", [r"^[0-9a-f]{12}$"], 60, False),
-    ("start-service", "Create + start a deployed compose service (revives a pruned one)", [r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$"], 300, True),
-    ("stop-container", "Stop a running container (12-hex ID)", [r"^[0-9a-f]{12}$"], 60, True),
-    ("update-preview", "What the next update would apply: clone git facts + line files (JSON)", [], 30, False),
-    ("update-report", "Last update's before→after: state + live images + version labels + log tail (JSON)", [], 30, False),
-    ("update-rollback", "Full rollback to the last update's snapshot (detached; re-gated)", [], 300, True),
-    ("update-run", "Launch the gated stack update (detached; skips when the clone has uncommitted changes)", [], 300, True),
-    ("update-run-force", "Launch the gated stack update even with uncommitted clone changes (detached)", [], 300, True),
+    ("autoupdate-toggle", "Enable (on) or disable (off) the daily auto-update timer", [r"^(on|off)$"], 30, True, "updates"),
+    ("edge-ips", "edge-network endpoints: containerID → {Name, IPv4Address} (JSON on stdout)", [], 15, False, "containers"),
+    ("gpu-apply", "(Re)create + start a gpu-* instance on the override's GPU set", [r"^gpu-[a-z0-9][a-z0-9-]{0,62}$"], 300, True, "gpu"),
+    ("gpu-fleet", "Fleet instances + cards needed (JSON on stdout)", [], 20, False, "gpu"),
+    ("gpu-live", "Live fleet containers: state + ROCR_VISIBLE_DEVICES holds (JSON on stdout)", [], 20, False, "gpu"),
+    ("gpu-stop", "Stop a gpu-* instance (container kept, cards released)", [r"^gpu-[a-z0-9][a-z0-9-]{0,62}$"], 90, True, "gpu"),
+    ("list-containers", "List all containers (JSON Lines on stdout)", [], 15, False, "containers"),
+    ("list-services", "Deployed compose services with the panel.manage label (JSON on stdout)", [], 15, False, "services"),
+    ("prune-docker", "Prune dangling images + build cache (never containers or networks)", [], 300, True, "containers"),
+    ("restart-container", "Restart a container (12-hex ID)", [r"^[0-9a-f]{12}$"], 90, True, "containers"),
+    ("restart-service", "Restart a systemd service", [r"^[a-zA-Z0-9][a-zA-Z0-9._@-]*\.service$"], 30, True, "services"),
+    ("servitor-doctor", "Run the servitor deploy doctor (guest certification + firewall probes + live prompt + live search)", [], 600, False, "servitor"),
+    ("servitor-status", "Servitor VM state + guest /healthz probe (read-only)", [], 30, False, "servitor"),
+    ("servitor-sync", "Push the host checkout (config/lib/app + key slice) into the servitor VM; never blocks a run", [], 600, True, "servitor"),
+    ("servitor-vm-restart", "Reboot the servitor VM (planned; boot reconciliation handles the unclean path)", [], 60, True, "servitor"),
+    ("start-container", "Start a stopped container (12-hex ID)", [r"^[0-9a-f]{12}$"], 60, False, "containers"),
+    ("start-service", "Create + start a deployed compose service (revives a pruned one)", [r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$"], 300, True, "services"),
+    ("stop-container", "Stop a running container (12-hex ID)", [r"^[0-9a-f]{12}$"], 60, True, "containers"),
+    ("update-preview", "What the next update would apply: clone git facts + line files (JSON)", [], 30, False, "updates"),
+    ("update-report", "Last update's before→after: state + live images + version labels + log tail (JSON)", [], 30, False, "updates"),
+    ("update-rollback", "Full rollback to the last update's snapshot (detached; re-gated)", [], 300, True, "updates"),
+    ("update-run", "Launch the gated stack update (detached; skips when the clone has uncommitted changes)", [], 300, True, "updates"),
+    ("update-run-force", "Launch the gated stack update even with uncommitted clone changes (detached)", [], 300, True, "updates"),
 ]
+
+# (name, summary, patterns, timeout, confirm, group) — group is the Actions
+# view's section (panel-do's registry carries it; the view groups on it).
 
 # 7.3.5-2-cachyos on the real box; repo head of the last update (invented)
 REPO_HEAD = "9c41f7a2d0e85b3c6a1f9d2e4b7c8a0d1e3f5b7d"
@@ -310,8 +315,8 @@ def stack_services() -> dict:
 
 def actions() -> dict:
     return {"actions": [
-        {"name": n, "summary": s, "arity": len(pats), "patterns": pats, "timeout_sec": t, "confirm": c}
-        for n, s, pats, t, c in ACTIONS
+        {"name": n, "summary": s, "group": g, "arity": len(pats), "patterns": pats, "timeout_sec": t, "confirm": c}
+        for n, s, pats, t, c, g in ACTIONS
     ]}
 
 
@@ -347,55 +352,618 @@ def llm_settings() -> dict:
     }
 
 
-def gen() -> dict:
-    ip = {"gpu-gentp1a": "172.18.0.7", "gpu-gentp1b": "172.18.0.8", "gpu-gentp2": "172.18.0.9", "gpu-writer": "172.18.0.6"}
+# ────────────────────── gen: jobs, queue, artifacts ──────────────────────
+# A job store with a small state machine: a queued job really does walk
+# enhancing → starting → running → completed while you watch the tab, and a
+# finished one owns a generated artifact (SVG — the mock has no encoder) served
+# under /gen/, the same URL space panel-web serves on the server.
+
+GEN_SETTINGS: dict = {
+    "purposes": {"image": "Krea2", "video": "Minimax-H3-T2V"},
+    "enhance": {
+        "enabled": True,
+        # the real prompt pair (compose/gpu-configs + the settings file); the
+        # rewrite the simulation produces is canned, not modelled
+        "prompts": {
+            "Minimax-H3-T2V": "Rewrite as a cinematic video prompt: name the subject, its motion and the environment; add camera move, lens and framing, lighting and time of day, and the soundscape (ambient + foley). Keep the user's intent and subject exactly; expand only detail the 24 fps timeline can show. Plain prose, no lists, no negative phrasing.",
+            # a model that was undeployed — the settings view must still show it
+            # (a PUT is all-or-nothing, so a stale key blocks the save until the
+            # operator copies it somewhere or drops it)
+            "SDXL-Turbo": "Expand into a photoreal image prompt: subject, lens, light, grade.",
+            "Krea2": "Expand into a photographic image prompt: subject and its material detail, framing and lens, lighting and time of day, colour grade, and one mood word. Keep the user's subject; add craft, not new objects. One sentence, no lists, no negative phrasing.",
+        },
+        "instance": "gpu-writer",
+        "model": "Uncensored",
+    },
+    "gc_days": 14,
+}
+
+VIDEO = "Minimax-H3-T2V"
+IMAGE = "Krea2"
+# model name → kind, the mock's deployment (the real gen_jobs' known_models)
+KNOWN_MODELS = {IMAGE: "image", VIDEO: "video"}
+# the real gen_jobs' shape regexes — submission is shape-checked the same way
+SIZE_RE = re.compile(r"^\d{2,4}x\d{2,4}$")
+MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,127}$")
+GEN_LOCK = threading.Lock()
+JOBS: dict[str, dict] = {}
+ORDER: list[str] = []
+ARTS: dict[str, tuple[bytes, str]] = {}  # filename → (bytes, mime)
+STAGE: dict[str, float] = {}  # job id → when it entered its current state
+SEQ = 0
+
+
+def art(seed: int, w: int, h: int) -> bytes:
+    """A generated picture: a deterministic landscape in a random palette. A
+    placeholder that renders in an <img> at any size, no binary assets here."""
+    r = random.Random(seed)
+    h1, h2 = r.randrange(360), (r.randrange(360) + r.randrange(40, 150)) % 360
+    sx, sy = r.randrange(int(w * 0.15), int(w * 0.85)), r.randrange(int(h * 0.12), int(h * 0.4))
+    sr = r.randrange(int(w * 0.04), int(w * 0.11))
+
+    def ridge(base: float, amp: float) -> str:
+        pts = [(0, h), (w, h)]
+        step = max(1, w // 9)
+        for x in range(w, -1, -step):
+            pts.append((x, int(h * (base + r.uniform(-amp, amp)))))
+        return " ".join(f"{x},{y}" for x, y in pts)
+
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">'
+        f'<defs><linearGradient id="s" x1="0" y1="0" x2="0" y2="1">'
+        f'<stop offset="0" stop-color="hsl({h1},62%,26%)"/><stop offset="1" stop-color="hsl({h2},58%,62%)"/>'
+        f'</linearGradient></defs>'
+        f'<rect width="{w}" height="{h}" fill="url(#s)"/>'
+        f'<circle cx="{sx}" cy="{sy}" r="{sr}" fill="hsl({(h1 + 40) % 360},88%,78%)" opacity="0.92"/>'
+        f'<polygon points="{ridge(0.62, 0.09)}" fill="hsl({h2},34%,24%)" opacity="0.75"/>'
+        f'<polygon points="{ridge(0.78, 0.06)}" fill="hsl({(h2 + 20) % 360},30%,14%)"/>'
+        f'<rect y="{int(h * 0.92)}" width="{w}" height="{int(h * 0.08)}" fill="hsl({h2},24%,9%)"/>'
+        f"</svg>"
+    ).encode()
+
+
+def _slug(prompt: str) -> str:
+    return prompt.split(",")[0][:44].lower()
+
+
+def mkjob(
+    model: str,
+    prompt: str,
+    *,
+    state: str,
+    ago: float,
+    enhanced: str | None = None,
+    params: dict | None = None,
+    slot: str | None = None,
+    error: str | None = None,
+    progress: int | None = None,
+    enhance: bool = True,
+    user: str = "piet",
+) -> dict:
+    global SEQ
+    SEQ += 1
+    jid = f"job-{SEQ:06d}"
+    kind = "video" if model == VIDEO else "image"
+    created = NOW - ago
+    started = created + 4
+    took = 480 if kind == "video" else 14
+    j = {
+        "id": jid,
+        "model": model,
+        "kind": kind,
+        "prompt": prompt,
+        "enhance": enhance,
+        "params": params if params is not None else {"size": "1344x768", "seed": 1234},
+        "user": user,
+        "state": state,
+        "slot": slot,
+        "enhanced_prompt": enhanced,
+        "progress": progress,
+        "error": error,
+        "artifact": None,
+        "radiance_video_id": f"video_{SEQ:08x}" if kind == "video" and state in ("running", "completed", "canceled") else None,
+        "created_at": created,
+        "started_at": started if state not in ("queued", "enhancing") else None,
+        "finished_at": started + took if state in ("completed", "failed", "canceled") else None,
+    }
+    if state == "completed":
+        j["artifact"] = put_artifact(j)
+    # a seeded live job keeps its wall-clock position — the progress bar
+    # continues where it is, it does not restart at zero on the first poll
+    if state in ("starting", "running") and j["started_at"] is not None:
+        STAGE[jid] = j["started_at"]
+    JOBS[jid] = j
+    ORDER.append(jid)
+    return j
+
+
+def mp4_bytes(seed: int) -> bytes:
+    """A short clip's worth of inert bytes (not decodable — the demo's <video>
+    takes the documented error→poster path, like an artifact the age GC took),
+    sized like a real render so the record matches the file."""
+    return random.Random(seed * 7919 + 1).randbytes(4_200_000 + seed % 3_000_000)
+
+
+def _pad_svg(svg: bytes, size: int) -> bytes:
+    """Grow a placeholder to its recorded size (a dot comment before the root
+    close) — the file is what the record says it is, so the download link and
+    the archive pack exactly the selection's MiB total."""
+    if len(svg) >= size:
+        return svg
+    return svg[:-6] + b"<!--" + b"." * (size - len(svg) - 7) + b"--></svg>"
+
+
+def put_artifact(j: dict) -> dict:
+    """Write the job's artifact (image, or MP4 + first-frame thumb) into the
+    served map — same names, same URLs the real panel uses. The bytes are
+    placeholders grown to their recorded size (see mp4_bytes / _pad_svg), so
+    the download link and the archive pack exactly what the record says."""
+    w, h = (int(x) for x in str(j["params"].get("size", "1024x1024")).split("x"))
+    seed = abs(hash(j["id"] + j["prompt"])) % 100000
+    if j["kind"] == "video":
+        blob = mp4_bytes(seed)
+        ARTS[f"{j['id']}.mp4"] = (blob, "video/mp4")
+        thumb = None
+        if "nothumb" not in j["prompt"]:  # one row keeps the no-thumbnail path visible
+            ARTS[f"{j['id']}-thumb.webp"] = (art(seed, w, h), "image/svg+xml")
+            thumb = f"/gen/{j['id']}-thumb.webp"
+        return {"url": f"/gen/{j['id']}.mp4", "mime": "video/mp4", "size": len(blob), "thumb": thumb}
+    svg = _pad_svg(art(seed, w, h), 380_000 + seed % 900_000)
+    ext, mime = (".jpg", "image/jpeg") if seed % 3 == 0 else (".png", "image/png")
+    ARTS[f"{j['id']}{ext}"] = (svg, "image/svg+xml")
+    return {"url": f"/gen/{j['id']}{ext}", "mime": mime, "size": len(svg), "thumb": None}
+
+
+FOX = "a red fox in fresh snow, morning light"
+PINE = "a red fox trotting through a snowy pine forest, snow crunching underfoot"
+
+
+def gen_models() -> dict:
+    """model → {kind, slots} — the real known_models for the mock's fleet."""
     return {
-        "slots": [
-            {
-                "name": "gpu-gentp1a", "display": "Gen TP1-A", "cards": 1,
-                "assigned": [5], "holding": [5], "running": True, "ip": ip["gpu-gentp1a"],
-                "models": {"Krea2": "image"}, "llm": None,
-                "status": {"state": "running", "stops": [], "blockers": [], "busy": False},
-            },
-            {
-                "name": "gpu-gentp1b", "display": "Gen TP1-B", "cards": 1,
-                "assigned": [6], "holding": [6], "running": True, "ip": ip["gpu-gentp1b"],
-                "models": {"Krea2": "image"}, "llm": None,
-                "status": {"state": "running", "stops": [], "blockers": [], "busy": False},
-            },
-            {
-                "name": "gpu-gentp2", "display": "Gen TP2", "cards": 2,
-                "assigned": [5, 6], "holding": None, "running": False, "ip": ip["gpu-gentp2"],
-                "models": {"Minimax-H3-T2V": "video"}, "llm": None,
-                "status": {"state": "down-idle-stops", "stops": ["gpu-gentp1a", "gpu-gentp1b"], "blockers": [], "busy": False},
-            },
-        ],
-        "instances": [
-            {"name": "gpu-writer", "display": "Writer", "cards": 1, "running": True, "ip": ip["gpu-writer"], "llms": ["Writer", "Uncensored"]},
-        ],
-        "enhance_target": {
-            "instance": "gpu-writer", "model": "Uncensored", "running": True,
-            "ip": ip["gpu-writer"], "ok": True, "reason": "",
-        },
-        "queue": [],
-        "jobs": [],
-        "models": {
-            "Krea2": {"kind": "image", "slots": ["gpu-gentp1a", "gpu-gentp1b"]},
-            "Minimax-H3-T2V": {"kind": "video", "slots": ["gpu-gentp2"]},
-        },
-        "purposes": {"image": "Krea2", "video": "Minimax-H3-T2V"},
-        "enhance": {
-            "enabled": True,
-            "prompts": {
-                # the video prompt is set (the settings card reads "1/2 set");
-                # the image one is empty (the composer shows "off (no prompt set)")
-                "Minimax-H3-T2V": "Rewrite as a cinematic video prompt: name the subject, its motion and the environment; add camera move, lens and framing, lighting and time of day, and the soundscape (ambient + foley). Keep the user's intent and subject exactly; expand only detail the 24 fps timeline can show. Plain prose, no lists, no negative phrasing.",
-            },
-            "instance": "gpu-writer",
-            "model": "Uncensored",
-        },
+        IMAGE: {"kind": "image", "slots": ["gpu-gentp1a", "gpu-gentp1b"]},
+        VIDEO: {"kind": "video", "slots": ["gpu-gentp2"]},
+    }
+
+
+def mock_resolve_model(model: str) -> tuple[str, str]:
+    """The real gen_jobs.resolve_model against the mock's two deployed models
+    — same purpose-key / exact-name semantics, same error shapes."""
+    model = (model or "").strip()
+    if model in ("image", "video"):
+        target = (GEN_SETTINGS.get("purposes") or {}).get(model)
+        if not target:
+            raise ValueError(f"purpose {model!r} is not configured (Gen settings)")
+        if target not in KNOWN_MODELS:
+            raise ValueError(f"purpose {model!r} points at unknown model {target!r}")
+        return target, KNOWN_MODELS[target]
+    if not model:
+        raise ValueError("model is required (a purpose key like 'image' or an exact model name)")
+    if model not in KNOWN_MODELS:
+        avail = ", ".join(sorted(KNOWN_MODELS))
+        raise ValueError(f"unknown model {model!r} (known: {avail})")
+    return model, KNOWN_MODELS[model]
+
+
+def mock_validate_params(kind: str, params: dict) -> dict:
+    """The real _gen_validate_params, shape-only: radiance stays the authority
+    on ranges (an out-of-range seconds lands in the job record, not here)."""
+    out: dict = {}
+    allowed = {"size", "seed"} if kind == "image" else {"seconds", "size", "seed"}
+    for k, v in (params or {}).items():
+        if k not in allowed:
+            raise ValueError(f"params.{k}: not a field for a {kind} job (allowed: {', '.join(sorted(allowed))})")
+        if k == "size":
+            if not isinstance(v, str) or not SIZE_RE.match(v):
+                raise ValueError('params.size: want "WIDTHxHEIGHT" like 1344x768')
+            out["size"] = v
+        elif k == "seed":
+            if not isinstance(v, int) or isinstance(v, bool) or v < -1:
+                raise ValueError("params.seed: want an integer ≥ -1 (-1 = random)")
+            out["seed"] = v
+        elif k == "seconds":
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not float(v) > 0:
+                raise ValueError("params.seconds: want a positive number of seconds")
+            out["seconds"] = float(v)
+    return out
+
+
+def mock_validate_settings(s: dict) -> tuple[dict, list[str]]:
+    """The real gen_jobs.validate_settings against the mock fleet — atomic
+    (errors non-empty → nothing applied) and rebuild-from-body (a PUT is the
+    whole file, not a patch — the UI's one-draft-two-tabs saves depend on
+    that)."""
+    errors: list[str] = []
+    out = {
+        "purposes": {},
+        "enhance": {"enabled": True, "prompts": {}, "instance": "gpu-writer", "model": "Writer"},
         "gc_days": 14,
     }
+    if not isinstance(s, dict):
+        return out, ["settings must be a JSON object"]
+    purp_in = s.get("purposes", {})
+    if not isinstance(purp_in, dict):
+        errors.append("purposes must be an object")
+    else:
+        for k, v in purp_in.items():
+            if k not in ("image", "video"):
+                errors.append(f"unknown purpose {k!r} (want one of: image, video)")
+                continue
+            if not isinstance(v, str) or not MODEL_NAME_RE.match(v):
+                errors.append(f"purposes.{k}: bad model name {v!r}")
+                continue
+            if v in ("image", "video"):
+                errors.append(f"purposes.{k}: {v!r} is a reserved purpose key, not a model name")
+                continue
+            if v not in KNOWN_MODELS:
+                errors.append(f"purposes.{k}: unknown model {v!r} (not hosted by any gen slot)")
+                continue
+            if KNOWN_MODELS[v] != k:
+                errors.append(f"purposes.{k}: {v!r} is a {KNOWN_MODELS[v]} model, not a {k} model")
+                continue
+            out["purposes"][k] = v
+    enh_in = s.get("enhance", {})
+    if not isinstance(enh_in, dict):
+        errors.append("enhance must be an object")
+    else:
+        out["enhance"]["enabled"] = bool(enh_in.get("enabled", out["enhance"]["enabled"]))
+        prompts_in = enh_in.get("prompts", {})
+        if not isinstance(prompts_in, dict):
+            errors.append("enhance.prompts must be an object (model name → instruction)")
+        else:
+            for k, v in prompts_in.items():
+                if k not in KNOWN_MODELS:
+                    errors.append(
+                        f"enhance.prompts: unknown gen model {k!r} (matches no deployed gen model — copy or delete it in the Gen tab's enhancement prompts)"
+                    )
+                    continue
+                if not isinstance(v, str):
+                    errors.append(f"enhance.prompts.{k}: must be a string")
+                    continue
+                out["enhance"]["prompts"][k] = v
+        inst = enh_in.get("instance", out["enhance"]["instance"])
+        mdl = enh_in.get("model", out["enhance"]["model"])
+        # the mock's one instance (the real thing: any deployed gpu-* with the named llm entry)
+        if not isinstance(inst, str) or inst != "gpu-writer":
+            errors.append(f"enhance.instance: {inst!r} is not a deployed gpu-* instance")
+        elif not isinstance(mdl, str) or mdl not in ("Writer", "Uncensored"):
+            errors.append(
+                f"enhance.model: {inst!r} hosts no llm model {mdl!r} (its llm entries: Writer, Uncensored)"
+            )
+        else:
+            out["enhance"]["instance"] = inst
+            out["enhance"]["model"] = mdl
+    gc = s.get("gc_days", out["gc_days"])
+    if not isinstance(gc, int) or isinstance(gc, bool) or not 1 <= gc <= 365:
+        errors.append("gc_days must be an integer 1-365")
+    else:
+        out["gc_days"] = gc
+    return out, errors
+
+
+def gen_seed() -> None:
+    mkjob(IMAGE, "a lighthouse at dusk, oil painting", state="completed", ago=86400 * 3 + 900,
+          enhanced="a lighthouse at dusk seen from the seawall, oil painting, impasto waves, warm lamp cutting cold blue haze, 35 mm, golden hour",
+          params={"size": "1024x1024", "seed": 7})
+    mkjob(VIDEO, PINE, state="completed", ago=86400 * 2 + 120,
+          enhanced="a red fox trots through a snowy pine forest, low morning sun raking the trunks, snow spraying under its paws, handheld tracking shot at fox height, 35 mm, shallow depth of field; soundscape: wind in the branches, snow crunching, distant jays",
+          params={"size": "1344x768", "seconds": 5, "seed": 21})
+    mkjob(IMAGE, FOX, state="completed", ago=86400 * 2 + 3000, params={"size": "1024x1024", "seed": -1})
+    mkjob(VIDEO, "a lighthouse beam sweeping over a storm sea, nothumb", state="completed", ago=86400 + 400,
+          enhanced="a lighthouse beam sweeps a storm sea at night, spray tearing off the breakwater, locked-off wide shot, 24 mm, cold moonlight, the lamp warm; soundscape: surf, wind, gulls",
+          params={"size": "1344x768", "seconds": 8, "seed": 404})
+    mkjob(IMAGE, "a cubist guitar on a velvet table", state="failed", ago=86400 + 60,
+          error="image generation failed: HTTP 400: size 2400x2400 exceeds the model's 2048x2048 (16384 latent tokens)",
+          params={"size": "2400x2400", "seed": 9}, enhance=False)
+    mkjob(IMAGE, "a copper teapot, product shot, softbox light", state="completed", ago=3600 * 20,
+          params={"size": "1536x1024", "seed": 500}, enhance=False)
+    mkjob(VIDEO, PINE + " (vertical)", state="canceled", ago=3600 * 6,
+          error="canceled", params={"size": "768x1344", "seconds": 10, "seed": 12})
+    mkjob(IMAGE, "a workshop bench at 6 am, dust in the light", state="completed", ago=3600 * 5,
+          enhanced="a carpenter's workshop bench at 6 am, hand tools laid out, dust motes in a low window shaft of light, 50 mm, natural light, muted warm grade, quiet",
+          params={"size": "1536x1024", "seed": 88})
+    mkjob(IMAGE, "an aurora over a frozen lake, reflections", state="completed", ago=3600 * 4,
+          enhanced="an aurora over a frozen lake, green and violet curtains mirrored in clear ice, foreground of cracked ice, 14 mm, long exposure, deep blue night, crisp",
+          params={"size": "1344x768", "seed": 31337})
+    mkjob(IMAGE, "a robot barista mid-pour, cinematic", state="completed", ago=3600 * 3,
+          enhanced="a robot barista mid-pour in a small café, steam curling over the cup, 85 mm macro, rim light, shallow depth of field, cinematic teal grade, cosy",
+          params={"size": "1024x1024", "seed": 2024})
+    mkjob(VIDEO, "a paper boat drifting down a rain-filled gutter", state="completed", ago=3600 * 2,
+          enhanced="a paper boat drifts down a rain-filled gutter past fallen leaves, low water-level follow shot, 50 mm, overcast light, grey city bokeh; soundscape: steady rain, traffic hum, a passing bicycle",
+          params={"size": "1344x768", "seconds": 5, "seed": 6})
+    # — the live end: one rendering, one enhancing, two queued
+    mkjob(VIDEO, "a train of cargo containers climbing a mountain pass at dawn", state="running", ago=90,
+          enhanced="a freight train of stacked cargo containers climbs a mountain pass at dawn, slow aerial parallel tracking shot, 70 mm, low golden sun along the viaduct, mist in the valley; soundscape: diesel rhythm, rail joints, wind",
+          params={"size": "1344x768", "seconds": 8, "seed": 77},
+          slot="gpu-gentp2", progress=57)
+    mkjob(IMAGE, "a bowl of blood oranges on marble", state="queued", ago=70,
+          params={"size": "1024x1024", "seed": 900})
+    enh = mkjob(IMAGE, "a crow on a snow-covered fence, winter morning", state="enhancing", ago=25,
+                params={"size": "1344x768", "seed": -1})
+    STAGE[enh["id"]] = time.time() - 1.0  # mid-rewrite when the first poll lands
+    mkjob(VIDEO, "waves breaking on a black-sand beach from behind", state="queued", ago=6,
+          params={"size": "1344x768", "seconds": 5, "seed": -1})
+    mkjob(IMAGE, FOX + ", 35 mm", state="queued", ago=2, params={"size": "1024x1024", "seed": -1})
+
+
+def enhance_of(j: dict) -> str:
+    """The canned rewrite — the shape is what the tab needs, not the words."""
+    if j["kind"] == "video":
+        return (
+            f"{j['prompt'].rstrip('.')}, low tracking shot at ground level, 35 mm, shallow depth of field, "
+            "golden-hour light raking across the frame; soundscape: ambient wind, foley of every footfall, "
+            "distant birdsong, no music"
+        )
+    return (
+        f"{j['prompt'].rstrip('.')}, editorial product photography, 90 mm macro, single soft window light, "
+        "shallow depth of field, muted natural palette"
+    )
+
+
+def _claim(j: dict) -> None:
+    j["slot"] = "gpu-gentp2" if j["kind"] == "video" else ("gpu-gentp1a" if int(j["id"][4:]) % 2 else "gpu-gentp1b")
+    j["state"] = "starting"
+    STAGE[j["id"]] = time.time()
+
+
+def gen_advance() -> None:
+    """Advance every non-terminal job by wall-clock time (the tab's poll drives
+    it — no threads, and the mock never needs an idle tick)."""
+    now = time.time()
+    for j in list(JOBS.values()):
+        st = j["state"]
+        t = STAGE.get(j["id"], now)
+        if st in ("completed", "failed", "canceled"):
+            continue
+        if st == "queued":
+            if now - j["created_at"] < 4:
+                continue
+            if j["enhance"] and not j["enhanced_prompt"]:
+                j["state"] = "enhancing"
+                STAGE[j["id"]] = now
+            else:
+                _claim(j)
+        elif st == "enhancing":
+            if now - t < 6:
+                continue
+            j["enhanced_prompt"] = enhance_of(j)
+            _claim(j)
+        elif st == "starting":
+            if now - t < 4:
+                continue
+            j["state"] = "running"
+            j["started_at"] = now
+            j["progress"] = 0 if j["kind"] == "video" else None
+            STAGE[j["id"]] = now
+        elif st == "running":
+            span = 150.0 if j["kind"] == "video" else 25.0
+            p = (now - t) / span * 100
+            if p >= 100:
+                j["progress"] = None
+                j["state"] = "completed"
+                j["finished_at"] = now
+                j["error"] = None
+                j["artifact"] = put_artifact(j)
+                STAGE.pop(j["id"], None)
+            elif j["kind"] == "video":
+                j["progress"] = max(0, int(p))
+
+
+def gen_view() -> dict:
+    with GEN_LOCK:
+        gen_advance()
+        jobs = [JOBS[i] for i in ORDER if i in JOBS]
+        active = [j for j in jobs if j["state"] not in ("completed", "failed", "canceled")]
+        counts = {
+            "all": len(jobs),
+            "active": len(active),
+            "image": sum(1 for j in jobs if j["kind"] == "image"),
+            "video": sum(1 for j in jobs if j["kind"] == "video"),
+            "failed": sum(1 for j in jobs if j["state"] in ("failed", "canceled")),
+        }
+        busy = {j["slot"] for j in JOBS.values() if j["state"] in ("starting", "loading", "running")}
+    # a down instance has no live container — the real instance rows carry
+    # container=None + ip="" in that case (the ip comes from the container)
+    t2_up = "gpu-gentp2" in busy
+    slots = [
+        {
+            "name": "gpu-gentp1a", "display": "Gen TP1-A", "cards": 1,
+            "assigned": [5], "holding": [5], "running": True,
+            "container": CONTAINER_IDS["gpu-gentp1a"], "ip": "172.18.0.7",
+            "models": {IMAGE: "image"}, "llm": None,
+            "status": {"state": "running", "stops": [], "blockers": [], "busy": "gpu-gentp1a" in busy},
+        },
+        {
+            "name": "gpu-gentp1b", "display": "Gen TP1-B", "cards": 1,
+            "assigned": [6], "holding": [6], "running": True,
+            "container": CONTAINER_IDS["gpu-gentp1b"], "ip": "172.18.0.8",
+            "models": {IMAGE: "image"}, "llm": None,
+            "status": {"state": "running", "stops": [], "blockers": [], "busy": "gpu-gentp1b" in busy},
+        },
+        {
+            "name": "gpu-gentp2", "display": "Gen TP2", "cards": 2,
+            "assigned": [5, 6], "holding": [5, 6] if t2_up else None,
+            "running": t2_up,
+            "container": CONTAINER_IDS["gpu-gentp2"] if t2_up else None,
+            "ip": "172.18.0.9" if t2_up else "",
+            "models": {VIDEO: "video"}, "llm": None,
+            "status": {
+                "state": "running" if t2_up else "down-idle-stops",
+                "stops": [] if t2_up else ["gpu-gentp1a", "gpu-gentp1b"],
+                "blockers": [],
+                "busy": t2_up,
+            },
+        },
+    ]
+    return {
+        "slots": slots,
+        "instances": [
+            # the writer's instance row, the real build_instances shape
+            {"name": "gpu-writer", "display": "Writer", "cards": 1,
+             "assigned": [4], "holding": [4], "running": True,
+             "container": CONTAINER_IDS["gpu-writer"], "ip": "172.18.0.6",
+             "models": {}, "llms": ["Writer", "Uncensored"]},
+        ],
+        "enhance_target": {
+            "instance": GEN_SETTINGS["enhance"]["instance"], "model": GEN_SETTINGS["enhance"]["model"],
+            "running": True, "ip": "172.18.0.6", "ok": True, "reason": "",
+        },
+        "active": active,
+        "counts": counts,
+        "models": gen_models(),
+        "purposes": GEN_SETTINGS["purposes"],
+        "enhance": GEN_SETTINGS["enhance"],
+        "gc_days": GEN_SETTINGS["gc_days"],
+    }
+
+
+def gen_create(body: dict) -> dict:
+    """Like the real POST /api/gen/jobs: prompt/model/enhance/params all
+    validated before anything is queued (same 400s, same messages)."""
+    prompt = (body.get("prompt") or "").strip()
+    if not prompt:
+        raise ValueError("prompt is required")
+    model, kind = mock_resolve_model(body.get("model"))
+    enhance_in = body.get("enhance")
+    enhance = bool(enhance_in) if enhance_in is not None else bool(GEN_SETTINGS["enhance"]["enabled"])
+    if enhance and not (GEN_SETTINGS["enhance"].get("prompts") or {}).get(model, ""):
+        if enhance_in is True:
+            raise ValueError(f"enhancement on but no prompt configured for {model!r} (Gen settings)")
+        enhance = False  # the settings' default is on, no prompt: skip (the plan's rule)
+    params = mock_validate_params(kind, body.get("params") or {})
+    with GEN_LOCK:
+        j = mkjob(
+            model,
+            prompt,
+            state="queued",
+            ago=0,
+            params=params,
+            enhance=enhance,
+        )
+        j["created_at"] = time.time()
+        STAGE[j["id"]] = time.time()
+        return j
+
+
+def gen_remove(jid: str) -> str:
+    with GEN_LOCK:
+        j = JOBS.get(jid)
+        if not j:
+            raise ValueError("no such job")
+        if j["state"] in ("completed", "failed", "canceled"):
+            del JOBS[jid]
+            if jid in ORDER:
+                ORDER.remove(jid)
+            for name in list(ARTS):
+                if name.startswith(jid):
+                    del ARTS[name]
+            return "deleted"
+        j.update({"state": "canceled", "error": "canceled", "finished_at": time.time(), "progress": None})
+        STAGE.pop(jid, None)
+        return "canceled"
+
+
+def gen_archive(ids: list[str]) -> bytes:
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    manifest = []
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+        for jid in ids:
+            j = JOBS.get(jid) or {}
+            url = ((j.get("artifact") or {}).get("url")) or ""
+            name = url.rsplit("/", 1)[-1]
+            if name in ARTS:
+                zf.writestr(name, ARTS[name][0])
+                # the real manifest, line for line (the prompts.txt a folder of
+                # pictures carries with it)
+                when = time.strftime("%Y-%m-%d %H:%M", time.localtime(j.get("created_at") or 0))
+                manifest.append(
+                    f"[{jid}] {j.get('model')} ({j.get('kind')}) — {when}\n"
+                    f"  prompt:   {j.get('prompt')}\n"
+                    + (f"  enhanced: {j['enhanced_prompt']}\n" if j.get("enhanced_prompt") else "")
+                    + f"  params:   {json.dumps(j.get('params') or {}, sort_keys=True)}\n"
+                )
+        if not manifest:
+            raise ValueError("no artifacts to download (nothing selected has one on disk)")
+        zf.writestr("prompts.txt", "\n".join(manifest))
+    return buf.getvalue()
+
+
+def gen_page(limit: int, cursor: int, q: str, flt: str) -> dict:
+    """One window of the history (newest first) — mirrors /api/gen/jobs: same
+    cursor (seq of the record to start BEFORE), the same `q`/`filter` semantics,
+    and the same `next` (the seq of the last job on the page when it is full —
+    resume before it — or None at the end)."""
+    needle = q.strip().lower()[:200]
+
+    def matches(j: dict) -> bool:
+        if flt == "active" and j["state"] in ("completed", "failed", "canceled"):
+            return False
+        if flt == "image" and j["kind"] != "image":
+            return False
+        if flt == "video" and j["kind"] != "video":
+            return False
+        if flt == "failed" and j["state"] not in ("failed", "canceled"):
+            return False
+        if needle:
+            hay = f"{j['id']} {j['model']} {j['prompt']} {j.get('enhanced_prompt') or ''}".lower()
+            if needle not in hay:
+                return False
+        return True
+
+    with GEN_LOCK:
+        gen_advance()
+        rows: list[dict] = []
+        last: int | None = None  # seq of the last job on this page
+        for jid in reversed(ORDER):
+            j = JOBS.get(jid)
+            if not j:
+                continue
+            s = int(jid.rsplit("-", 1)[1])
+            if cursor > 0 and s >= cursor:
+                continue
+            if not matches(j):
+                continue
+            if len(rows) == limit:
+                # a full page with an older match: resume BEFORE the last job
+                # shown — never the first match past the page (the `>=` skip
+                # would drop it and it would never surface)
+                return {"jobs": rows, "next": last}
+            rows.append(j)
+            last = s
+    return {"jobs": rows, "next": None}
+
+
+def gen() -> dict:
+    return gen_view()
+
+
+# The Actions console reads better with real shapes than with a stub, so the
+# read-only actions answer with their own JSON (the write ones stay no-ops).
+def action_output(name: str, args: list[str]) -> str:
+    if name == "gpu-fleet":
+        return json.dumps([{"service": n, "cards": cn} for n, _d, cn, _a, _h, _st, _x in INSTANCES], indent=2)
+    if name == "gpu-live":
+        return json.dumps(
+            [{"service": n, "state": st, "holds": h} for n, _d, _cn, _a, h, st, _x in INSTANCES if h], indent=2
+        )
+    if name == "edge-ips":
+        return json.dumps({CONTAINER_IDS[s]: {"Name": f"panel-{s}-1", "IPv4Address": f"172.18.0.{i + 4}"}
+                           for i, s in enumerate(CONTAINER_IDS)}, indent=2)
+    if name == "list-services":
+        return json.dumps([{"name": s, "image": img, "display": d} for d, s, img, _1, _2, _3, _4 in sorted(CONTAINERS, key=lambda r: r[1])], indent=2)
+    if name == "list-containers":
+        return "\n".join(json.dumps(r) for r in containers()["containers"])
+    if name == "update-preview":
+        return json.dumps(update_preview(), indent=2)
+    if name == "update-report":
+        return json.dumps(update_report(), indent=2)
+    if name == "servitor-status":
+        return json.dumps({"domain": "servitor", "state": "running", "healthz": {"ok": True, "uptime_s": 5210},
+                           "gpu_pick": "gpu-27b"}, indent=2)
+    return f"(demo) {name}{' ' + ' '.join(args) if args else ''}: no-op — mock API\n"
 
 
 def update_report() -> dict:
@@ -464,7 +1032,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:
-        p = self.path.split("?", 1)[0]
+        p, _q, query = self.path.partition("?")
+        params = dict(urllib.parse.parse_qsl(query))
         routes = {
             "/api/metrics": metrics,
             "/api/health": lambda: {"ok": True, "dev": False, "ts": int(time.time())},
@@ -473,47 +1042,153 @@ class Handler(BaseHTTPRequestHandler):
             "/api/actions": actions,
             "/api/gpus": gpus,
             "/api/gen": gen,
+            "/api/gen/settings": lambda: {"settings": GEN_SETTINGS, "models": gen_models()},
             "/api/settings/llm": llm_settings,
             "/api/update": update_report,
             "/api/update/preview": update_preview,
         }
+        if p.startswith("/gen/"):
+            self._artifact(p[len("/gen/"):])
+            return
+        if p == "/api/gen/jobs":
+            # the gallery's page — same params + semantics as the real endpoint
+            flt = params.get("filter", "all")
+            if flt not in ("all", "active", "image", "video", "failed"):
+                self._json({"detail": "filter: one of all, active, image, video, failed"}, 400)
+                return
+            try:
+                limit = max(1, min(int(params.get("limit", "50")), 200))
+                cursor = max(0, int(params.get("cursor", "0")))
+            except ValueError:
+                self._json({"detail": "bad limit/cursor"}, 400)
+                return
+            self._json(gen_page(limit, cursor, params.get("q", ""), flt))
+            return
+        if p.startswith("/api/gen/jobs/"):
+            # the single-job GET (the real endpoint 404s on an unknown id) —
+            # advances the walk like the other gen routes, so polling ONLY
+            # this route still drives the state machine
+            with GEN_LOCK:
+                gen_advance()
+                j = JOBS.get(p[len("/api/gen/jobs/"):])
+            if not j:
+                self._json({"detail": "no such job"}, 404)
+                return
+            self._json(j)
+            return
         if p in routes:
             self._json(routes[p]())
         else:
             self._json({"detail": f"not found (demo): {p}"}, 404)
 
+    def _artifact(self, name: str) -> None:
+        """The artifacts the mock generated (a real deploy serves the files from
+        /models/gen-output through panel-web's nginx). The MP4 is inert bytes —
+        undecodable, so the UI's <video> falls back to its poster, like it does
+        for an artifact the age GC took; the download link and the archive pack
+        the bytes for real (see mp4_bytes)."""
+        found = ARTS.get(name)
+        if not found:
+            self._json({"detail": f"no artifact {name} (demo)"}, 404)
+            return
+        body, mime = found
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_POST(self) -> None:
         p = self.path.split("?", 1)[0]
-        self._read_body()
-        if p == "/api/update" or p == "/api/update/rollback":
-            self._json({"ok": True, "exit_code": 0, "stdout": "(demo) no-op — mock API", "stderr": ""})
-        elif p == "/api/gen/jobs":
-            self._json({"id": "job-" + f"{int(time.time() * 1000) % 10**12:012x}", "state": "queued"}, 201)
-        elif p.startswith("/api/containers/") and p.count("/") >= 4:
-            self._json({"ok": True})
-        elif p in ("/api/gpus/start", "/api/gpus/stop", "/api/gpus/assign",
-                   "/api/gpus/autostart", "/api/gpus/reserve", "/api/gpus/unreserve"):
-            self._json(gpus())
-        elif p.startswith("/api/action/"):
-            self._json({"ok": True, "exit_code": 0, "stdout": "(demo) no-op — mock API", "stderr": ""})
-        else:
-            self._json({"ok": True})
+        body = self._read_body()
+        try:
+            if p == "/api/gen/jobs":
+                self._json(gen_create(body), 201)
+            elif p == "/api/gen/jobs/remove":
+                # like the real endpoint: every id gets an answer (unknown
+                # ones fail per id) — nothing is dropped silently
+                ids = list(dict.fromkeys(body.get("ids", [])))
+                if not ids:
+                    raise ValueError("no job ids")
+                out = []
+                for jid in ids:
+                    try:
+                        out.append({"id": jid, "ok": True, "action": gen_remove(jid)})
+                    except ValueError as e:
+                        out.append({"id": jid, "ok": False, "error": str(e)})
+                self._json({"results": out})
+            elif p == "/api/gen/jobs/archive":
+                ids = list(dict.fromkeys(body.get("ids", [])))
+                if not ids:
+                    raise ValueError("no job ids")
+                try:
+                    blob = gen_archive(ids)
+                except ValueError as e:
+                    self._json({"detail": str(e)}, 404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Disposition", 'attachment; filename="panel-gen-demo.zip"')
+                self.send_header("Content-Length", str(len(blob)))
+                self.end_headers()
+                self.wfile.write(blob)
+            elif p in ("/api/update", "/api/update/rollback"):
+                self._json({"ok": True, "exit_code": 0, "stdout": "(demo) no-op — mock API", "stderr": ""})
+            elif p.startswith("/api/action/"):
+                name = p[len("/api/action/"):]
+                self._json({"ok": True, "exit_code": 0, "stdout": action_output(name, body.get("args", [])), "stderr": ""})
+            elif p.startswith("/api/containers/") and p.count("/") >= 4:
+                self._json({"ok": True})
+            elif p in ("/api/gpus/start", "/api/gpus/stop", "/api/gpus/assign",
+                       "/api/gpus/autostart", "/api/gpus/reserve", "/api/gpus/unreserve"):
+                self._json(gpus())
+            else:
+                self._json({"ok": True})
+        except ValueError as e:
+            self._json({"detail": str(e)}, 400)
 
     def do_PUT(self) -> None:
-        self._read_body()
+        body = self._read_body()
+        if self.path.split("?", 1)[0] == "/api/gen/settings":
+            # like the real endpoint: full validation, atomic (an error applies
+            # nothing), rebuild-from-body (a PUT is the whole file, not a patch)
+            clean, errors = mock_validate_settings(body)
+            if errors:
+                self._json({"detail": "; ".join(errors[:5])}, 400)
+                return
+            with GEN_LOCK:
+                GEN_SETTINGS.clear()
+                GEN_SETTINGS.update(clean)
+            self._json({"settings": GEN_SETTINGS})
+            return
         self._json({"ok": True})
 
     def do_DELETE(self) -> None:
         self._read_body()
+        p = self.path.split("?", 1)[0]
+        if p.startswith("/api/gen/jobs/"):
+            try:
+                self._json({"ok": True, "action": gen_remove(p[len("/api/gen/jobs/"):])})
+            except ValueError as e:
+                self._json({"detail": str(e)}, 404)
+            return
         self._json({"ok": True})
 
-    def _read_body(self) -> None:
+    def _read_body(self) -> dict:
         n = int(self.headers.get("Content-Length") or 0)
-        if n:
-            self.rfile.read(n)
+        raw = self.rfile.read(n) if n else b""
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else {}
+        except json.JSONDecodeError:
+            return {}
 
 
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else PORT
-    print(f"demo mock api on http://{HOST}:{port} (serves the panel-api read shapes)")
+    gen_seed()
+    print(f"demo mock api on http://{HOST}:{port} (serves the panel-api read shapes + {len(JOBS)} gen jobs)")
     ThreadingHTTPServer((HOST, port), Handler).serve_forever()

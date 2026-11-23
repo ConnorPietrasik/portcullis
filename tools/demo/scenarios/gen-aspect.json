@@ -1,0 +1,27 @@
+[
+  {
+    "name": "aspect",
+    "tab": "Gen",
+    "wait": 2600
+  },
+  {
+    "name": "aspect-34-image",
+    "then": "[...document.querySelectorAll('.w-aspect button')].find(x=>x.textContent==='3:4')?.click(); 'ok'",
+    "wait": 1000
+  },
+  {
+    "name": "aspect-34-video",
+    "then": "(() => { const sel=document.querySelector('.w-model select'); Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set.call(sel,'video'); sel.dispatchEvent(new Event('change',{bubbles:true})); return 'ok' })()",
+    "wait": 1400
+  },
+  {
+    "name": "aspect-43-image",
+    "then": "(() => { const sel=document.querySelector('.w-model select'); Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set.call(sel,'image'); sel.dispatchEvent(new Event('change',{bubbles:true})); return 'ok' })()",
+    "wait": 700
+  },
+  {
+    "name": "aspect-43-image-2",
+    "then": "[...document.querySelectorAll('.w-aspect button')].find(x=>x.textContent==='4:3')?.click(); 'ok'",
+    "wait": 1000
+  }
+]

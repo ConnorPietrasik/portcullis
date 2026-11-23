@@ -669,10 +669,12 @@ mkdir -p /models/llm /models/image /models/video
 #    first: no "lowest free card" pitfall), then assign the lane while the slots are
 #    still down (5 → gpu-gentp1a, 6 → gpu-gentp1b, 5,6 → gpu-gentp2 — an explicit
 #    assign refuses a card a running instance holds; the tp2 set overlaps the tp1
-#    ones on purpose — that overlap IS the lane), then Gen tab → slots → start both
-#    tp1 slots (the writer comes up on demand — or start it to warm it).
-#    The tp2 assignment is what makes the tp2 slot's status read `down · yields 2`
-#    while the tp1 slots hold the lane (smoke below); without it the engine still
+#    ones on purpose — that overlap IS the lane), then GPUs view → start both tp1
+#    slots (the Gen bar's `pool ↗` links there; the writer comes up on demand — or
+#    start it to warm it).
+#    The tp2 assignment is what makes the tp2 slot's status read `down` (hover the
+#    Gen bar's TP2 chip: a start would stop both tp1 slots) while the tp1 slots
+#    hold the lane (smoke below); without it the engine still
 #    yields the lane for the video job (its start auto-grabs the lowest free set,
 #    and the idle yield covers that grab) — but it would record whatever it takes
 #    (e.g. [2,5] if a card is down), off the x16 lane.
@@ -685,7 +687,8 @@ mkdir -p /models/llm /models/image /models/video
 #    two tp1 slots are down (a queued video job stops them itself; see below).
 # 5. smoke: queue a small image job (model `image`) and a ~5 s video job
 #    (model `video`). The video needs the tp2 slot — with the tp1 slots holding
-#    5 and 6, its status shows `down · yields 2` and it starts only after they drain + stop.
+#    5 and 6, the Gen bar's TP2 chip sits `down` (hover: a start would stop both
+#    tp1 slots) and the job starts only after they drain + stop.
 #    A job with enhance on should log a chat completion on the writer (its RADIANCE_LOG lines).
 ```
 
@@ -702,6 +705,30 @@ mkdir -p /models/llm /models/image /models/video
   ticket's flag, the same one the video's `DELETE` sets), so the render retires at the next pass
   boundary instead of burning out; a video render in progress is additionally `DELETE`d by its
   poll within ~5 s. No half-artifact ever lands (the state is re-checked before every write).
+- **Gallery (data budget):** the tab is two small polls, never the whole store —
+  `GET /api/gen` (counts + the in-flight set — the queue, whatever the operator
+  queued, plus the in-flight jobs the admission caps bound; the store cap
+  `MAX_JOBS_KEPT` bounds the whole) and
+  `GET /api/gen/jobs?limit&cursor&q&filter` (ONE page of history, newest first;
+  the cursor is the `job-NNNNNN` seq of the record to resume before, the response's
+  `next` carries the next one; `filter` is all/active/image/video/failed, `q` a
+  substring over id/model/prompt/enhanced prompt — the server searches the whole
+  capped store, the page is the unit of transfer: the tab polls from phones on
+  metered lines). The in-flight set is merged into whatever page is showing,
+  subject to the same filter/search the page was asked with — a long video keeps
+  its progress bar on every page of a tab that shows it, and the filter tabs
+  (whole-store counts) filter everything on screen, not just the fetched
+  records. “Select all” selects what is on screen; the batch endpoints below
+  take any ids.
+- **Batch:** the tab's selection acts on many jobs at once. The batch delete applies the same
+  per-job rule as the single one (cancellable → canceled, terminal → record + files; one bad id
+  never aborts the rest — the response says what happened to each). The download packs the
+  selected artifacts in one ZIP (stored — they're already compressed) plus a `prompts.txt`
+  manifest, built as a temp file in the artifact dir and unlinked after the response (the age
+  GC skips it — non-`job-*` name — and the nginx allowlist can never serve it; a hard kill's
+  leftover is reaped by the engine's zip sweep, which only touches names not being served). No id or size
+  caps: the admin double gate is the authorization, and the store's own history cap
+  (`MAX_JOBS_KEPT`) bounds what any page can select.
 - **Lanes:** a running slot owns its cards exclusively; a job becomes eligible when all of its
   slot's cards are free or held by an idle gen slot, and among the eligible slots it is claimed on
   the LEAST-LOADED one that hosts its model (a model on two slots spreads one-each — not two on
@@ -725,13 +752,13 @@ mkdir -p /models/llm /models/image /models/video
   it clears), down-idle-stops (the holder gets stopped), or free (it starts). A permanent
   conflict (the lane is short, docker down) re-queues with the same reason until it clears. A config drift after a job is
   queued (the model vanished, or its enhance target became misconfigured while the job wants
-  enhance) says so in the error column instead of the job waiting in silence. A stop
-  only lands on a drained slot from the Gen tab (its stop button stays disabled while a job is in
-  flight); the GPUs view's stop does not wait — in-flight jobs on it fail (`lost the slot
-  mid-render`).
+  enhance) says so in the error column instead of the job waiting in silence. The GPUs
+  view's stop does not wait for a drain — in-flight jobs on the slot fail (`lost the slot
+  mid-render`); the graceful exit is the lazy stop (a queued job needing the cards
+  stops a drained slot itself).
 - **Lazy stop:** a drained slot STAYS UP (the gen model is resident; the next job is fast). It
   yields its cards only when (a) a queued job needs them — the slot stops automatically (only when
-  drained — nothing in flight is lost), (b) you stop it (Gen tab or GPUs view), or (c) a reboot. An explicit
+  drained — nothing in flight is lost), (b) you stop it (GPUs view), or (c) a reboot. An explicit
   start of ANY instance may stop idle gen slots holding the cards it wants — server-side, with no
   UI confirmation: the audit log records it (`stopped-idle-gen:<slot>` on the `gpu-start` entry).
   LLM instance occupants are NEVER auto-stopped (their traffic is not panel-visible, so idleness
@@ -754,7 +781,7 @@ toggle, the per-model enhancement prompts, the ENHANCE TARGET (instance + model 
 `gpu-writer` / `Writer`), the GC age. State lives in `/opt/panel-api/gen-settings.json`
 (panel 0600) + `/opt/panel-api/gen-jobs.json` (queue + jobs, 0600) — both in the update snapshot,
 like the LLM router's settings. A model rename/swap leaves the old name's prompt entry behind:
-the *manage enhancement prompts* popup lists it under **stale entries** (its text can be copied
+the *prompts* tab of the settings dialog lists it under **stale entries** (its text can be copied
 into a current model, the entry deleted — one by one or all) — the PUT, and with it the tab's
 save, is rejected while any stale entry is in the draft, so that section is where a model
 change gets cleaned up, not a hand-edit of the file.

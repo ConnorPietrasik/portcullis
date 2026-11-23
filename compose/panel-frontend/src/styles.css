@@ -28,7 +28,7 @@ body {
 }
 
 .app {
-  max-width: 1440px;
+  max-width: 1720px;
   margin: 0 auto;
   padding: 0 18px 44px;
 }
@@ -122,19 +122,6 @@ footer {
   display: flex;
   align-items: center;
   gap: 8px;
-}
-
-.kv {
-  display: flex;
-  gap: 18px;
-  color: var(--muted);
-  font-size: 12px;
-  margin-top: 6px;
-}
-
-.kv.err {
-  color: var(--red);
-  font-weight: 600;
 }
 
 .muted,
@@ -290,18 +277,6 @@ tr:last-child td {
   border-color: var(--accent);
 }
 
-.action input {
-  display: block;
-  width: 100%;
-  margin: 8px 0;
-  background: var(--bg);
-  color: var(--fg);
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  padding: 7px 10px;
-  font: 13px ui-monospace, monospace;
-}
-
 .settings label {
   display: block;
   color: var(--muted);
@@ -431,6 +406,13 @@ pre.out.err {
   gap: 14px;
   color: var(--muted);
   font-size: 12px;
+}
+
+/* the two readouts beside the live dot (last poll, uptime) — digits don't
+   jitter as the relative time ticks */
+.ov-bar .ago {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .live {
@@ -602,12 +584,12 @@ pre.out.err {
   gap: 7px;
 }
 
-.bars .bar {
+.bars .lbar {
   display: grid;
   gap: 2px;
 }
 
-.bars .bar em {
+.bars .lbar em {
   font-style: normal;
   font-size: 9.5px;
   color: var(--dim);
@@ -1563,185 +1545,1381 @@ pre.out.err {
   cursor: default;
 }
 
-/* ── Gen view ──────────────────────────────────────────────────────────── */
+/* ══════════════════════ shared bits (more than one view) ══════════════════
+   One control look, one label rhythm: a field is a label over a control
+   (.fld), a settings line is a label column and a control column (.frow).
+   Anything you type into shares one box, one focus ring, one size. */
 
-.gen-view .card + .card {
-  margin-top: 14px;
-}
-
-.gen-composer .gen-compose-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 10px 14px;
-  margin: 8px 0 4px;
-}
-
-.gen-field {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
+input,
+select,
+textarea {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 6px 9px;
+  font-family: inherit;
   font-size: 13px;
+  min-width: 0;
 }
 
-.gen-field > span {
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--dim);
+}
+
+.search {
+  flex: 0 1 210px;
+}
+
+/* a compact, inline button — copy, dice, ratio preset, row affordance */
+.mini {
+  padding: 1px 7px;
+  font-size: 12px;
+  line-height: 1.5;
+  background: var(--bg);
   color: var(--muted);
 }
 
-.gen-field select,
-.gen-field input,
-.gen-field textarea,
-.gen-field button {
+.mini.on {
+  color: var(--fg);
+  border-color: var(--accent);
+}
+
+/* a labelled field: label above the control, always */
+.fld {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+/* only the label — `.lin` (a control row) is a span too */
+.fld > span:first-of-type {
+  font-size: 11px;
+  letter-spacing: 1.1px;
+  text-transform: uppercase;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fld input,
+.fld select,
+.fld textarea {
   width: 100%;
 }
 
-.gen-field textarea {
-  resize: vertical;
-  font-family: inherit;
+/* control + its small satellites (dice, ratio presets) on one line */
+.lin {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
 }
 
-.gen-prompt {
+/* the field's own width:100% would starve the satellites */
+.lin > input {
+  flex: 1 1 0;
+  width: auto;
+  min-width: 4.5em;
+}
+
+/* a settings line: label column, control column */
+.frow {
+  display: grid;
+  grid-template-columns: 168px minmax(0, 1fr);
+  gap: 12px;
+  align-items: center;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.frow:last-child {
+  border-bottom: none;
+}
+
+.frow .fl {
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.frow .fc {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.frow .fc input,
+.frow .fc select {
+  max-width: 260px;
+}
+
+.frow .fh {
+  color: var(--dim);
+  font-size: 11.5px;
+}
+
+.unit {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.unit em {
+  font-style: normal;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* pill switch */
+.tgl {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 12.5px;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 3px 11px 3px 5px;
+  background: var(--bg);
+  white-space: nowrap;
+}
+
+.tgl input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.tgl i {
+  position: relative;
+  width: 26px;
+  height: 14px;
+  border-radius: 999px;
+  background: var(--track);
+  box-shadow: inset 0 0 0 1px var(--line);
+  transition: background 0.15s ease;
+  flex: 0 0 auto;
+}
+
+.tgl i::after {
+  content: '';
+  position: absolute;
+  left: 2px;
+  top: 2px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--dim);
+  transition: transform 0.15s ease, background 0.15s ease;
+}
+
+.tgl.on {
+  color: var(--fg);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+}
+
+.tgl.on i {
+  background: color-mix(in srgb, var(--accent) 22%, var(--track));
+}
+
+.tgl.on i::after {
+  transform: translateX(12px);
+  background: var(--accent);
+}
+
+.tgl:has(input:disabled) {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.tgl:has(input:focus-visible) {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* one control, N exclusive choices */
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+.seg button {
+  border: none;
+  border-radius: 0;
+  background: none;
+  padding: 4px 11px;
+  font-size: 12.5px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.seg button + button {
+  border-left: 1px solid var(--line-soft);
+}
+
+.seg button:hover {
+  color: var(--fg);
+}
+
+.seg button.on {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--fg);
+}
+
+.seg button em {
+  font-style: normal;
+  margin-left: 6px;
+  color: var(--dim);
+  font-size: 11px;
+}
+
+.badge.dim {
+  color: var(--dim);
+}
+
+.empty {
   grid-column: 1 / -1;
+  color: var(--dim);
+  font-size: 13px;
+  padding: 26px 4px;
+  text-align: center;
 }
 
-.gen-target-line {
-  margin: 6px 0 0;
-  font-size: 12px;
+/* dismissible one-line result of a batch action */
+.note-bar {
+  cursor: pointer;
+  color: var(--fg);
 }
 
-.gen-err {
-  margin: 8px 0 0;
+/* the status rail a view opens with (the Gen bar) */
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 8px 12px;
+  font-size: 12.5px;
+  color: var(--muted);
 }
 
-.gen-model-note {
-  margin: 2px 0 0;
-  font-size: 12px;
+.bar .sp {
+  margin-left: auto;
 }
 
-.gen-err-text {
-  color: var(--red);
+.bar .div {
+  width: 1px;
+  align-self: stretch;
+  background: var(--line-soft);
 }
 
-.gen-progress {
+.bar .grp {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.bar .c {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.bar .c i {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--dim);
+  flex: 0 0 auto;
+}
+
+.bar .c.ok {
+  color: var(--fg);
+}
+
+.bar .c.ok i {
+  background: var(--accent);
+  animation: pulse 2.4s ease-out infinite;
+}
+
+.bar .c.warn {
+  color: var(--amber);
+}
+
+.bar .c.warn i {
+  background: var(--amber);
+  animation: pulse 2.4s ease-out infinite;
+}
+
+.bar .c.warn:hover {
+  text-decoration: underline;
+}
+
+.bar .c.idle {
+  color: var(--dim);
+}
+
+/* slot state chips (the GPU pool lives in its own view — this only reads) */
+.bar .slot {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  margin-left: 8px;
-  min-width: 110px;
+  font: 12px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--muted);
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  padding: 0 9px;
+  white-space: nowrap;
 }
 
-.gen-progress i {
-  font-style: normal;
+.bar .slot i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--dim);
+}
+
+.bar .slot.s-up i {
+  background: var(--green);
+}
+
+.bar .slot.s-busy {
+  color: var(--fg);
+}
+
+.bar .slot.s-busy i {
+  background: var(--accent);
+  animation: pulse 2.4s ease-out infinite;
+}
+
+.bar .slot.s-blocked i {
+  background: var(--red);
+}
+
+.bar .slot.s-down {
+  opacity: 0.6;
+}
+
+/* the enhance target: green when it can serve, red with the reason */
+.bar .tgt {
+  border-radius: 999px;
+  padding: 2px 11px;
   font-size: 12px;
   color: var(--muted);
 }
 
-.gen-prompt-cell {
-  max-width: 320px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.bar .tgt.ok {
+  color: var(--green);
+  border-color: color-mix(in srgb, var(--green) 40%, var(--line));
 }
 
-.gen-artifact {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
+.bar .tgt.err {
+  color: var(--red);
+  border-color: var(--red);
 }
 
-.gen-thumb {
-  width: 56px;
-  height: 56px;
-  object-fit: cover;
-  border-radius: 6px;
-  border: 1px solid var(--line);
-  background: var(--track);
-}
+/* ── Gen view ────────────────────────────────────────────────────────────
+   A composer whose fields all line up, a queue you can see (a gallery, not a
+   table of truncated strings), and settings behind a button. */
 
-/* a video with no (best-effort) thumbnail — same box, dashed, no image */
-.gen-thumb-placeholder {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border-style: dashed;
-  color: var(--dim);
-  font-size: 15px;
-}
-
-.gen-modelchip {
-  display: inline-block;
-  margin-right: 6px;
-}
-
-.gen-modelchip i {
-  font-style: normal;
-  color: var(--dim);
-  font-size: 11px;
-  margin-left: 3px;
-}
-
-.gen-settings {
+.gen {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-  gap: 10px 14px;
-  margin: 8px 0 4px;
+  gap: 12px;
 }
 
-/* the popup's "copy prompt from" row — select + button side by side
-   (.gen-field children are full-width by default) */
-.gen-copyrow-ctl {
+.gen-comp .rail {
   display: flex;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  align-items: flex-end;
 }
 
-.gen-copyrow-ctl select {
-  flex: 1;
+.gen-comp .w-model {
+  flex: 1 1 320px;
+  min-width: 210px;
+  max-width: 560px;
 }
 
-.gen-copyrow-ctl button {
-  width: auto;
+.gen-comp .w-size {
+  width: 104px;
+}
+
+/* the chips size themselves; no fixed width, they are the label's control */
+.gen-comp .w-aspect {
   flex: 0 0 auto;
 }
 
-/* the popup's stale prompt entries (model names matching no deployed gen
-   model — the save is blocked until they're copied or deleted) */
-.gen-stale {
-  padding-top: 8px;
-  border-top: 1px solid var(--line-soft);
-  font-size: 13px;
+.gen-comp .w-num,
+.gen-comp .w-seed {
+  width: 122px;
 }
 
-.gen-stale-head {
+.gen-comp .lin .mini {
+  padding: 5px 6px;
+  font-size: 11.5px;
+}
+
+.ratios {
+  display: flex;
+  gap: 3px;
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
+}
+
+/* the toggles are the rail's tail: one deliberate gap, not stretched fields */
+.gen-comp .railtail {
   display: flex;
   align-items: center;
   gap: 8px;
-}
-
-.gen-stale-head button {
   margin-left: auto;
-  flex-shrink: 0;
+  padding-bottom: 2px;
 }
 
-.gen-stale-row {
+.gen-comp textarea {
+  margin-top: 12px;
+  width: 100%;
+  min-height: 66px;
+  resize: vertical;
+  line-height: 1.5;
+}
+
+.cfoot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 8px;
+  min-width: 0;
+}
+
+.cfoot .note {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--dim);
+  font-size: 11.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cfoot .flash {
+  color: var(--green);
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+
+.cfoot .gen-err {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  padding: 3px 10px;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+button.go {
+  margin-left: auto;
+  flex: 0 0 auto;
+  background: color-mix(in srgb, var(--accent) 18%, var(--panel));
+  border-color: var(--accent);
+  color: var(--fg);
+  font-weight: 600;
+  padding: 6px 18px;
+}
+
+button.go:disabled {
+  background: var(--panel);
+}
+
+/* ── the gallery ── */
+.jobs {
+  padding: 12px 14px 14px;
+}
+
+.jobs-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.jobs-bar .sp {
+  margin-left: auto;
+}
+
+/* the page pair — newer/older (the history is windowed, see /api/gen/jobs) */
+.pgnp {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.pgnp .mini:disabled {
+  opacity: 0.4;
+}
+
+.selbar {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 3px 6px 3px 11px;
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+
+.selbar b {
+  color: var(--accent);
+}
+
+.jgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(198px, 1fr));
+  gap: 10px;
+}
+
+.jc {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.jc.sel {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+/* failed — a red rim, not a red wall: the card stays calm, the failure
+   doesn't (state outranks selection, so this sits after .sel). The reason
+   itself stays out of the grid — hover (title) or the job modal. */
+.jc.fail {
+  border-color: color-mix(in srgb, var(--red) 55%, var(--line));
+}
+
+/* "inf" (in flight) — not ".live": the Overview's live-indicator owns that */
+.jc.inf {
+  border-color: color-mix(in srgb, var(--accent) 42%, var(--line));
+}
+
+.jthumb {
+  position: relative;
+  display: grid;
+  aspect-ratio: 4 / 3;
+  background: var(--track);
+  cursor: pointer;
+  overflow: hidden;
+}
+
+.jthumb .media {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.jthumb .noimg {
+  display: grid;
+  place-items: center;
+  color: var(--dim);
+  font-size: 17px;
+}
+
+.jcheck {
+  position: absolute;
+  left: 6px;
+  top: 6px;
+  display: grid;
+  place-items: center;
+  padding: 3px 5px;
+  border-radius: 6px;
+  background: rgba(8, 11, 16, 0.72);
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.jc:hover .jcheck,
+.jcheck:has(input:checked) {
+  opacity: 1;
+}
+
+.jcheck input {
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  width: 13px;
+  height: 13px;
+  accent-color: var(--accent);
+}
+
+.jkind {
+  position: absolute;
+  right: 6px;
+  top: 6px;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 1.1px;
+  text-transform: uppercase;
+  color: var(--muted);
+  background: rgba(8, 11, 16, 0.72);
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+
+.jacts {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.jc:hover .jacts {
+  opacity: 1;
+}
+
+.jacts a,
+.jacts button {
+  width: 25px;
+  height: 25px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  font-size: 12px;
+  line-height: 1;
+  color: var(--fg);
+  background: rgba(8, 11, 16, 0.82);
+  border-radius: 6px;
+  text-decoration: none;
+}
+
+.jacts a:hover {
+  border-color: var(--accent);
+}
+
+.jacts button:hover {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+.jprog {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-top: 6px;
+  padding: 6px 9px;
+  background: linear-gradient(transparent, rgba(6, 9, 13, 0.86) 55%);
 }
 
-.gen-stale-row code {
-  flex-shrink: 0;
-}
-
-.gen-stale-row .gen-stale-text {
+.jprog .meter {
   flex: 1;
+}
+
+.jprog em {
+  font-style: normal;
+  font-size: 11px;
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
+}
+
+.jprog.under {
+  position: static;
+  background: none;
+  padding: 8px 2px 0;
+}
+
+/* no progress figure yet (an image render, a slot booting) — a moving bar */
+.jbar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 3px;
+  background: var(--track);
+  overflow: hidden;
+}
+
+.jbar::after {
+  content: '';
+  position: absolute;
+  left: -40%;
+  width: 40%;
+  top: 0;
+  bottom: 0;
+  border-radius: 99px;
+  background: var(--accent);
+  animation: slide 1.5s ease-in-out infinite;
+}
+
+@keyframes slide {
+  0% {
+    left: -40%;
+  }
+  100% {
+    left: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .jbar::after {
+    animation: none;
+    left: 0;
+    width: 100%;
+    opacity: 0.5;
+  }
+}
+
+.jbody {
+  display: grid;
+  gap: 5px;
+  padding: 9px 11px 11px;
+  cursor: pointer;
   min-width: 0;
+}
+
+.jline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.jid {
+  font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--muted);
+}
+
+.jline .badge {
+  margin-left: auto;
+  font-size: 11px;
+}
+
+.jprompt {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.42;
+  color: var(--fg);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  min-height: 2.84em;
+}
+
+.jprompt em {
+  font-style: normal;
+  color: var(--dim);
+}
+
+.jfoot {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11.5px;
+  min-width: 0;
+}
+
+.jfoot span {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.gen-stale-row button {
-  flex-shrink: 0;
+/* ── the job popup ── */
+.jm {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(220px, 0.65fr);
+  gap: 12px 20px;
+  min-width: 0;
+}
+
+.jm-l {
+  display: grid;
+  gap: 10px;
+  align-content: start;
+  min-width: 0;
+}
+
+.jm-media {
+  position: relative;
+  display: grid;
+  place-items: center;
+  min-height: 200px;
+  background: var(--track);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.jm-media .media {
+  width: 100%;
+  max-height: 56vh;
+  object-fit: contain;
+  display: block;
+}
+
+.jm-media .noimg {
+  color: var(--dim);
+  font-size: 13px;
+  padding: 40px;
+}
+
+.jm-r {
+  display: grid;
+  align-content: start;
+  font-size: 12.5px;
+  min-width: 0;
+}
+
+.mrow {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.mk {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  color: var(--dim);
+  min-width: 72px;
+  flex: 0 0 auto;
+}
+
+.mv {
+  margin-left: auto;
+  text-align: right;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.merr {
+  margin-top: 10px;
+  color: var(--red);
+  font-size: 12.5px;
+  line-height: 1.45;
+  background: rgba(255, 82, 82, 0.07);
+  border: 1px solid color-mix(in srgb, var(--red) 38%, var(--line));
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.pblock {
+  background: var(--bg);
+  border: 1px solid var(--line-soft);
+  border-radius: 9px;
+  padding: 8px 11px 10px;
+  min-width: 0;
+}
+
+.pblock .ph {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 5px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.pblock .ph .mini {
+  margin-left: auto;
+}
+
+.pblock .pt {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 190px;
+  overflow-y: auto;
+}
+
+.pblock summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+.pblock summary::-webkit-details-marker {
+  display: none;
+}
+
+.pblock summary::before {
+  content: '▸';
+  color: var(--dim);
+  margin-right: 7px;
+  display: inline-block;
+  transition: transform 0.12s ease;
+}
+
+.pblock[open] summary::before {
+  transform: rotate(90deg);
+}
+
+.pblock summary .mini {
+  float: right;
+}
+
+/* ── the settings popup ── */
+.fset {
+  display: grid;
+}
+
+.ped {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  gap: 14px;
+  min-height: 300px;
+}
+
+.ped-list {
+  display: grid;
+  align-content: start;
+  gap: 2px;
+  border-right: 1px solid var(--line-soft);
+  padding-right: 12px;
+  min-width: 0;
+}
+
+.ped-list button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  padding: 4px 8px;
+  font: 12.5px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--muted);
+  min-width: 0;
+}
+
+.ped-list button:hover {
+  color: var(--fg);
+}
+
+.ped-list button.on {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--fg);
+}
+
+.ped-list button span,
+.ped-list button {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ped-list i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--line);
+  flex: 0 0 auto;
+}
+
+.ped-list i.set {
+  background: var(--green);
+}
+
+.ped-list i.stale {
+  background: var(--amber);
+}
+
+.ped-list .stale {
+  margin-top: 10px;
+  border-top: 1px dashed var(--line);
+  padding-top: 7px;
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.ped-list .stale-h {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+.ped-list .stale-h .mini {
+  margin-left: auto;
+}
+
+.ped-list .stale-r {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.ped-edit {
+  display: grid;
+  gap: 8px;
+  align-content: start;
+  min-width: 0;
+}
+
+.ped-edit textarea {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+  line-height: 1.6;
+  resize: vertical;
+}
+
+.ped-h {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.ped-copy {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.blocknote {
+  margin-right: auto;
+  font-size: 12px;
+  color: var(--amber);
+}
+
+.asklist {
+  display: grid;
+  gap: 9px;
+  font-size: 13px;
+}
+
+.asklist p {
+  margin: 0;
+}
+
+.asklist .mono {
+  font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--fg);
+  overflow-wrap: anywhere;
+}
+
+.asklist code {
+  color: var(--accent);
+}
+
+@media (max-width: 900px) {
+  .jm,
+  .ped {
+    grid-template-columns: 1fr;
+  }
+
+  .ped-list {
+    border-right: none;
+    border-bottom: 1px solid var(--line-soft);
+    padding: 0 0 8px;
+  }
+
+  .frow {
+    grid-template-columns: 120px minmax(0, 1fr);
+  }
+}
+
+/* ── Actions view ────────────────────────────────────────────────────────
+   A workbench: the registry on the left (grouped, filtered, args inline),
+   the console on the right (this session's runs and their output). */
+
+.acts {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(430px, 46%);
+  gap: 12px;
+  align-items: start;
+}
+
+.alist {
+  padding: 10px 12px 12px;
+  min-width: 0;
+}
+
+.alist-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 4px 6px;
+}
+
+.alist-bar .sp {
+  margin-left: auto;
+}
+
+.alist-bar .muted {
+  font-size: 11.5px;
+}
+
+.agroup {
+  border-top: 1px solid var(--line-soft);
+  min-width: 0;
+}
+
+.agroup > summary {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 4px;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.agroup > summary::-webkit-details-marker {
+  display: none;
+}
+
+.agroup > summary::before {
+  content: '▸';
+  color: var(--dim);
+  font-size: 10px;
+  transition: transform 0.12s ease;
+}
+
+.agroup[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.gn {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 1.3px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.gc {
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.agroup-rows {
+  display: grid;
+  gap: 1px;
+  padding-bottom: 8px;
+}
+
+.arow {
+  display: grid;
+  grid-template-columns: minmax(140px, 168px) minmax(0, 1fr) 244px;
+  gap: 12px;
+  align-items: center;
+  padding: 5px 9px 5px 7px;
+  border-radius: 8px;
+  border-left: 2px solid transparent;
+  min-width: 0;
+}
+
+.arow:hover {
+  background: var(--panel-2);
+}
+
+/* the registry's Confirm flag: this one changes state on the host */
+.arow.warn {
+  border-left-color: color-mix(in srgb, var(--amber) 50%, transparent);
+}
+
+.arow .an {
+  font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.arow .as {
+  font-size: 12.5px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.actrls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.aarg {
+  flex: 0 1 180px;
+  font-size: 12.5px;
+}
+
+.console {
+  position: sticky;
+  top: 64px;
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px 12px;
+  min-width: 0;
+}
+
+.con-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.con-bar .sp {
+  margin-left: auto;
+}
+
+.con-bar .an {
+  font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.con-bar .muted {
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+.con-body {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.con-body pre.out {
+  max-height: 54vh;
+}
+
+.con-hist {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  max-height: 158px;
+  overflow-y: auto;
+  border-top: 1px solid var(--line-soft);
+  padding-top: 7px;
+}
+
+.con-hist button {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  justify-content: flex-start;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  padding: 2px 7px;
+  font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--muted);
+  min-width: 0;
+}
+
+.con-hist button:hover {
+  color: var(--fg);
+}
+
+.con-hist button.on {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--fg);
+}
+
+.con-hist i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--dim);
+  flex: 0 0 auto;
+}
+
+.con-hist i.ok {
+  background: var(--green);
+}
+
+.con-hist i.bad {
+  background: var(--red);
+}
+
+.con-hist i.p {
+  background: var(--accent);
+  animation: pulse 2s ease-out infinite;
+}
+
+.con-hist span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 1150px) {
+  .acts {
+    grid-template-columns: 1fr;
+  }
+
+  .console {
+    position: static;
+  }
+
+  .arow {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 4px 10px;
+  }
+
+  .actrls {
+    flex-wrap: wrap;
+  }
 }
 
 /* ── modal (the popup editor — the gen enhancement prompts) ── */
@@ -1779,9 +2957,15 @@ pre.out.err {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
+  gap: 10px 16px;
+  flex-wrap: wrap;
   padding: 12px 16px;
   border-bottom: 1px solid var(--line-soft);
+}
+
+.modal > header h3 .seg {
+  margin-left: 10px;
+  vertical-align: -2px;
 }
 
 .modal > header h3 {
@@ -1800,11 +2984,15 @@ pre.out.err {
   flex-direction: column;
   gap: 10px;
   padding: 14px 16px;
-  overflow-y: auto;
+  overflow: auto;
 }
 
 .modal-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
   padding: 12px 16px;
   border-top: 1px solid var(--line-soft);
-  text-align: right;
+  white-space: normal;
 }

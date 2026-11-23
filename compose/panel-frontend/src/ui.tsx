@@ -7,7 +7,7 @@
 // that colour means "this needs you" (amber/red) or "just a reading"
 // (accent/cyan). Anything else is a rainbow you have to decode.
 
-import { useEffect, useId, useRef } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { clamp01 } from './fmt'
 import type { Tone } from './fmt'
@@ -192,6 +192,128 @@ function lastIndexOf(values: Num[]): number {
   return -1
 }
 
+// ─────────────────────────── form bits ─────────────────────────────
+
+/** A labelled field: label above the control. Every form in the panel uses it
+ *  so label placement never changes from control to control. A div, NOT a
+ *  label: the aspect field's control is a group of buttons, and a label
+ *  activates its first labelable descendant — clicking the caption would
+ *  fire the 1:1 button and retune the size behind the user's back. */
+export function Field({
+  label,
+  children,
+  className,
+  title,
+}: {
+  label: ReactNode
+  children: ReactNode
+  className?: string
+  title?: string
+}) {
+  return (
+    <div className={`fld${className ? ` ${className}` : ''}`} title={title}>
+      <span>{label}</span>
+      {children}
+    </div>
+  )
+}
+
+/** A settings row: label in its own column, control after it. One rhythm for
+ *  the whole form, so a stack of options reads as a table, not a scatter. */
+export function FRow({ label, children, hint }: { label: ReactNode; children: ReactNode; hint?: ReactNode }) {
+  return (
+    <div className="frow">
+      <span className="fl">{label}</span>
+      <div className="fc">
+        {children}
+        {hint && <span className="fh">{hint}</span>}
+      </div>
+    </div>
+  )
+}
+
+/** Pill switch — a two-state choice that needs no words next to it. */
+export function Toggle({
+  label,
+  checked,
+  onChange,
+  disabled,
+  title,
+}: {
+  label: string
+  checked: boolean
+  onChange: (on: boolean) => void
+  disabled?: boolean
+  title?: string
+}) {
+  return (
+    <label className={`tgl${checked ? ' on' : ''}`} title={title}>
+      <input type="checkbox" checked={checked} disabled={disabled} onChange={e => onChange(e.target.checked)} />
+      <i />
+      <span>{label}</span>
+    </label>
+  )
+}
+
+/** A small group of mutually exclusive choices, rendered as one control. */
+export function Segmented<T extends string>({
+  value,
+  onChange,
+  options,
+}: {
+  value: T
+  onChange: (v: T) => void
+  options: { value: T; label: ReactNode; title?: string; count?: number }[]
+}) {
+  return (
+    <div className="seg">
+      {options.map(o => (
+        <button
+          key={o.value}
+          type="button"
+          className={o.value === value ? 'on' : ''}
+          title={o.title}
+          onClick={() => onChange(o.value)}
+        >
+          {o.label}
+          {o.count != null && <em>{o.count}</em>}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+/** Copy-to-clipboard button that says ✓ when it worked (no dialog, no prose). */
+export function CopyBtn({ text, title = 'copy' }: { text: string; title?: string }) {
+  const [done, setDone] = useState(false)
+  const copy = async () => {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text)
+      } else {
+        // plain-http LAN fallback: the async clipboard API is secure-context only
+        const ta = document.createElement('textarea')
+        ta.value = text
+        ta.style.position = 'fixed'
+        ta.style.opacity = '0'
+        document.body.appendChild(ta)
+        ta.select()
+        document.execCommand('copy')
+        ta.remove()
+      }
+      setDone(true)
+      window.setTimeout(() => setDone(false), 1200)
+    } catch {
+      /* clipboard refused — the text is still on screen */
+    }
+  }
+  return (
+    <button type="button" className="mini" title={title} onClick={() => void copy()}>
+      {done ? '✓' : '⧉'}
+    </button>
+  )
+}
+
 export function Pill({ tone = 'muted', children, title }: { tone?: Tone; children: ReactNode; title?: string }) {
   return (
     <span className={`pill t-${tone}`} title={title}>
@@ -252,6 +374,51 @@ export function TrendMark({ arrow, text, tone = 'muted' }: { arrow: string; text
 }
 
 // ─────────────────────────── dialog ──────────────────────────────────────
+
+/**
+ * A confirmation that is part of the page instead of the browser's — used for
+ * anything destructive (deleting jobs, running a privileged action). The
+ * subject goes in `body` so the dialog can name what is about to happen.
+ */
+export function ConfirmModal({
+  title,
+  body,
+  confirm = 'confirm',
+  danger,
+  busy,
+  onConfirm,
+  onClose,
+}: {
+  title: ReactNode
+  body: ReactNode
+  confirm?: string
+  danger?: boolean
+  busy?: boolean
+  onConfirm: () => void
+  onClose: () => void
+}) {
+  return (
+    <Modal
+      title={title}
+      onClose={onClose}
+      width={460}
+      footer={
+        <>
+          <button onClick={onClose}>cancel</button>
+          <button
+            className={danger ? 'danger' : 'warn'}
+            disabled={busy}
+            onClick={() => void onConfirm()}
+          >
+            {busy ? '…' : confirm}
+          </button>
+        </>
+      }
+    >
+      {body}
+    </Modal>
+  )
+}
 
 /**
  * A popup editor: a backdrop + a centred card over the page. Closes on

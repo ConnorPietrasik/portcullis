@@ -85,6 +85,17 @@ export function relTime(now: number, then: number | null, freshMs = 2000): strin
   return `${Math.floor(s / 60)}m ago`
 }
 
+/** "3m 12s" — a job's queue/render span (nothing longer than a day matters).
+ *  Components are floored, never rounded: the seconds can never carry
+ *  ("1m 60s" is not a duration) and the read never overstates the span. */
+export function dur(s: number | null | undefined): string {
+  if (s == null || !Number.isFinite(s) || s < 0) return '—'
+  if (s < 60) return `${s < 10 ? s.toFixed(1) : Math.floor(s)}s`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}m ${Math.floor(s % 60)}s`
+  return `${Math.floor(m / 60)}h ${m % 60}m`
+}
+
 /** hh:mm, for chart spans. */
 export function clockOf(t: number): string {
   return new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
