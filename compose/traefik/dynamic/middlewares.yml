@@ -35,6 +35,23 @@ http:
     # another IP would bypass it entirely. If you are tempted to re-add one:
     # don't.
 
+    # The panel API's gzip. /api never reaches panel-web's nginx (Traefik
+    # hands it to the host service directly), uvicorn doesn't compress, so
+    # without this the decoded size IS the transfer size — and the panel
+    # polls it (the Gen tab: two requests per tick, phones on metered lines).
+    # The v3 compress middleware compresses every content type except
+    # application/grpc (bodies over 1 KiB) — no mime list to configure, so
+    # application/json is covered as-is; the one explicit exclusion is the
+    # batch archive's stored ZIP (its PNG/MP4 payloads are already
+    # compressed — a gzip pass would burn CPU for ~0%). Named api-gzip, not
+    # compress, so the middleware name and the v3 config key (compress:)
+    # don't read as one word. Panel-api only: the fleet machine hosts stream
+    # model output (already-compressed, latency-sensitive) and panel-web's
+    # statics are gzipped by their own nginx.
+    api-gzip:
+      compress:
+        excludedContentTypes: [application/zip]
+
     # Injected into requests forwarded to the panel API only — Traefik
     # overwrites any client-supplied value; panel-api re-verifies it.
     panel-secret:

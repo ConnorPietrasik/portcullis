@@ -2357,11 +2357,6 @@ button.go:disabled {
   min-height: 2.84em;
 }
 
-.jprompt em {
-  font-style: normal;
-  color: var(--dim);
-}
-
 .jfoot {
   display: flex;
   justify-content: space-between;

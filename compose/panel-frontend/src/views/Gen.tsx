@@ -8,21 +8,43 @@
 // whole 500-job store never crosses the wire):
 //   /api/gen        counts + the in-flight set (bounded by the admission caps)
 //   /api/gen/jobs   ONE page of history (newest first; cursor/q/filter)
-// The in-flight set is merged into whatever page is showing, so a long video
-// keeps its progress bar on every page, and every mutation just re-polls.
+// Both are ETag/304'd — an idle tick (nothing in flight, no card changing
+// hands, no instance flapping) answers 304, headers only; the browser's
+// cache re-serves its stored body for the app (the wire is what shrinks), and
+// usePoll's NotModified path covers a 304 that reaches the app directly.
+// The page's records are CARD projections: the human prompt clipped (the
+// enhanced rewrite is dropped — it is machine text, not what was typed, and
+// it is the modal's), no params. The in-flight set is FULL and is merged
+// into whatever page is showing (so a long video keeps its progress bar on
+// every page), and the modal + remix fetch the full record by id for a
+// TERMINAL job. Every mutation just re-polls.
 //
 // The `model` field accepts a purpose key (image/video — mapped in the
 // settings) or an exact model name; the server resolves it.
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { Tab } from '../App'
-import { api, download } from '../api'
+import { api, download, NotFound } from '../api'
 import { usePoll } from '../usePoll'
 import { ConfirmModal, CopyBtn, Field, FRow, Meter, Modal, Segmented, Toggle } from '../ui'
 import { clockOf, dur, relTime } from '../fmt'
-import type { GenInstance, GenJob, GenOverview, GenPage, GenSlot, GenState } from '../types'
+import type { GenInstance, GenJob, GenJobCard, GenOverview, GenPage, GenSlot, GenState } from '../types'
 
 const IN_FLIGHT: ReadonlySet<GenState> = new Set(['queued', 'starting', 'enhancing', 'loading', 'running'])
-const isLive = (j: GenJob) => IN_FLIGHT.has(j.state)
+const isLive = (j: GenJob | GenJobCard) => IN_FLIGHT.has(j.state)
+
+/** The record's params — the card projection drops the field (the modal and
+ *  the remix hold the full record; the beat before the fetch lands, there
+ *  are none). */
+function paramsOf(j: GenJob | GenJobCard): Record<string, unknown> {
+  return 'params' in j ? (j as GenJob).params : {}
+}
+
+/** The record's enhanced prompt — the card projection drops the field (the
+ *  modal holds the full record; the beat before its fetch lands, there is
+ *  none). */
+function enhancedOf(j: GenJob | GenJobCard): string | null {
+  return 'enhanced_prompt' in j ? ((j as GenJob).enhanced_prompt ?? null) : null
+}
 
 const STATE: Record<GenState, { cls: string; label: string }> = {
   queued: { cls: 'badge', label: 'queued' },
@@ -376,7 +398,7 @@ function Composer({
 
 // ── the gallery ─────────────────────────────────────────────────────────────
 
-function Thumb({ job, big }: { job: GenJob; big?: boolean }) {
+function Thumb({ job, big }: { job: GenJob | GenJobCard; big?: boolean }) {
   const a = job.artifact
   // The file can die under a row: a record still in the store is protected (the
   // age GC skips its files), but a trimmed record or a hand `rm` leaves the URL
@@ -433,7 +455,7 @@ function JobCard({
   onOpen,
   onRemove,
 }: {
-  job: GenJob
+  job: GenJob | GenJobCard
   selected: boolean
   onSel: (on: boolean) => void
   onOpen: () => void
@@ -441,7 +463,6 @@ function JobCard({
 }) {
   const st = STATE[job.state]
   const inf = IN_FLIGHT.has(job.state)
-  const shown = job.enhanced_prompt || job.prompt
   const ago = relTime(Date.now(), (inf ? job.created_at : (job.finished_at ?? job.created_at)) * 1000)
   return (
     <div
@@ -480,9 +501,10 @@ function JobCard({
           <span className="jid">{shortId(job.id)}</span>
           <span className={st.cls}>{st.label}</span>
         </div>
-        <p className="jprompt" title={shown}>
-          {shown}
-          {job.enhanced_prompt && <em title="enhanced prompt — the rewrite is what rendered"> ✎</em>}
+        {/* the human prompt only — the rewrite (when there is one) is the
+            modal's: it is machine text, not what was typed */}
+        <p className="jprompt" title={job.prompt}>
+          {job.prompt}
         </p>
         <div className="jfoot">
           <span className="muted">{job.model}</span>
@@ -518,43 +540,101 @@ function PromptBlock({ label, text, hint }: { label: string; text: string; hint?
 function JobModal({
   job,
   o,
+  tick,
   busy,
   onClose,
   onRemove,
   onRemix,
 }: {
-  job: GenJob
+  job: GenJob | GenJobCard
   o: GenOverview
+  /** the overview poll's `last` (a bump per successful tick, a re-served
+   *  304 included) — the full-record fetch's retry clock */
+  tick: number
   busy: boolean
   onClose: () => void
-  onRemove: (j: GenJob) => void
-  onRemix: (j: GenJob) => void
+  onRemove: (j: GenJob | GenJobCard) => void
+  onRemix: (j: GenJob | GenJobCard) => void
 }) {
-  const st = STATE[job.state]
-  const instruction = o.enhance.prompts[job.model] ?? ''
-  const queueS = job.started_at != null ? job.started_at - job.created_at : null
-  const runS = job.started_at != null && job.finished_at != null ? job.finished_at - job.started_at : null
+  // The page's records are card projections (clipped prompt, no params) —
+  // the modal is the one place a clip would be seen, so a TERMINAL job takes
+  // its full record, one GET. In-flight records arrive full (the overview's
+  // active set the merge prefers) — use them directly, progress updates and
+  // all. When one goes terminal the fetch takes over — the record the modal
+  // stands on is then a clipped card, or (an off-page modal) the
+  // open-snapshot: FULL, but still the IN-FLIGHT one (a full snapshot was
+  // taken while live — terminal is sticky, so it can't be the finished
+  // record) — the fetch carries the terminal transition: due even when the
+  // standing record has params (skipping it would freeze the modal on
+  // "running"); the standing record covers the beat before it lands.
+  const [full, setFull] = useState<GenJob | null>(null)
+  // The job 404'd (deleted mid-open, or the store trim took it) — the card
+  // stands for good, no point re-asking. A blip is NOT that: the next tick
+  // retries, so one failed fetch never leaves the clipped card on display
+  // for the modal's whole life.
+  const [gone, setGone] = useState(false)
+  // A full live record in hand: the overview still lists the job in flight
+  // (the source of truth — the record the modal stands on can be a stale
+  // snapshot, and a stale in-flight state would skip the fetch, reading
+  // "running" forever) AND the record is full (the card projections carry
+  // no params — a card means the fetch is due, for the beat before the
+  // overview catches up).
+  const liveFull = o.active.some(a => a.id === job.id) && 'params' in job
+  // the in-flight fetch's hold: `tick` re-runs this effect every poll, and a
+  // response slower than the interval must not pile up a request per tick —
+  // the clock retries a SETTLED failure only (the flag clears on settle, the
+  // next tick re-fires)
+  const inflight = useRef(false)
+  useEffect(() => {
+    if (liveFull || gone || full || inflight.current) return
+    inflight.current = true
+    let on = true
+    void api<GenJob>(`/gen/jobs/${job.id}`)
+      .then(r => {
+        if (on) setFull(r)
+      })
+      .catch(e => {
+        if (!on) return
+        // a 404 (NotFound) is the only kind that keeps — the record is gone
+        // (deleted mid-open, or the store's trim took it); a blip retries on
+        // the next tick
+        if (e instanceof NotFound) setGone(true)
+      })
+      .finally(() => {
+        inflight.current = false
+      })
+    return () => {
+      on = false
+    }
+  }, [job.id, liveFull, gone, full, tick])
+  const j: GenJob | GenJobCard = liveFull ? job : (full ?? job)
+  const params = paramsOf(j)
+  const enhanced = enhancedOf(j)
+  const st = STATE[j.state]
+  const instruction = o.enhance.prompts[j.model] ?? ''
+  const queueS = j.started_at != null ? j.started_at - j.created_at : null
+  const runS = j.started_at != null && j.finished_at != null ? j.finished_at - j.started_at : null
 
   return (
     <Modal
       title={
         <>
-          {job.id} <span className={st.cls}>{st.label}</span>
+          {j.id} <span className={st.cls}>{st.label}</span>
         </>
       }
       onClose={onClose}
       width={1000}
       footer={
         <>
-          <button className="danger solid" disabled={busy} onClick={() => onRemove(job)}>
+          <button className="danger solid" disabled={busy} onClick={() => onRemove(j)}>
             delete
           </button>
-          {job.artifact && (
-            <a href={job.artifact.url} download>
+          {j.artifact && (
+            <a href={j.artifact.url} download>
               download
             </a>
           )}
-          <button onClick={() => onRemix(job)} title="load this prompt + settings into the composer">
+          <button onClick={() => onRemix(j)} title="load this prompt + settings into the composer">
             remix
           </button>
         </>
@@ -563,20 +643,20 @@ function JobModal({
       <div className="jm">
         <div className="jm-l">
           <div className="jm-media">
-            <Thumb job={job} big />
-            {job.state === 'running' && job.progress != null && (
+            <Thumb job={j} big />
+            {j.state === 'running' && j.progress != null && (
               <span className="jprog under">
-                <Meter pct={job.progress / 100} tone="load" />
-                <em>{job.progress}%</em>
+                <Meter pct={j.progress / 100} tone="load" />
+                <em>{j.progress}%</em>
               </span>
             )}
           </div>
-          <PromptBlock label="prompt" text={job.prompt} hint={job.enhanced_prompt ? 'what you typed' : undefined} />
-          {job.enhanced_prompt && <PromptBlock label="enhanced" text={job.enhanced_prompt} hint="what rendered" />}
+          <PromptBlock label="prompt" text={j.prompt} hint={enhanced ? 'what you typed' : undefined} />
+          {enhanced && <PromptBlock label="enhanced" text={enhanced} hint="what rendered" />}
           {instruction && (
             <details className="pblock">
               <summary>
-                enhance instruction <span className="muted">{job.model}</span>
+                enhance instruction <span className="muted">{j.model}</span>
               </summary>
               <p className="pt muted">{instruction}</p>
               <CopyBtn text={instruction} />
@@ -586,20 +666,20 @@ function JobModal({
 
         <div className="jm-r">
           <Row k="model">
-            {job.model} <span className="muted">{job.kind}</span>
+            {j.model} <span className="muted">{j.kind}</span>
           </Row>
           <Row k="slot">
-            {job.slot ?? <span className="muted">—</span>}
+            {j.slot ?? <span className="muted">—</span>}
           </Row>
           <Row k="params">
-            {Object.keys(job.params).length
-              ? Object.entries(job.params)
+            {Object.keys(params).length
+              ? Object.entries(params)
                   .map(([k, v]) => `${k} ${v}`)
                   .join(' · ')
               : '—'}
           </Row>
           <Row k="enhance">
-            {job.enhance ? (
+            {j.enhance ? (
               <>
                 on <span className="muted">{o.enhance_target.model}</span>
               </>
@@ -608,28 +688,28 @@ function JobModal({
             )}
           </Row>
           <Row k="queued">
-            {clockOf(job.created_at * 1000)}
+            {clockOf(j.created_at * 1000)}
             {queueS != null && <span className="muted"> · waited {dur(queueS)}</span>}
           </Row>
-          <Row k={job.kind === 'video' ? 'rendered' : 'ran'}>
-            {job.started_at ? (
+          <Row k={j.kind === 'video' ? 'rendered' : 'ran'}>
+            {j.started_at ? (
               <>
-                {clockOf(job.started_at * 1000)}
+                {clockOf(j.started_at * 1000)}
                 {runS != null ? <span className="muted"> · {dur(runS)}</span> : <span className="muted"> · running</span>}
               </>
             ) : (
               '—'
             )}
           </Row>
-          {job.artifact && (
+          {j.artifact && (
             <Row k="artifact">
-              {(job.artifact.size / 1048576).toFixed(1)} MiB <span className="muted">{job.artifact.mime}</span>
+              {(j.artifact.size / 1048576).toFixed(1)} MiB <span className="muted">{j.artifact.mime}</span>
             </Row>
           )}
-          {job.user && <Row k="by">{job.user}</Row>}
-          {job.error && (
+          {j.user && <Row k="by">{j.user}</Row>}
+          {j.error && (
             <div className="merr">
-              {job.error}
+              {j.error}
             </div>
           )}
         </div>
@@ -992,7 +1072,7 @@ export default function Gen({ intervalMs, onTab }: { intervalMs: number; onTab?:
   // the opened job's record at open time — the modal must not vanish when a
   // page change scrolls its record off screen (it re-lives while in-flight and
   // matching the filter/search: the active set is merged into every page)
-  const openSnap = useRef<GenJob | null>(null)
+  const openSnap = useRef<GenJob | GenJobCard | null>(null)
   const [settings, setSettings] = useState(false)
   const [ask, setAsk] = useState<{ ids: string[] } | null>(null)
   const [note, setNote] = useState<string | null>(null)
@@ -1020,7 +1100,7 @@ export default function Gen({ intervalMs, onTab }: { intervalMs: number; onTab?:
   // same filter/search the page was asked with, so the tabs and search filter
   // everything on screen, not just the fetched records.
   const jobs = useMemo(() => {
-    const m = new Map<string, GenJob>()
+    const m = new Map<string, GenJob | GenJobCard>()
     for (const j of page.data?.jobs ?? []) m.set(j.id, j)
     for (const j of o?.active ?? []) if (pageMatches(j, filter, q)) m.set(j.id, j)
     return [...m.values()].sort((a, b) => Number(isLive(b)) - Number(isLive(a)) || b.created_at - a.created_at)
@@ -1051,7 +1131,7 @@ export default function Gen({ intervalMs, onTab }: { intervalMs: number; onTab?:
   const selArts = Object.values(selMeta).filter(v => v.a).length
   // the live record wins while it is on this page (progress updates); the
   // snapshot keeps an off-page modal alive
-  const openJob: GenJob | null = open
+  const openJob: GenJob | GenJobCard | null = open
     ? (jobs.find(j => j.id === open) ?? (openSnap.current?.id === open ? openSnap.current : null))
     : null
 
@@ -1064,7 +1144,7 @@ export default function Gen({ intervalMs, onTab }: { intervalMs: number; onTab?:
     })
   }
 
-  function openJobModal(j: GenJob) {
+  function openJobModal(j: GenJob | GenJobCard) {
     openSnap.current = j
     setOpen(j.id)
   }
@@ -1078,7 +1158,10 @@ export default function Gen({ intervalMs, onTab }: { intervalMs: number; onTab?:
     setPageIdx(pageIdx + 1)
   }
 
-  function remix(j: GenJob) {
+  function loadRemix(j: GenJob) {
+    // what the composer wants out of a full record: the prompt the modal
+    // shows (the rewrite, when there is one — that is what rendered) + the
+    // params, as the draft's string fields
     const p = j.params as { size?: string; seed?: number; seconds?: number }
     setDraft({
       model: j.model,
@@ -1090,6 +1173,27 @@ export default function Gen({ intervalMs, onTab }: { intervalMs: number; onTab?:
     })
     setOpen(null)
     composer.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }
+
+  function remix(j: GenJob | GenJobCard) {
+    // A full record in hand — the live one off the poll, or the modal's
+    // fetched one (terminal states are sticky, so it cannot have moved) —
+    // remixes directly: no second GET for what the modal is already showing.
+    // A card is clipped (prompt) and paramless: fetch the full record first.
+    // A failed fetch NEVER falls back to the card — that would load the
+    // 200-char clip into the composer as if it were the prompt — refuse with
+    // a note instead (the modal closes; the card stands for a retry when the
+    // job is still there).
+    if ('params' in j) {
+      loadRemix(j)
+      return
+    }
+    void api<GenJob>(`/gen/jobs/${j.id}`)
+      .then(loadRemix)
+      .catch(e => {
+        setOpen(null)
+        setNote(`remix: ${e instanceof Error ? e.message : String(e)}`)
+      })
   }
 
   async function remove(ids: string[]) {
@@ -1260,6 +1364,7 @@ export default function Gen({ intervalMs, onTab }: { intervalMs: number; onTab?:
           key={openJob.id} // remount per job: the editor's state is that job's
           job={openJob}
           o={o}
+          tick={poll.last ?? 0} // the full-record fetch's retry clock
           busy={busy !== null}
           onClose={() => setOpen(null)}
           onRemove={j => setAsk({ ids: [j.id] })}
@@ -1281,7 +1386,7 @@ export default function Gen({ intervalMs, onTab }: { intervalMs: number; onTab?:
                 return (
                   <div key={id}>
                     <code>{shortId(id)}</code>{' '}
-                    <span className="muted">{j ? `${j.model} · ${(j.enhanced_prompt || j.prompt).slice(0, 60)}` : id}</span>
+                    <span className="muted">{j ? `${j.model} · ${j.prompt.slice(0, 60)}` : id}</span>
                   </div>
                 )
               })}

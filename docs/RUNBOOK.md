@@ -714,12 +714,36 @@ mkdir -p /models/llm /models/image /models/video
   `next` carries the next one; `filter` is all/active/image/video/failed, `q` a
   substring over id/model/prompt/enhanced prompt — the server searches the whole
   capped store, the page is the unit of transfer: the tab polls from phones on
-  metered lines). The in-flight set is merged into whatever page is showing,
-  subject to the same filter/search the page was asked with — a long video keeps
-  its progress bar on every page of a tab that shows it, and the filter tabs
-  (whole-store counts) filter everything on screen, not just the fetched
-  records. “Select all” selects what is on screen; the batch endpoints below
-  take any ids.
+  metered lines). The page carries CARD records, not full ones: prompt/error
+  clipped (200 chars, the card's tooltip shows the clip), `params`,
+  `radiance_video_id` and `enhanced_prompt` dropped — the card previews the
+  HUMAN prompt only (the rewrites are machine text, not prose — the Minimax
+  ones read “integrated_multimodal_description: [Shot 1]…” — and they are the
+  modal's, which shows them on select). The modal and the remix fetch the
+  FULL record per id from `GET /api/gen/jobs/{id}` for a terminal job (a
+  clipped prompt is exactly what they must never show). The in-flight set in
+  `GET /api/gen` stays FULL and is merged into whatever page is showing,
+  subject to the same filter/search the page was asked with — it is the
+  gallery's live source (progress + the prompt the modal/remix read off the
+  poll), so a long video keeps its progress bar on every page of a tab that
+  shows it, and the filter tabs (whole-store counts) filter everything on
+  screen, not just the fetched records. “Select all” selects what is on
+  screen; the batch endpoints below take any ids.
+- **The wire (data budget, part 2):** the two polls are ETag/304'd — the etag
+  is the response body's hash, so an unchanged store (the idle ticks: nothing in
+  flight, no card changing hands, no instance flapping) answers `304 Not
+  Modified`, headers only, and the browser's HTTP cache re-serves its stored
+  body for the app — the wire transfer is what shrinks, the fetch code path
+  is unchanged
+  (`Cache-Control: no-cache` forces the revalidation every tick — the poll
+  always reaches the server, it never serves a stale body; the UI's `usePoll`
+  additionally keeps its data if a 304 ever reaches the app directly, e.g.
+  through a layer that passes it through instead of re-serving the cache). And
+  the `/api` path is gzipped by Traefik's `compress` middleware (panel-api
+  router only): `/api` never reaches panel-web's nginx — Traefik hands it to the
+  host service directly — and uvicorn doesn't compress, so without it the
+  decoded size IS the transfer size; the one exclusion is the batch
+  archive's stored ZIP, which is already compressed.
 - **Batch:** the tab's selection acts on many jobs at once. The batch delete applies the same
   per-job rule as the single one (cancellable → canceled, terminal → record + files; one bad id
   never aborts the rest — the response says what happened to each). The download packs the

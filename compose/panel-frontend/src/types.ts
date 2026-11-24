@@ -345,9 +345,19 @@ export interface GenCounts {
   failed: number
 }
 
-/** one page of the job history (GET /api/gen/jobs) */
+/** The page projection of a job record (GET /api/gen/jobs): the full record
+ *  minus the modal-only fields — the params the remix loads, the radiance
+ *  video id the engine owns, and the ENHANCED prompt (the card previews the
+ *  human one; the rewrites are machine text, not prose — they are the
+ *  modal's, shown on select) — with the remaining text clipped to the card's
+ *  width. The modal and the remix fetch the full record by id for a TERMINAL
+ *  job; the overview's `active` records are full, and the gallery's merge
+ *  prefers them, so anything in flight is never the clipped shape. */
+export type GenJobCard = Omit<GenJob, 'params' | 'radiance_video_id' | 'enhanced_prompt'>
+
+/** one page of the job history (GET /api/gen/jobs) — card records, newest first */
 export interface GenPage {
-  jobs: GenJob[]
+  jobs: GenJobCard[]
   /** seq to pass as `cursor` for the next page — null at the end */
   next: number | null
 }

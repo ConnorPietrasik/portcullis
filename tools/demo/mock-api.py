@@ -17,6 +17,7 @@ stubs for the mutation endpoints so clicking buttons doesn't raise errors.
 from __future__ import annotations
 
 import json
+import hashlib
 import random
 import re
 import sys
@@ -891,11 +892,32 @@ def gen_archive(ids: list[str]) -> bytes:
     return buf.getvalue()
 
 
+GEN_CARD_TEXT_CHARS = 200
+GEN_CARD_DROP = ("params", "radiance_video_id", "enhanced_prompt")
+
+
+def gen_card(j: dict) -> dict:
+    """The page projection — mirrors the real _gen_card: the modal-only fields
+    out (params, the radiance video id, the enhanced prompt — the card
+    previews the human prompt only), the remaining long text clipped. The
+    modal and the remix fetch the full record by id for a terminal job (the
+    single-job GET stays full here, like there).
+    """
+    c = {k: v for k, v in j.items() if k not in GEN_CARD_DROP}
+    for k in ("prompt", "error"):
+        v = c.get(k)
+        if isinstance(v, str) and len(v) > GEN_CARD_TEXT_CHARS:
+            c[k] = v[: GEN_CARD_TEXT_CHARS - 1] + "…"
+    return c
+
+
 def gen_page(limit: int, cursor: int, q: str, flt: str) -> dict:
     """One window of the history (newest first) — mirrors /api/gen/jobs: same
-    cursor (seq of the record to start BEFORE), the same `q`/`filter` semantics,
-    and the same `next` (the seq of the last job on the page when it is full —
-    resume before it — or None at the end)."""
+    cursor (seq of the record to start BEFORE), the same `q`/`filter` semantics
+    (the search matches the FULL text, before the projection), and the same
+    `next` (the seq of the last job on the page when it is full — resume
+    before it — or None at the end). The records are card projections.
+    """
     needle = q.strip().lower()[:200]
 
     def matches(j: dict) -> bool:
@@ -931,7 +953,7 @@ def gen_page(limit: int, cursor: int, q: str, flt: str) -> dict:
                 # shown — never the first match past the page (the `>=` skip
                 # would drop it and it would never surface)
                 return {"jobs": rows, "next": last}
-            rows.append(j)
+            rows.append(gen_card(j))
             last = s
     return {"jobs": rows, "next": None}
 
@@ -1023,11 +1045,42 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args) -> None:  # quiet
         pass
 
-    def _json(self, obj, code: int = 200) -> None:
+    def _json(self, obj, code: int = 200, headers: dict | None = None) -> None:
         body = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json_conditional(self, obj) -> None:
+        """The gen polls' ETag/304 — mirrors the real _gen_conditional: the
+        etag is the body hash, so an unchanged store (the idle ticks — the
+        walk only moves while a job is live) answers 304, headers only. The
+        304 carries no body (RFC 7232) and echoes the etag so the client can
+        refresh its copy; Cache-Control: no-cache forces the revalidation
+        every poll, never a stale body.
+        """
+        body = json.dumps(obj, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()
+        etag = '"' + hashlib.sha256(body).hexdigest() + '"'
+        inm = (self.headers.get("If-None-Match") or "").split(",")
+        # strong comparison (RFC 9110 §13.2.1): the tag is strong, so a
+        # W/-prefixed candidate never matches — and neither does `*` (its
+        # precondition is "no current representation", which this always
+        # has) — mirrors the real endpoint
+        if any(c.strip() == etag for c in inm):
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(body)
 
@@ -1041,7 +1094,6 @@ class Handler(BaseHTTPRequestHandler):
             "/api/stack-services": stack_services,
             "/api/actions": actions,
             "/api/gpus": gpus,
-            "/api/gen": gen,
             "/api/gen/settings": lambda: {"settings": GEN_SETTINGS, "models": gen_models()},
             "/api/settings/llm": llm_settings,
             "/api/update": update_report,
@@ -1050,8 +1102,13 @@ class Handler(BaseHTTPRequestHandler):
         if p.startswith("/gen/"):
             self._artifact(p[len("/gen/"):])
             return
+        if p == "/api/gen":
+            # the tab's overview poll — ETag/304'd, like the real endpoint
+            self._json_conditional(gen())
+            return
         if p == "/api/gen/jobs":
             # the gallery's page — same params + semantics as the real endpoint
+            # (card records, ETag/304'd)
             flt = params.get("filter", "all")
             if flt not in ("all", "active", "image", "video", "failed"):
                 self._json({"detail": "filter: one of all, active, image, video, failed"}, 400)
@@ -1062,19 +1119,21 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 self._json({"detail": "bad limit/cursor"}, 400)
                 return
-            self._json(gen_page(limit, cursor, params.get("q", ""), flt))
+            self._json_conditional(gen_page(limit, cursor, params.get("q", ""), flt))
             return
         if p.startswith("/api/gen/jobs/"):
             # the single-job GET (the real endpoint 404s on an unknown id) —
             # advances the walk like the other gen routes, so polling ONLY
-            # this route still drives the state machine
+            # this route still drives the state machine. Like the real
+            # endpoint: not conditional (no ETag), but no-cache (a stale
+            # copy of a deleted record must not be served from cache)
             with GEN_LOCK:
                 gen_advance()
                 j = JOBS.get(p[len("/api/gen/jobs/"):])
             if not j:
                 self._json({"detail": "no such job"}, 404)
                 return
-            self._json(j)
+            self._json(j, headers={"Cache-Control": "no-cache"})
             return
         if p in routes:
             self._json(routes[p]())

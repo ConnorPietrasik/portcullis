@@ -14,7 +14,7 @@ http:
 
     panel-api:
       rule: "Host(`panel.pietrasik.top`) && PathPrefix(`/api`)"
-      middlewares: [auth-chain@file, panel-secret@file, rate-panel@file]
+      middlewares: [auth-chain@file, panel-secret@file, rate-panel@file, api-gzip@file]
       service: panel-api
       priority: 200
 

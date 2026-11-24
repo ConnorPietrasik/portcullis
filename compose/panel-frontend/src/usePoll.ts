@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { NotModified } from './api'
 
 /**
  * Poll `fn` every `intervalMs`; keeps `fn` fresh via a ref (no stale closures).
@@ -23,6 +24,16 @@ export function usePoll<T>(fn: () => Promise<T>, intervalMs: number) {
       setError(null)
       setLast(Date.now())
     } catch (e) {
+      // The poll's 304 (the server's ETag says the body is unchanged — the
+      // idle ticks): the browser usually re-serves its cached body instead,
+      // but if the 304 reaches the app it is a SUCCESS — the data stands (it
+      // is current: the server says the body is unchanged), a stale error
+      // clears, and only the timestamp moves.
+      if (e instanceof NotModified) {
+        setError(null)
+        setLast(Date.now())
+        return
+      }
       setError(e instanceof Error ? e.message : String(e))
     }
   }, [])

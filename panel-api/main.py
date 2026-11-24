@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import glob
+import hashlib
 import json
 import mimetypes
 import os
@@ -2988,8 +2989,75 @@ def _gen_validate_params(kind: str, params: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+# ── the wire budget (the tab polls from phones on metered lines) ──────────
+# Two moves keep the two polls small, because NOTHING on the path would
+# shrink them otherwise: /api never reaches panel-web's nginx (Traefik hands
+# it to the host service directly), uvicorn doesn't compress (Traefik's
+# `compress` middleware is the gzip — see traefik/dynamic/), and the page
+# used to carry whole records whose prompt length is unbounded.
+#
+# (1) The gallery page carries CARD records, not full ones: the card renders
+# a status chip, a line or two of the HUMAN prompt and a progress bar — the
+# full text belongs to the single-job GET, which the modal and the remix
+# fetch on demand for a terminal job. The ENHANCED prompt is dropped from
+# the card outright, not clipped: the card previews what was typed, and the
+# rewrites are usually machine text rather than prose (the Minimax ones read
+# "integrated_multimodal_description: [Shot 1]…") — the modal shows them on
+# select. Clipped, never dropped: the card's tooltip shows the clipped text,
+# the modal never does. The
+# overview's `active` set stays FULL — it is the gallery's live source
+# (progress + the prompt the modal/remix read off the poll), and the merge
+# that overwrites the page with it is what keeps a long render's bar on
+# every page.
+#
+# (2) The two polls are ETag/304'd: the body hash IS the etag, so an
+# unchanged store (the idle ticks — nothing in flight, no card changing
+# hands, no instance flapping) answers 304 — headers only — and the browser
+# reuses the body it has. Cache-Control: no-cache forces the revalidation
+# every tick: the poll always reaches the server, it never serves a stale
+# body.
+GEN_CARD_TEXT_CHARS = 200
+_GEN_CARD_DROP = ("params", "radiance_video_id", "enhanced_prompt")
+
+
+def _gen_card(j: dict[str, Any]) -> dict[str, Any]:
+    """The page projection of a job record: the modal-only fields out (params,
+    the radiance video id, the enhanced prompt — see the note above), the
+    remaining long text fields clipped (the full record is one GET away, by
+    id)."""
+    c = {k: v for k, v in j.items() if k not in _GEN_CARD_DROP}
+    for k in ("prompt", "error"):
+        v = c.get(k)
+        if isinstance(v, str) and len(v) > GEN_CARD_TEXT_CHARS:
+            c[k] = v[: GEN_CARD_TEXT_CHARS - 1] + "…"
+    return c
+
+
+def _gen_conditional(request: Request, payload: dict[str, Any]) -> Response:
+    """The ETag/304 for the gen polls (see the note above). The etag is the
+    body hash, so it is exact: only a byte-identical reply 304s. The body is
+    serialized HERE — the same options Starlette's JSONResponse uses — so
+    the etag hashes what the wire gets."""
+    data = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()
+    etag = '"' + hashlib.sha256(data).hexdigest() + '"'
+    headers = {"ETag": etag, "Cache-Control": "no-cache"}
+    inm = request.headers.get("if-none-match")
+    if inm:
+        for cand in inm.split(","):
+            c = cand.strip()
+            # Strong comparison (RFC 9110 §13.2.1): the tag issued here is
+            # strong, so a W/-prefixed candidate is never equivalent — it
+            # does not 304. Neither does `*`: that precondition is true only
+            # when the resource has NO current representation (§13.1.2), and
+            # this one always does — a 304 to it would answer an existence
+            # probe with a lie.
+            if c == etag:
+                return Response(status_code=304, headers=headers)
+    return Response(content=data, media_type="application/json", headers=headers)
+
+
 @app.get("/api/gen")
-def gen_overview(_admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
+def gen_overview(request: Request, _admin: Optional[str] = Depends(require_admin)) -> Response:
     """The tab's small half: slots, settings, counts and the in-flight set.
     Never the whole store — the history is a windowed /api/gen/jobs (the tab
     polls from phones on metered lines, so the page, not the store, is the
@@ -2998,32 +3066,39 @@ def gen_overview(_admin: Optional[str] = Depends(require_admin)) -> dict[str, An
     jobs, which the admission caps bound (GEN_CAP per slot + GEN_ENHANCE_CAP
     system-wide); the store cap (MAX_JOBS_KEPT) bounds the whole. The gallery
     merges it into whatever page it is showing, subject to that page's
-    filter/search."""
+    filter/search.
+
+    `active` is FULL records, not the page's card projection (the note above
+    explains why), and the reply is ETag/304'd (an idle tick costs headers
+    only)."""
     w = _gen_world()
     settings = gen_jobs.load_settings()
     jobs = [w["jobs"][i] for i in w["store"]["order"] if i in w["jobs"]]
     active = [j for j in jobs if j["state"] not in gen_jobs.TERMINAL_STATES]
-    return {
-        "slots": [{**row, "status": w["status"][row["name"]]} for row in sorted(w["slots"].values(), key=lambda r: r["name"])],
-        # the whole fleet (the settings' enhance-target picks an instance +
-        # one of its llm models from here)
-        "instances": [row for row in w["instances"].values() if row["llms"]],
-        "enhance_target": w["enhance_target"],
-        "active": active,
-        # whole-store counts (the gallery's filter tabs) — counting is cheap,
-        # the records are not what the wire needs
-        "counts": {
-            "all": len(jobs),
-            "active": len(active),
-            "image": sum(1 for j in jobs if j["kind"] == "image"),
-            "video": sum(1 for j in jobs if j["kind"] == "video"),
-            "failed": sum(1 for j in jobs if j["state"] in (gen_jobs.FAILED, gen_jobs.CANCELED)),
+    return _gen_conditional(
+        request,
+        {
+            "slots": [{**row, "status": w["status"][row["name"]]} for row in sorted(w["slots"].values(), key=lambda r: r["name"])],
+            # the whole fleet (the settings' enhance-target picks an instance +
+            # one of its llm models from here)
+            "instances": [row for row in w["instances"].values() if row["llms"]],
+            "enhance_target": w["enhance_target"],
+            "active": active,
+            # whole-store counts (the gallery's filter tabs) — counting is cheap,
+            # the records are not what the wire needs
+            "counts": {
+                "all": len(jobs),
+                "active": len(active),
+                "image": sum(1 for j in jobs if j["kind"] == "image"),
+                "video": sum(1 for j in jobs if j["kind"] == "video"),
+                "failed": sum(1 for j in jobs if j["state"] in (gen_jobs.FAILED, gen_jobs.CANCELED)),
+            },
+            "models": gen_jobs.known_models(w["slots"]),
+            "purposes": settings["purposes"],
+            "enhance": settings["enhance"],
+            "gc_days": settings["gc_days"],
         },
-        "models": gen_jobs.known_models(w["slots"]),
-        "purposes": settings["purposes"],
-        "enhance": settings["enhance"],
-        "gc_days": settings["gc_days"],
-    }
+    )
 
 
 @app.post("/api/gen/jobs", status_code=201)
@@ -3072,19 +3147,29 @@ def _gen_job_seq(jid: str) -> Optional[int]:
 
 @app.get("/api/gen/jobs")
 def gen_jobs_list(
+    request: Request,
     limit: int = 50,
     cursor: int = 0,
     q: str = "",
     filter: str = "all",  # noqa: A002 — query param named after the UI's filter tabs
     _admin: Optional[str] = Depends(require_admin),
-) -> dict[str, Any]:
+) -> Response:
     """One window of the job history, newest first — the gallery's page.
     `cursor` resumes BEFORE the record with that seq (the previous page's
     `next`); `q` is a case-insensitive substring over id/model/prompt/
     enhanced prompt; `filter` is one of GEN_JOB_FILTERS (active = anything
     not terminal, failed includes canceled — the UI's tab semantics). The
     scan is over the capped store (MAX_JOBS_KEPT), so even a full-history
-    search is a few hundred dict checks."""
+    search is a few hundred dict checks.
+
+    The records are CARD projections (`_gen_card`, the note above): the page
+    is the gallery's window and the card its unit — the search still matches
+    the FULL text (it runs against the store, before the projection), but
+    the wire carries the clipped one, and the enhanced prompt is dropped
+    outright (the card previews the human one; the rewrite is the modal's);
+    the modal and the remix take the full record from the single-job GET,
+    per id, for a terminal job. The reply is
+    ETag/304'd — an unchanged store (the idle ticks) costs headers only."""
     limit = max(1, min(limit, 200))
     cursor = max(0, cursor)
     if filter not in GEN_JOB_FILTERS:
@@ -3109,6 +3194,10 @@ def gen_jobs_list(
 
     out: list[dict[str, Any]] = []
     last: Optional[int] = None  # seq of the last job on this page
+
+    def reply(next_cursor: Optional[int]) -> Response:
+        return _gen_conditional(request, {"jobs": [_gen_card(j) for j in out], "next": next_cursor})
+
     for jid in reversed(store["order"]):
         j = store["jobs"].get(jid)
         if not j:
@@ -3129,18 +3218,23 @@ def gen_jobs_list(
             # that match next pass and it would never surface.) The scan
             # stops at a full page — there is no match between the cursor
             # and the page's end to look for.
-            return {"jobs": out, "next": last}
+            return reply(last)
         out.append(j)
         last = s
-    return {"jobs": out, "next": None}
+    return reply(None)
 
 
 @app.get("/api/gen/jobs/{jid}")
-def gen_job_get(jid: str, _admin: Optional[str] = Depends(require_admin)) -> dict[str, Any]:
+def gen_job_get(jid: str, _admin: Optional[str] = Depends(require_admin)) -> Response:
+    """The FULL record — the page's card projection's other half: the modal
+    and the remix fetch it per id for a terminal job (a clipped prompt is
+    exactly what they must never show). Not _gen_conditional: nothing
+    revalidates it (no ETag), but no-cache — an aggressive cache must not
+    serve a stale copy of a record the store has since deleted."""
     job = gen_jobs.get_job(jid)
     if not job:
         raise HTTPException(404, "no such job")
-    return job
+    return JSONResponse(job, headers={"Cache-Control": "no-cache"})
 
 
 @app.delete("/api/gen/jobs/{jid}")
