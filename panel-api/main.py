@@ -2421,6 +2421,18 @@ async def _gen_await_request(coro, jid: str) -> Any:
     raise _JobCanceled()
 
 
+def _gen_video_prompt(job: dict[str, Any], prompt: str) -> str:
+    """The prompt as sent to the enhance LLM for a video job:
+    ``"[5s video] {prompt}"`` when the job carries a length (``params.seconds``)
+    — the rewriter plans scene timing against the target length. Its output is
+    what the model gets (no tag). No length set (the model's default applies)
+    → the prompt unchanged."""
+    s = job["params"].get("seconds")
+    if s is None:
+        return prompt
+    return f"[{s:g}s video] {prompt}"
+
+
 async def _gen_enhance_call(base: str, model: str, user_prompt: str, instruction: str) -> str:
     """One non-streaming chat completion against the enhance target (the
     settings' instance + model). The per-gen-model ``instruction`` is the
@@ -2671,8 +2683,11 @@ async def _gen_enhance_phase(jid: str) -> None:
             return  # canceled while the target came up — nothing to send
         if not et_ip:
             return
+        # video jobs carry their length in the prompt ("[5s video] …") — the
+        # rewriter plans scene timing against it (images: the helper is a no-op)
+        user_prompt = _gen_video_prompt(job, job["prompt"])
         final_prompt = await _gen_await_request(
-            _gen_enhance_call(f"http://{et_ip}:8000", et["model"], job["prompt"], instruction), jid
+            _gen_enhance_call(f"http://{et_ip}:8000", et["model"], user_prompt, instruction), jid
         )
 
         def _m(job2: dict[str, Any]) -> None:

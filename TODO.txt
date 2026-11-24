@@ -1,4 +1,3 @@
-Add video length to the enhancement prompt that gets sent for video jobs; like [5s video] {prompt}
 Add image / video edit stuff
 Add servitor image/video integration
 - `/machine/gen/*` route alias over the same handlers + bearer gate
