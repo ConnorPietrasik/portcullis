@@ -618,7 +618,7 @@ resource). Only ONE of the two fits the card's VRAM at a time; there is delibera
 waits for the other to finish — a switch is bounded by the config's `drain-timeout`), and between
 sessions the cheaper-to-reload one (Writer) yields first. Listing `Writer` FIRST makes it the
 resident one right after boot (the warm-up loads later-in-file entries first and the last loaded
-parks the earlier one — see the config's header):
+parks the earlier one):
 
 | entry (the /v1 `model` name) | file (`/models/llm/`) | role |
 |---|---|---|

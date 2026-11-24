@@ -1,38 +1,3 @@
-# Search — SearXNG. Two hosts, one router each:
-#   search.pietrasik.top = agent API — whole-host key-gated (LLM_API_KEY,
-#     reused — owner decision), NO path scoping (mcp-searxng probes
-#     /config + /autocompleter on the same host). Whole-host is safe: the
-#     host has no state-changing surface (instance state lives in
-#     settings.yml) and no arbitrary-fetch surface (/image needs an HMAC
-#     under the sed-filled instance secret; /metrics its own password).
-#     The key gate is the control (limiter: false is deliberate, not a
-#     guard — the why is in settings.yml).
-#   searx.pietrasik.top  = browser UI — Authelia chain on the existing
-#     *.pietrasik.top two_factor wildcard. ZERO ACL edits; the bare-domain
-#     bypass stays last. Droppable: removing this router + the base_url
-#     line in settings.yml leaves the agent path byte-identical.
-#
-# The gate is panel-api's /gate/search — a KEY CHECKER, not a proxy: it
-# answers 200/401/503 ONLY, and forwardAuth forwards only on [200, 300)
-# (every other status — 3xx included — is copied to the client verbatim).
-# A proxy-through-panel-api design would put every search byte through a
-# second process for zero security gain (the gate IS the auth). The address
-# is the docker0 bridge IP, literally: panel-api binds 172.17.0.1 and there
-# is no panel-api DNS name on edge; host.docker.internal resolves to the
-# EDGE gateway, where nothing listens (panel.yml notes the same).
-#
-# Both forwardAuth keys are version-gated on the floated traefik:v3:
-# maxResponseBodySize needs >= v3.6.9; trustForwardHeader is deprecated as
-# of v3.6.14 and removed in v4 (explicit false is the STRONG v3 behavior —
-# it strips ALL X-Forwarded-* from the gate subrequest). An unknown key is
-# a file-provider DECODE ERROR that fails the WHOLE file to land (on a
-# first load, every route in it — the ship check gates both keys against
-# a printed traefik version; RUNBOOK → Web search).
-#
-# Naming: no gpu-*/fleet-* prefix (not an instance — doctor's orphan
-# check). No secret may live in a dynamic file; the key lives only in
-# .panel-api.env.
-
 http:
   routers:
     search:
@@ -56,17 +21,14 @@ http:
     search-gate:
       forwardAuth:
         address: "http://172.17.0.1:8010/gate/search"
-        trustForwardHeader: false   # v3-only key — deprecated v3.6.14+, gone in v4
-        maxResponseBodySize: 4096   # v3.6.9+ only — the landing version check gates both keys
+        trustForwardHeader: false
+        maxResponseBodySize: 4096
 
     search-rate:
       rateLimit:
-        # Budget sized to the 4-thread ceiling, not to any inference rate:
-        # search and the UI share the pool; the rate limit blunts abuse,
-        # GRANIAN_BLOCKING_THREADS is the capacity. Source is the socket
-        # address — Traefik terminates TLS itself, so the peer IS the
-        # client. Do not add forwardedHeaders/trustedIPs anywhere: it would
-        # hand the shared-key holder their own rate-limit identity.
+        # keys on the socket address (Traefik terminates TLS): do NOT add
+        # forwardedHeaders/trustedIPs — it would hand the shared-key holder
+        # their own rate-limit identity
         average: 2
         period: 1s
         burst: 10

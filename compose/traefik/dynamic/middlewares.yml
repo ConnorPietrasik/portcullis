@@ -1,7 +1,6 @@
-# Shared middlewares. The X-Panel-Token and X-Servitor-Edge-Key values are
-# placeholders — stack_sync_configs (setup/common.sh) substitutes them in
-# the deployed files (which therefore contain secrets — chmod 600 on the
-# server).
+# Shared middlewares. The __PANEL_TOKEN__ / __SERVITOR_EDGE_KEY__ values are
+# placeholders — stack_sync_configs (setup/common.sh) substitutes them in the
+# deployed files (which then hold secrets — chmod 600 on the server).
 
 http:
   middlewares:
@@ -9,13 +8,10 @@ http:
       headers:
         stsSeconds: 31536000
         stsIncludeSubdomains: true
-        frameDeny: true # X-Frame-Options: DENY — nothing here needs iframing
+        frameDeny: true
         contentTypeNosniff: true
         referrerPolicy: same-origin
 
-    # /api/authz/forward-auth is the 4.38+ replacement for the deprecated
-    # /api/verify?rd=… (the portal URL now comes from the session cookie's
-    # authelia_url, so the rd parameter is gone).
     authelia:
       forwardAuth:
         address: http://authelia:9091/api/authz/forward-auth
@@ -28,44 +24,18 @@ http:
       chain:
         middlewares: [sec-headers, authelia]
 
-    # No rate limit on the fleet machine-API hosts: the API key IS the gate
-    # (a wrong key 401s before any GPU work, and radiance's admission
-    # control bounds GPU spend), and a per-IP bucket shared by every client
-    # behind one NAT only punishes genuine traffic — a leaked key from
-    # another IP would bypass it entirely. If you are tempted to re-add one:
-    # don't.
-
-    # The panel API's gzip. /api never reaches panel-web's nginx (Traefik
-    # hands it to the host service directly), uvicorn doesn't compress, so
-    # without this the decoded size IS the transfer size — and the panel
-    # polls it (the Gen tab: two requests per tick, phones on metered lines).
-    # The v3 compress middleware compresses every content type except
-    # application/grpc (bodies over 1 KiB) — no mime list to configure, so
-    # application/json is covered as-is; the one explicit exclusion is the
-    # batch archive's stored ZIP (its PNG/MP4 payloads are already
-    # compressed — a gzip pass would burn CPU for ~0%). Named api-gzip, not
-    # compress, so the middleware name and the v3 config key (compress:)
-    # don't read as one word. Panel-api only: the fleet machine hosts stream
-    # model output (already-compressed, latency-sensitive) and panel-web's
-    # statics are gzipped by their own nginx.
+    # No rate limit on the fleet machine hosts: the API key IS the gate, and a
+    # per-IP bucket shared by every client behind one NAT only punishes
+    # genuine traffic.
     api-gzip:
       compress:
         excludedContentTypes: [application/zip]
 
-    # Injected into requests forwarded to the panel API only — Traefik
-    # overwrites any client-supplied value; panel-api re-verifies it.
     panel-secret:
       headers:
         customRequestHeaders:
           X-Panel-Token: __PANEL_TOKEN__
 
-    # The servitor edge credential (invariant 3 in the servitor repo): the
-    # guest firewall admits the port from the WHOLE edge subnet, so the key
-    # — re-verified by the app on every route — is what stops a neighbor
-    # container (the public gpu fleet) from driving the agent or reading
-    # its files (same Traefik-overwrites-any-client-value contract as
-    # panel-secret above). Must equal SERVITOR_EDGE_KEY in
-    # /opt/servitor-repo/.env (make doctor cross-checks).
     servitor-edge:
       headers:
         customRequestHeaders:

@@ -1,22 +1,3 @@
-# GPU fleet — one router pair per instance WITH a public host (any model
-# class the pool serves). The gen slots are gpu.private: no router here —
-# panel-api reaches them by container IP (see the compose header). TLS
-# terminates here; auth is the instance's own API key (Authorization:
-# Bearer), NOT Authelia — forward-auth is cookie-based and can't serve
-# bearer-only clients. A wrong key 401s before any GPU work; radiance's
-# admission control (429 + Retry-After) bounds spend (see the no-rate-limit
-# note in middlewares.yml). A host 502s until its instance is up — harmless.
-#
-# Naming: gpu-<name> is an INSTANCE — router, traefik service, compose
-# service and container share the name, 1:1 (make doctor's orphan check
-# assumes that prefix). Shared (non-instance) routers are fleet-*, never
-# gpu-*, and route to the panel-api service defined in panel.yml (same file
-# provider, so one service, not redefined here):
-#   fleet-fallback  llm.pietrasik.top /v1     — ordered LLM fallback (llm.yml)
-#   fleet-open      <instance hosts> /open    — dashboards' key bootstrap
-# New instance = router pair + `|| Host(`<name>.pietrasik.top`)` in
-# fleet-open (make doctor verifies the list; RUNBOOK → GPU fleet).
-
 http:
   routers:
     gpu-27b:
@@ -44,15 +25,6 @@ http:
       middlewares: [sec-headers@file]
       service: gpu-writer
 
-    # Key bootstrap for the radiance dashboards: /open is a one-line page
-    # served by panel-api (which holds LLM_API_KEY) that writes the key into
-    # the dashboard's own-origin localStorage and bounces to /. The ONLY
-    # Authelia-gated path on these hosts — /v1 stays bearer-gated for API
-    # clients. Admins-only: the wildcard admits any user to the path, so
-    # panel-api re-checks Remote-Groups.
-    # Traefik v3 takes ONE host per Host() — the v2 multi-value form is a
-    # parse error traefik SWALLOWS (logs it, drops just this router), so
-    # OR the hosts inside one conjunction: (Host(`a`) || Host(`b`)) && ...
     fleet-open:
       rule: "(Host(`27b.pietrasik.top`) || Host(`27b-1.pietrasik.top`) || Host(`27b-2.pietrasik.top`) || Host(`flashnext.pietrasik.top`) || Host(`writer.pietrasik.top`)) && PathPrefix(`/open`)"
       middlewares: [auth-chain@file]

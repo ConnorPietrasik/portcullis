@@ -1,12 +1,5 @@
-# Portcullis route for the servitor agent VM. Raw-IP upstream: the libvirt
-# domain sits on the edge bridge at a static address (invariant 2: the route
-# is a file, no docker.sock). The IP mirrors SERVITOR_VM_IP in
-# /opt/servitor-repo/.env — keep in sync on re-address.
-# Auth: two gates — the auth chain (the servitor admins-only rule pair in
-# authelia/configuration.yml sits ABOVE the wildcard) + servitor-edge (the
-# app re-verifies the key on every route — why it is needed: the middleware
-# comment in middlewares.yml). Rides 443 — no UFW ingress change.
-
+# Raw-IP upstream (the VM sits on the edge bridge): the IP mirrors
+# SERVITOR_VM_IP in /opt/servitor-repo/.env — keep in sync on re-address.
 http:
   routers:
     servitor:
@@ -23,11 +16,8 @@ http:
         servers:
           - url: "http://172.18.0.15:8787"
         passHostHeader: true
-        # SSE contract: a stream cut by a proxy timeout is the bug we must
-        # not reproduce. Traefik v3 has NO per-service response timeout
-        # (defaults are 0) — the app's ~15 s heartbeats keep the client side
-        # live. flushInterval is v3's only responseForwarding field (set for
-        # the record); do NOT re-add a readTimeout key — v3 has no such
-        # loadBalancer field and silently ignores unknown ones.
+        # SSE: no response timeout on purpose — a proxy-cut stream is the bug
+        # we must not reproduce (v3 has no such loadBalancer key; unknown keys
+        # are silently ignored, so don't add one)
         responseForwarding:
           flushInterval: 100ms

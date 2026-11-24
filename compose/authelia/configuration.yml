@@ -1,6 +1,4 @@
-# Authelia configuration. Secrets are injected via the AUTHELIA_*
-# environment (docker-compose.yml), never stored in this file.
-# Docs: https://www.authelia.com/configuration/prologue/introduction/
+# Secrets are injected via the AUTHELIA_* environment — never stored here.
 
 theme: dark
 
@@ -12,14 +10,13 @@ log:
 
 authentication_backend:
   password_reset:
-    disable: true # filesystem notifier can't send mail; reset via CLI if needed
+    disable: true
   file:
     path: /config/users_database.yml
 
-# Order matters: first match wins. Specific rules BEFORE the wildcard; the
-# bare-domain bypass stays LAST so any new subdomain is private-by-default
-# (it falls to the *.pietrasik.top rule above it).
 access_control:
+  # Order matters: first match wins — specific rules BEFORE the wildcard, the
+  # bare-domain bypass LAST (a new subdomain is private-by-default).
   default_policy: deny
   rules:
     - domain: auth.pietrasik.top
@@ -27,39 +24,33 @@ access_control:
 
     - domain: panel.pietrasik.top
       policy: two_factor
-      subject: ['group:admins'] # only admins — a subject rule only MATCHES
-                                # admins; the deny below EXCLUDES everyone else
+      subject: ['group:admins']
     - domain: panel.pietrasik.top
-      policy: deny # without this catch-all, non-admins fall through to the
-                   # wildcard below and are admitted after 2FA
+      policy: deny # without this catch-all, non-admins fall to the wildcard below and are admitted after 2FA
 
     - domain: servitor.pietrasik.top
       policy: two_factor
-      subject: ['group:admins'] # same two-rule pattern as the panel
+      subject: ['group:admins']
     - domain: servitor.pietrasik.top
       policy: deny
 
-    # Example rules — uncomment (kept ABOVE the wildcard) when you add these
-    # apps; until then they are dead weight (no matching router exists):
+    # Example rules — uncomment (kept ABOVE the wildcard) when you add these apps:
     # - domain: jellyfin.pietrasik.top # friends-only app
     #   policy: two_factor
     #   subject: ['group:friends']
     # - domain: demo.pietrasik.top # public demo — the app does its own auth
     #   policy: bypass
 
-    - domain: www.pietrasik.top # portfolio: public
+    - domain: www.pietrasik.top
       policy: bypass
 
-    - domain: '*.pietrasik.top' # everything else: any authenticated user
+    - domain: '*.pietrasik.top'
       policy: two_factor
 
-    - domain: pietrasik.top # portfolio: public (bare domain + www above)
+    - domain: pietrasik.top
       policy: bypass
 
 session:
-  # default_redirection_url MUST be per-cookie (4.38+ multi-domain
-  # protection): a top-level one is a hard startup error while cookies[] is
-  # configured.
   cookies:
     - name: authelia_session
       domain: pietrasik.top

@@ -1,28 +1,15 @@
-# gpu-gentp1a — gen slot (PRIVATE: no router — see the compose header).
-# radiance 2.x reads THIS file only (`radiance --config`, no flags; a key
-# is the pre-2.x flag minus its dashes). The API key arrives via
-# RADIANCE_API_KEY (api-key-env), never written here. Config edits sync on
-# `make update` but recreate nothing — restart the slot from the panel's
-# GPU view to apply them.
-# Gen-ONLY: the gen model is the sole entry and simply stays resident — a
-# slot start pays a disk load once and the first job pays nothing. Prompt
-# enhancement runs off-slot, on the writer (Gen settings).
-
 server:
   host: 0.0.0.0
   port: 8000
   api-key-env: RADIANCE_API_KEY
 memory:
   gpu-headroom-mib: 96
-  # pinned-RAM CEILING (not a reservation): sized for the removed in-slot-LLM
-  # slot design; the gen-only pinned need is a strict subset. Never lower it
-  # on a guess
   host-mib: 24576
 scheduler:
-  load-timeout: 300s # cold load (16–20 GiB off NVMe + engine init) + headroom
+  load-timeout: 300s
   drain-timeout: 30s
-  warm-up: true # load at start so the first job pays no disk load
+  warm-up: true
 models:
-  Krea2: # image gen (12.9B DiT, IQ8R) — the engine sizes image models itself
+  Krea2:
     model: /models/image/krea-2-raw-iq8r.rad
-    tp: 1 # == the block's gpu.cards (doctor cross-checks)
+    tp: 1

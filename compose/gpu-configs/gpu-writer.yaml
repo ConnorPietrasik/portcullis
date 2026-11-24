@@ -1,92 +1,40 @@
-# gpu-writer — the 7th card (PCIe5 x8, the odd one out): x8 halves the LOAD
-# traffic (weight loads over PCIe), not inference (VRAM-bandwidth-bound) —
-# so the chat models live here; the swapping gen slots keep the x16 cards.
-# radiance 2.x reads THIS file only (`radiance --config`, no flags; a key
-# is the pre-2.x flag minus its dashes — `radiance --help` is the
-# reference). The API key arrives via RADIANCE_API_KEY (api-key-env), never
-# written here. Config edits sync on `make update` but recreate nothing —
-# restart the instance from the panel's GPU view to apply them.
-#
-# Multi-model = radiance's router: both entries serve :8000 and /v1 routes
-# by the `model` name. The Gen section's prompt enhancement targets the
-# "Writer" entry (Gen settings → enhance target; the engine reaches this
-# instance by container IP over the edge network, like the gen slots).
-# Only ONE of the two fits the card's VRAM at a time — the other parks to
-# its .rad on disk (park: {ram: never} on both: pinned host RAM is the
-# scarce shared resource, and the restore pays a full load).
-#
-# Residency: NO `priority` on either entry (both default 0) — neither
-# "always wins". A model AT WORK is protected (eviction drains it first,
-# bounded by drain-timeout); between IDLE models the one that costs least
-# to restore yields first (upstream's tiebreak — here "Writer", the small
-# one). Listing order still fixes the BOOT instant: the warm-up loads the
-# unpinned entries lowest-priority first, LATER IN THE FILE FIRST among
-# equals — the LAST loaded is the resident one. "Writer" is listed first
-# (loads last) so the enhance path pays no restore right after boot.
-# The fit question (does one max-length sequence's KV fit beside the
-# weights?) is answered by the first boot: the startup report's `vram
-# claim`/`kv` lines, or the refusal that names the shortfall.
-
+# `kernels: libr4d,spechub` (packager-recommended) is deliberately OUT: the key
+# is server-level (it would bind gemma too) and a non-empty list is exclusive —
+# it would narrow the kernel set for every model in this process.
 server:
   host: 0.0.0.0
   port: 8000
   api-key-env: RADIANCE_API_KEY
-  # The writer's packager also recommends `kernels: libr4d,spechub` — left
-  # OUT: the key is server-level (it would bind gemma too) and a non-empty
-  # list is EXCLUSIVE (the image ships more kernel libraries than those two,
-  # so the pin would narrow the set every model in this process runs on).
-  # Add it if the writer model ever misbehaves in a kernel-ish way (a
-  # missing-op boot failure the startup report names).
 memory:
   gpu-headroom-mib: 96
-  # no host-mib: the fleet LLM configs leave it unset (default: 75% of the
-  # host) — the 31B's KV host tier is too big to guess a ceiling for, and
-  # the budget is a ceiling, not a reservation
 scheduler:
-  load-timeout: 300s # cold load over x8 (half the lane's bandwidth) + headroom
-  drain-timeout: 30s # the bound on a mid-session switch (residency above)
-  warm-up: true # load both at start (the second loaded parks the first to disk)
+  load-timeout: 300s
+  drain-timeout: 30s
+  warm-up: true
 models:
-  Writer: # hemmingway 1.5 IQ4R (tool-calling, MTP)
+  Writer:
     model: /models/llm/hemmingway-1.5-iq4r-s-tool-tail-mtp-gptq.rad
-    aliases: [default] # model-less requests land here (the instance's default)
-    tp: 1 # == the block's gpu.cards (doctor cross-checks — this is the file's first tp:)
+    aliases: [default]
+    tp: 1
     max-model-len: 200000
-    max-num-seqs: 8 # the panel's enhance cap lands here by default; over-
-    # subscribing is safe (radiance queues excess sequences)
-    # Packager-recommended: the MTP drafter the model ships (auto = the
-    # drafter's own operating point; resolves to 0 where there's no draft
-    # head — safe either way), an adaptive draft window, coupled sampling
+    max-num-seqs: 8
     num-speculative-tokens: auto
     draft-window: adaptive
     draft-coupling: on
-    kv-cache-dtype: i8 # K/V as int8 — halves what a token of context costs in VRAM
+    kv-cache-dtype: i8
     park: {ram: never}
-  Uncensored: # gemma 31B a4 — the unfiltered chat entry
+  Uncensored:
     model: /models/llm/gemma4-31b-heretic-ara-a4.rad
     tp: 1
-    # A CEILING, not a preallocation: the KV pool is the budget-resolved
-    # leftover VRAM. The one hard cost: one full-length sequence's KV is a
-    # BOOT FLOOR (the fit question — header)
     max-model-len: 100000
     kv-cache-dtype: i8
-    max-num-seqs: 8 # headroom for direct sessions
-    # Packager-recommended per-model defaults (the sampling three are
-    # defaults for requests that do not set them):
+    max-num-seqs: 8
     max-num-batched-tokens: 2048
-    num-speculative-tokens: 3 # the packager's draft window — drop this line
-    # if the boot says the container carries no draft head
-    vision-tower-placement: ram # encoder towers in pinned host RAM so the
-    # VRAM goes to the KV pool (the boot refuses if the model has no tower)
+    num-speculative-tokens: 3
+    vision-tower-placement: ram
     temp: 1.0
     top-p: 0.95
     top-k: 64
-    # The packager's per-request requirement as an entry default: handed to
-    # the chat template on EVERY chat request (a request's own
-    # chat_template_kwargs still wins key by key)
     chat-template-kwargs: {enable_thinking: true}
-    # The long-session keeper: with a host tier, a resumed conversation
-    # RESTORES from pinned RAM instead of re-prefilling (LRU drops the
-    # oldest). Sized to the longest conversation you expect to resume.
     prefix-cache-mib: 16384
     park: {ram: never}

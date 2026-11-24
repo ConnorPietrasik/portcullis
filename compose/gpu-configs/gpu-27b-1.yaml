@@ -1,12 +1,4 @@
-# gpu-27b-1 — radiance 2.x reads THIS file only (`radiance --config`, no
-# flags; a key is the pre-2.x flag minus its dashes — `radiance --help` is
-# the reference). The API key arrives via RADIANCE_API_KEY (api-key-env),
-# never written here. Config edits sync on `make update` but recreate
-# nothing — restart the instance from the panel's GPU view to apply them.
-
-# bf16 KV (no kv-cache-dtype: the fp8 cache diverges on long contexts).
-# VRAM holds ~612k tokens; the 40 GiB host tier keeps evicted context for
-# re-prefill (box: 251 GiB RAM).
+# No kv-cache-dtype on purpose: bf16 KV — the fp8 cache diverges on long contexts.
 server:
   host: 0.0.0.0
   port: 8000
@@ -16,11 +8,11 @@ memory:
 models:
   Qwen3.8-27B:
     model: /models/llm/qwen3.8-27b-iq6r-s-v4.rad
-    aliases: [default]           # model-less requests land here
-    tp: 2                        # == the block's gpu.cards (doctor cross-checks)
+    aliases: [default]
+    tp: 2
     max-num-seqs: 6
     max-model-len: 250000
-    prefix-cache-mib: 40960      # the host tier — 0 (the default) turns it OFF
-    checkpoint-policy: tip-only  # bounds the snapshot store's pinned RAM
+    prefix-cache-mib: 40960 # the host tier — 0 turns it OFF
+    checkpoint-policy: tip-only
     num-speculative-tokens: 3
     max-num-batched-tokens: 2048
