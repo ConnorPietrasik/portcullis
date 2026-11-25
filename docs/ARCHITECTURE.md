@@ -126,6 +126,48 @@ existing Authelia gate; the `GET /api/gen/jobs/{id}/content` twin exists so the 
 (`/machine/gen/*`, the fleet key as bearer — no Authelia, the servitor is an agent, not a browser)
 needs no second artifact path.
 
+**Image EDITING: the same slots, the same dir, the same gate — no new surface.** The tp1 gen slots host a
+**parking pair** rather than one model each: Krea 2 (text→picture) and NoctQ-V4 (a Qwen-Image 2.1 finetune,
+which also SERVES `/v1/images/edits`). Their weights never fit one card together, so radiance keeps one
+resident and swaps the other in — and the panel enforces **one model per slot at a time**
+(`gen_jobs.admission`) precisely so two in-flight jobs cannot hand the card back and forth by parking each
+other every step. That is a scheduler invariant, not a trust boundary; the trust story is unchanged, because
+an edit is the same request shape over the same edge-network data path. What IS new is that a request now
+carries picture bytes, and they are bounded where they arrive: `data:` URLs only, a format allowlist (png,
+jpeg, webp — a mask png/webp for its alpha), a per-picture cap and a per-request count cap, decoded by panel-api
+and written under the panel's OWN generated names (`job-NNNNNN-in0.png`, `job-NNNNNN-mask.png`) into the same
+`/models/gen-output`. No user-chosen filename ever reaches the filesystem, so there is nothing to traverse;
+the panel-web nginx allowlist grew to those two name shapes and nothing else (a hand-placed or temp file in
+that dir stays unreachable, and the dir is still ro-bound into the container). Deleting a job removes its
+sources with it, and the age GC matches them by the same `job-NNNNNN` prefix. No new privileged path, no new
+secret, no new route: the source pictures ride the panel host's existing Authelia gate like every artifact.
+
+**What a model can do is radiance's answer, not the panel's table.** Whether an entry serves `/v1/images/edits`
+is a property of the weights, so the engine ASKS: a capability pass reads `capabilities.image_edit` off each
+RUNNING slot's `/v1/models` into `/opt/panel-api/gen-capabilities.json`, keyed by model name and the config's
+model PATH (a file swapped under the same name re-probes). That cache is what lets the Gen tab offer "attach a
+picture" for NoctQ-V4, say "text only" for Krea 2, and budget an edit's frame against the entry's
+`max-model-len` (the row budget ONE pass gets: prompt + every reference picture + the frame). It is a cache of
+an internal answer, never a policy: a model radiance has never been asked (an entry its process has not
+loaded) reads as UNVERIFIED, not as unable — so the probe must never guess, and the create endpoint's own
+capability check refuses only what radiance has positively said it cannot do. The pass talks to slots panel-api
+already talks to, over the same segment and the same fleet bearer — no new surface, no new key.
+
+**A model's SIZE is the config's answer, and it can differ per seat — so cost routes.** `max-model-len` is
+an entry's context bound and, for a generator, its KV floor: the bytes every restore has to find room for.
+It is therefore sized per CARD, not per model: `NoctQ-V4` is bound at 8192 rows on a tp1 slot — the
+one-card value upstream sizes for this model (it needs 29.7 GiB, `docs/GUIDE` §5.6) — and UNBOUNDED on the
+tp2 pair as written (the long-pass seat, which loads only once bounded — RUNBOOK → Editing pictures), one entry with two seats. Nothing about that is a second trust boundary — same container
+class, same private slot, same config-driven discovery — but it does mean a job's `model` field no longer
+determines where it runs. So the scheduler costs the pass (frame rows + a figure per reference picture +
+the prompt, all upstream's numbers, in `gen_jobs` as ONE row model that `GET /api/gen` also hands the UI so
+the chips and the routing cannot drift apart) and takes it to the **cheapest slot whose bound covers it**;
+`create` refuses a pass no seat covers rather than spending a slot start to fail at radiance. Cost-first
+routing is what keeps the expensive seat expensive: sending tp1-sized work to the tp2 pair would park the
+video model that lives there for nothing, and a parked model costs its next job a full reload. Cheapest
+AFTER "already running" — a cold slot costs a container start and a model load (and can stop an idle
+container to get its cards), which is dearer than the card-minutes the rule saves.
+
 **Secrets.** One `.env` (chmod 600) is the single source of truth: it feeds compose, and deploy derives the reduced env files the
 panel-uid systemd units load — `/opt/panel/.panel-api.env` (0600; `PANEL_TOKEN`, `PANEL_DEV`, `PANEL_DISK_MOUNTS` +
 `LLM_API_KEY` — the one deliberately non-PANEL key) and `/opt/panel/.panel-ddns.env` (0600, only `NAMESILO_API_KEY` + optional

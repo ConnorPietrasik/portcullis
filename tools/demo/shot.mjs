@@ -159,6 +159,10 @@ for (const step of walk) {
   if (step.then) {
     const r = await evalJs(step.then)
     if (r.exceptionDetails) console.error(`then (${step.name}): ${r.exceptionDetails.text}`)
+    // a step's return value is its assertion: `return 'ok'` when it just
+    // clicked, or a diagnostic string when the thing it clicked refused
+    // (steps that return nothing report nothing — no "undefined" noise)
+    else if (r.result.value != null && r.result.value !== 'ok') log(`then (${step.name}): ${JSON.stringify(r.result.value)}`)
     await sleep(step.wait ?? 1200)
   }
   // the viewport frame always (that is what the monitor shows), and for a tab

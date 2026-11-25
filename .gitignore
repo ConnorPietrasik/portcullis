@@ -29,6 +29,7 @@ gpu-pool-override.yml
 # gen section dev-mode state (same: PANEL_DEV=1 writes them in the CWD)
 gen-settings.json
 gen-jobs.json
+gen-capabilities.json
 .gen-jobs.lock
 gen-output/
 

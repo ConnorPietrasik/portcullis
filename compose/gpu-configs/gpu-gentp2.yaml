@@ -10,7 +10,17 @@ scheduler:
   drain-timeout: 30s
   warm-up: true
 models:
+  # One model per card-pair at a time (a parking pair; gen_jobs.admission).
+  # NoctQ-V4 is the UNBOUNDED long-pass seat: passes past the tp1 cards' 8192
+  # line land here. At its own length its grant is 32.6 GiB a card (docs/GUIDE
+  # §5.6) — more than these cards — so it loads only once bounded: upstream's
+  # two-card value is 20480 (tools/gpu-mlen-test.sh tries values first).
   Minimax-H3-T2V:
     model: /models/video/minimax-h3-i8.rad
     tp: 2
     vision-tower-placement: ram
+    park: {ram: never}
+  NoctQ-V4:
+    model: /models/image/noctq-v4-uncensored-iq8r.rad
+    tp: 2
+    park: {ram: never}

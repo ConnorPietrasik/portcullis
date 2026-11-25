@@ -16,7 +16,9 @@ stubs for the mutation endpoints so clicking buttons doesn't raise errors.
 
 from __future__ import annotations
 
+import base64
 import json
+import struct
 import hashlib
 import random
 import re
@@ -24,6 +26,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOST = "127.0.0.1"
@@ -360,7 +363,7 @@ def llm_settings() -> dict:
 # under /gen/, the same URL space panel-web serves on the server.
 
 GEN_SETTINGS: dict = {
-    "purposes": {"image": "Krea2", "video": "Minimax-H3-T2V"},
+    "purposes": {"image": "Krea2", "edit": "NoctQ-V4", "video": "Minimax-H3-T2V"},
     "enhance": {
         "enabled": True,
         # the real prompt pair (compose/gpu-configs + the settings file); the
@@ -372,6 +375,9 @@ GEN_SETTINGS: dict = {
             # operator copies it somewhere or drops it)
             "SDXL-Turbo": "Expand into a photoreal image prompt: subject, lens, light, grade.",
             "Krea2": "Expand into a photographic image prompt: subject and its material detail, framing and lens, lighting and time of day, colour grade, and one mood word. Keep the user's subject; add craft, not new objects. One sentence, no lists, no negative phrasing.",
+            # an EDIT model gets an INSTRUCTION, not a scene description: the
+            # picture already carries the subject, so the text says what changes
+            "NoctQ-V4": "Rewrite as one editing instruction for a single picture: name the part to change and what it becomes in the picture's own terms (material, colour, light, position), and leave the rest untouched. Keep the user's intent exactly; invent no new subjects. One imperative sentence, no lists, no negative phrasing.",
         },
         "instance": "gpu-writer",
         "model": "Uncensored",
@@ -381,11 +387,131 @@ GEN_SETTINGS: dict = {
 
 VIDEO = "Minimax-H3-T2V"
 IMAGE = "Krea2"
-# model name → kind, the mock's deployment (the real gen_jobs' known_models)
-KNOWN_MODELS = {IMAGE: "image", VIDEO: "video"}
+EDIT = "NoctQ-V4"
+# model name → kind, the mock's deployment (the real gen_jobs' known_models).
+# The two image models are PARKING PARTNERS on each tp1 card.
+KNOWN_MODELS = {IMAGE: "image", EDIT: "image", VIDEO: "video"}
+# radiance's /v1/models capabilities answer for each (the mock ships the
+# answer the real panel would probe).
+PURPOSE_KEYS = ("image", "video", "edit")
+EDITS = {IMAGE: False, EDIT: True, VIDEO: None}
+# THE ROW MODEL — gen_jobs' constants, mirrored.
+ROW_PX = 16
+REF_ROWS = 4600
+PROMPT_ROWS = 256
+# max-model-len PER SLOT: the same model is bound differently where it is
+# served (8192 on the tp1 cards, no bound on the tp2 pair), so a job's row
+# cost picks its slot — the routing the tab shows.
+SLOT_MLEN = {
+    "gpu-gentp1a": {IMAGE: 0, EDIT: 8192},
+    "gpu-gentp1b": {IMAGE: 0, EDIT: 8192},
+    "gpu-gentp2": {VIDEO: 0, EDIT: 0},
+}
+# which entry lives on which slot (a parking pair on each)
+SLOT_MODELS = {s: {n: KNOWN_MODELS[n] for n in b} for s, b in SLOT_MLEN.items()}
+
+
+def size_rows(size) -> int | None:
+    """WxH → latent rows, or None when the size is not two numbers (an unknown
+    size is an unknown cost and routes unconstrained)."""
+    if not isinstance(size, str):
+        return None
+    m = re.match(r"^\s*(\d+)\s*[x*]\s*(\d+)\s*$", size, re.I)
+    if not m:
+        return None
+    return (int(m.group(1)) // ROW_PX) * (int(m.group(2)) // ROW_PX)
+
+
+def pass_rows(kind: str, params: dict, refs: int = 0) -> int | None:
+    """What one pass costs (None = no constraint: a video job, or a size that
+    cannot be costed) — gen_jobs.pass_rows."""
+    if kind != "image":
+        return None
+    rows = size_rows((params or {}).get("size"))
+    return None if rows is None else rows + max(0, refs) * REF_ROWS + PROMPT_ROWS
+
+
+def slot_bound(slot: str, model: str) -> int:
+    return int(SLOT_MLEN.get(slot, {}).get(model) or 0)
+
+
+def candidate_slots(model: str, kind: str, params: dict, refs: int = 0) -> list[str]:
+    """The slots that host the model and whose pass covers the job, cheapest
+    seat first — gen_jobs.job_candidates minus the running/load terms."""
+    rows = pass_rows(kind, params, refs)
+    out = []
+    for slot, models in SLOT_MODELS.items():
+        if model not in models:
+            continue
+        bound = slot_bound(slot, model)
+        if bound > 0 and rows is not None and rows > bound:
+            continue
+        out.append(slot)
+    return sorted(out, key=lambda s: slot_bound(s, model) or 1 << 40)
 # the real gen_jobs' shape regexes — submission is shape-checked the same way
 SIZE_RE = re.compile(r"^\d{2,4}x\d{2,4}$")
 MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,127}$")
+# an edit's inputs — the real EDIT_INPUT_MIMES / EDIT_MAX_IMAGES / size caps
+EDIT_MIME_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}
+# a mask is the alpha-having subset (a jpeg mask would repaint nothing)
+EDIT_MASK_MIMES = frozenset({"image/png", "image/webp"})
+EDIT_MAX_IMAGES = 10
+EDIT_MAX_BYTES = 16 * 1024 * 1024
+# radiance's decoded-source cap, the real gen_jobs.EDIT_MAX_SOURCE_PIXELS
+EDIT_MAX_SOURCE_PIXELS = 1 << 26
+
+
+def image_size(data: bytes):
+    """(w, h) from the file's header — png / webp / jpeg — or None. The real
+    gen_jobs.image_size, mirrored."""
+    try:
+        if data[:8] == b"\x89PNG\r\n\x1a\n":
+            w, h = struct.unpack(">II", data[16:24])
+            return (w, h) if w and h else None
+        if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            if len(data) < 30:  # shorter than any chunk's header + dimension bytes
+                return None
+            chunk = data[12:16]
+            if chunk == b"VP8 ":  # lossy: 3-byte frame tag + 3-byte start code, then 14-bit w/h
+                w = int.from_bytes(data[26:28], "little") & 0x3FFF
+                h = int.from_bytes(data[28:30], "little") & 0x3FFF
+                return (w, h) if w and h else None
+            if chunk == b"VP8L":
+                b0 = int.from_bytes(data[21:25], "little")
+                return ((b0 & 0x3FFF) + 1, ((b0 >> 14) & 0x3FFF) + 1)
+            if chunk == b"VP8X":  # extended: 1 flag byte, then 24-bit (w-1) / 24-bit (h-1)
+                w = int.from_bytes(data[21:24], "little") + 1
+                h = int.from_bytes(data[24:27], "little") + 1
+                return (w, h) if w and h else None
+            return None
+        if data[:2] == b"\xff\xd8":
+            i, n = 2, len(data)
+            while i + 4 <= n:
+                while i < n and data[i] == 0xFF:
+                    i += 1
+                if i >= n:
+                    return None
+                marker = data[i]
+                i += 1
+                if marker == 0xD9 or marker == 0x01 or 0xD0 <= marker <= 0xD8:
+                    continue
+                seglen = int.from_bytes(data[i : i + 2], "big")
+                if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC9, 0xCB, 0xCC, 0xCD, 0xCE, 0xCF):
+                    if i + 7 > n:
+                        return None
+                    h = int.from_bytes(data[i + 3 : i + 5], "big")
+                    w = int.from_bytes(data[i + 5 : i + 7], "big")
+                    return (w, h) if w and h else None
+                if seglen < 2:
+                    return None
+                i += seglen
+            return None
+    except (IndexError, struct.error, ValueError):
+        return None
+    return None
+
+
+DATA_URL_RE = re.compile(r"\Adata:([-.+a-zA-Z0-9]+/[-.+a-zA-Z0-9]+)?(;base64)?,(.*)\z", re.S)
 GEN_LOCK = threading.Lock()
 JOBS: dict[str, dict] = {}
 ORDER: list[str] = []
@@ -440,6 +566,7 @@ def mkjob(
     progress: int | None = None,
     enhance: bool = True,
     user: str = "piet",
+    edit: tuple[int, bool] | None = None,
 ) -> dict:
     global SEQ
     SEQ += 1
@@ -455,6 +582,9 @@ def mkjob(
         "prompt": prompt,
         "enhance": enhance,
         "params": params if params is not None else {"size": "1344x768", "seed": 1234},
+        # set for an edit: (pictures, mask) — the source files are written
+        # beside the result below
+        "edit": None,
         "user": user,
         "state": state,
         "slot": slot,
@@ -467,6 +597,8 @@ def mkjob(
         "started_at": started if state not in ("queued", "enhancing") else None,
         "finished_at": started + took if state in ("completed", "failed", "canceled") else None,
     }
+    if edit:
+        j["edit"] = put_inputs(jid, edit[0], edit[1], seed=SEQ)
     if state == "completed":
         j["artifact"] = put_artifact(j)
     # a seeded live job keeps its wall-clock position — the progress bar
@@ -492,6 +624,61 @@ def _pad_svg(svg: bytes, size: int) -> bytes:
     if len(svg) >= size:
         return svg
     return svg[:-6] + b"<!--" + b"." * (size - len(svg) - 7) + b"--></svg>"
+
+
+def _png(w: int, h: int, seed: int, mask: bool = False) -> bytes:
+    """REAL png bytes (zlib + struct, no deps) — the seeded edit sources must
+    decode under the record's mime, because the remix re-posts them as
+    `data:image/png;base64,…` and a browser will not draw svg bytes under a png
+    mime. A mask is alpha-correct: transparent where the picture may change."""
+    r = random.Random(seed)
+    top = (r.randrange(20, 80), r.randrange(40, 110), r.randrange(90, 160))
+    bot = (r.randrange(140, 210), r.randrange(110, 180), r.randrange(90, 150))
+    cx, cy = r.randrange(int(w * 0.32), int(w * 0.68)), r.randrange(int(h * 0.3), int(h * 0.7))
+    rx, ry = int(w * 0.26), int(h * 0.2)
+    rows = []
+    for y in range(h):
+        t = y / max(1, h - 1)
+        if mask:
+            row = bytearray(b"\x00" + b"\x00\x00\x00\x00" * w)  # fully transparent
+            if abs(y - cy) <= ry:
+                dx = int(rx * (1 - ((y - cy) / ry) ** 2) ** 0.5)
+                a, b = max(0, cx - dx), min(w, cx + dx + 1)
+                row[1 + 4 * a : 1 + 4 * b] = b"\xff\xff\xff\xff" * (b - a)
+            rows.append(bytes(row))
+        else:
+            sky = bytes(int(top[i] + (bot[i] - top[i]) * t) for i in range(3))
+            row = bytearray(b"\x00" + sky * w)
+            if abs(y - cy) <= ry:
+                dx = int(rx * (1 - ((y - cy) / ry) ** 2) ** 0.5)
+                a, b = max(0, cx - dx), min(w, cx + dx + 1)
+                row[1 + 3 * a : 1 + 3 * b] = b"\xe0\x7a\x24" * (b - a)
+            rows.append(bytes(row))
+    raw = b"".join(rows)
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 6 if mask else 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b"")
+
+
+def put_inputs(jid: str, n: int = 1, mask: bool = False, seed: int = 0, w: int = 1024, h: int = 1024) -> dict:
+    """The EDIT block for a seeded job: the pictures an edit worked FROM, under
+    the real names (`-in0…`, `-mask`) in the same served map as its result.
+    (A created job's inputs come from the request instead — see gen_create.)"""
+    images = []
+    for i in range(n):
+        blob = _png(w, h, seed * 31 + i * 977)
+        name = f"{jid}-in{i}"
+        ARTS[f"{name}.png"] = (blob, "image/png")
+        images.append({"url": f"/gen/{name}.png", "mime": "image/png", "size": len(blob)})
+    m = None
+    if mask:
+        blob = _png(w, h, seed + 7, mask=True)
+        ARTS[f"{jid}-mask.png"] = (blob, "image/png")
+        m = {"url": f"/gen/{jid}-mask.png", "mime": "image/png", "size": len(blob)}
+    return {"images": images, "mask": m}
 
 
 def put_artifact(j: dict) -> dict:
@@ -520,30 +707,42 @@ PINE = "a red fox trotting through a snowy pine forest, snow crunching underfoot
 
 
 def gen_models() -> dict:
-    """model → {kind, slots} — the real known_models for the mock's fleet."""
-    return {
-        IMAGE: {"kind": "image", "slots": ["gpu-gentp1a", "gpu-gentp1b"]},
-        VIDEO: {"kind": "video", "slots": ["gpu-gentp2"]},
-    }
+    """model → {kind, slots, edits, mlen, mlen_min} — the real known_models for
+    the mock's fleet, capabilities included. mlen/mlen_min: the longest and
+    shortest BOUNDED pass any slot gives the model."""
+    out = {}
+    for name in KNOWN_MODELS:
+        host = [sl for sl, ms in SLOT_MODELS.items() if name in ms]
+        bounds = [slot_bound(sl, name) for sl in host]
+        bounded = [b for b in bounds if b > 0]
+        out[name] = {
+            "kind": KNOWN_MODELS[name],
+            "slots": sorted(host),
+            "edits": EDITS[name],
+            "mlen": max(bounds) if bounds else 0,
+            "mlen_min": min(bounded) if bounded else 0,
+        }
+    return out
 
 
-def mock_resolve_model(model: str) -> tuple[str, str]:
-    """The real gen_jobs.resolve_model against the mock's two deployed models
-    — same purpose-key / exact-name semantics, same error shapes."""
+def mock_resolve_model(model: str) -> tuple[str, str, str | None]:
+    """The real gen_jobs.resolve_model against the mock's entries — same
+    purpose-key / exact-name semantics, same error shapes, same third value
+    (which purpose key named it, or None)."""
     model = (model or "").strip()
-    if model in ("image", "video"):
+    if model in PURPOSE_KEYS:
         target = (GEN_SETTINGS.get("purposes") or {}).get(model)
         if not target:
             raise ValueError(f"purpose {model!r} is not configured (Gen settings)")
         if target not in KNOWN_MODELS:
             raise ValueError(f"purpose {model!r} points at unknown model {target!r}")
-        return target, KNOWN_MODELS[target]
+        return target, KNOWN_MODELS[target], model
     if not model:
         raise ValueError("model is required (a purpose key like 'image' or an exact model name)")
     if model not in KNOWN_MODELS:
         avail = ", ".join(sorted(KNOWN_MODELS))
         raise ValueError(f"unknown model {model!r} (known: {avail})")
-    return model, KNOWN_MODELS[model]
+    return model, KNOWN_MODELS[model], None
 
 
 def mock_validate_params(kind: str, params: dict) -> dict:
@@ -587,20 +786,26 @@ def mock_validate_settings(s: dict) -> tuple[dict, list[str]]:
         errors.append("purposes must be an object")
     else:
         for k, v in purp_in.items():
-            if k not in ("image", "video"):
-                errors.append(f"unknown purpose {k!r} (want one of: image, video)")
+            if k not in PURPOSE_KEYS:
+                errors.append(f"unknown purpose {k!r} (want one of: {', '.join(PURPOSE_KEYS)})")
                 continue
             if not isinstance(v, str) or not MODEL_NAME_RE.match(v):
                 errors.append(f"purposes.{k}: bad model name {v!r}")
                 continue
-            if v in ("image", "video"):
+            if v in PURPOSE_KEYS:
                 errors.append(f"purposes.{k}: {v!r} is a reserved purpose key, not a model name")
                 continue
             if v not in KNOWN_MODELS:
                 errors.append(f"purposes.{k}: unknown model {v!r} (not hosted by any gen slot)")
                 continue
-            if KNOWN_MODELS[v] != k:
-                errors.append(f"purposes.{k}: {v!r} is a {KNOWN_MODELS[v]} model, not a {k} model")
+            want = "video" if k == "video" else "image"
+            if KNOWN_MODELS[v] != want:
+                errors.append(f"purposes.{k}: {v!r} is a {KNOWN_MODELS[v]} model, not a {want} model")
+                continue
+            # the edit purpose names a model that must READ pictures — the real
+            # server checks radiance's answer, unprobed (None) stays allowed
+            if k == "edit" and EDITS.get(v) is False:
+                errors.append(f"purposes.edit: {v!r} refuses /v1/images/edits (radiance says it reads no pictures) — pick an edit-capable model")
                 continue
             out["purposes"][k] = v
     enh_in = s.get("enhance", {})
@@ -666,6 +871,27 @@ def gen_seed() -> None:
     mkjob(IMAGE, "an aurora over a frozen lake, reflections", state="completed", ago=3600 * 4,
           enhanced="an aurora over a frozen lake, green and violet curtains mirrored in clear ice, foreground of cracked ice, 14 mm, long exposure, deep blue night, crisp",
           params={"size": "1344x768", "seed": 31337})
+    # the EDIT rows: each record carries the picture it read (before/after,
+    # archive) under the real names
+    mkjob(EDIT, "put a red knitted scarf on the fox", state="completed", ago=3600 * 3 + 900,
+          enhanced="put a red knitted scarf on the fox, wrapped once around its neck, wool texture matching the snow light, leave the snow, the pose and the fur unchanged",
+          params={"size": "896x896", "seed": 4100}, edit=(1, True))
+    # frames that FIT the 8192-row pass once a reference is paid for
+    # (~4600 + the prompt) — the seeded rows stay physically possible.
+    mkjob(EDIT, "make it night and add a full moon", state="completed", ago=3600 * 2 + 45,
+          enhanced="make the scene night under a low full moon, cool blue key light from the upper right, keep the subject, framing and materials unchanged",
+          params={"size": "1024x768", "seed": -1}, edit=(1, False))
+    # a pass no tp1 card holds (14072 rows > 8192): routed to the long-pass
+    # seat by its row cost
+    mkjob(EDIT, "relight this bench as a rainy night scene, keep the composition", state="completed",
+          ago=3600 * 2 + 900,
+          enhanced="a wet park bench under streetlight on a rainy night, sodium and LED sources, puddle mirrors, keep the framing and the bench unchanged, 35 mm",
+          params={"size": "1536x1536", "seed": 707}, edit=(1, False), slot="gpu-gentp2")
+    # a failed edit — and NOT a budget one (over-long passes are refused at the
+    # door now): a slot-side failure at submit
+    mkjob(EDIT, "swap the teapot for a copper one", state="failed", ago=3600 * 2,
+          error="image edit failed: HTTP 500: vae decode on gpu-gentp2 died mid-pass (the slot restarted) — queue it again",
+          params={"size": "1536x1024", "seed": 88}, edit=(1, False), slot="gpu-gentp2")
     mkjob(IMAGE, "a robot barista mid-pour, cinematic", state="completed", ago=3600 * 3,
           enhanced="a robot barista mid-pour in a small café, steam curling over the cup, 85 mm macro, rim light, shallow depth of field, cinematic teal grade, cosy",
           params={"size": "1024x1024", "seed": 2024})
@@ -685,6 +911,10 @@ def gen_seed() -> None:
     mkjob(VIDEO, "waves breaking on a black-sand beach from behind", state="queued", ago=6,
           params={"size": "1344x768", "seconds": 5, "seed": -1})
     mkjob(IMAGE, FOX + ", 35 mm", state="queued", ago=2, params={"size": "1024x1024", "seed": -1})
+    # a queued edit: the slot it lands on has to park Krea 2 out first (one
+    # model per card at a time)
+    mkjob(EDIT, "remove the power lines from the roofline", state="queued", ago=1,
+          params={"size": "1024x768", "seed": -1}, edit=(1, True))
 
 
 def enhance_of(j: dict) -> str:
@@ -695,6 +925,10 @@ def enhance_of(j: dict) -> str:
             "golden-hour light raking across the frame; soundscape: ambient wind, foley of every footfall, "
             "distant birdsong, no music"
         )
+    if j["model"] == EDIT:
+        return (
+            f"{j['prompt'].rstrip('.')}, keeping the picture's framing, subject and lighting exactly as they are"
+        )
     return (
         f"{j['prompt'].rstrip('.')}, editorial product photography, 90 mm macro, single soft window light, "
         "shallow depth of field, muted natural palette"
@@ -702,7 +936,25 @@ def enhance_of(j: dict) -> str:
 
 
 def _claim(j: dict) -> None:
-    j["slot"] = "gpu-gentp2" if j["kind"] == "video" else ("gpu-gentp1a" if int(j["id"][4:]) % 2 else "gpu-gentp1b")
+    # the real scheduler's two rules: the ROW COST picks the slots that can
+    # take the pass (cheapest seat first), and ONE MODEL PER SLOT says whether
+    # that seat is free right now
+    refs = len(((j.get("edit") or {}).get("images")) or [])
+    cands = candidate_slots(j["model"], j["kind"], j.get("params") or {}, refs)
+    free = [
+        s
+        for s in cands
+        if not any(
+            o["slot"] == s and o["state"] in ("starting", "loading", "running") and o["model"] != j["model"]
+            for o in JOBS.values()
+        )
+    ]
+    if not free:
+        # the one-model rule: the flights drain, the model switches once, the
+        # job runs — the normal queue, no say-so
+        return
+    j["error"] = None
+    j["slot"] = free[int(j["id"][4:]) % len(free)]
     j["state"] = "starting"
     STAGE[j["id"]] = time.time()
 
@@ -760,6 +1012,7 @@ def gen_view() -> dict:
             "active": len(active),
             "image": sum(1 for j in jobs if j["kind"] == "image"),
             "video": sum(1 for j in jobs if j["kind"] == "video"),
+            "edit": sum(1 for j in jobs if j.get("edit")),
             "failed": sum(1 for j in jobs if j["state"] in ("failed", "canceled")),
         }
         busy = {j["slot"] for j in JOBS.values() if j["state"] in ("starting", "loading", "running")}
@@ -771,14 +1024,15 @@ def gen_view() -> dict:
             "name": "gpu-gentp1a", "display": "Gen TP1-A", "cards": 1,
             "assigned": [5], "holding": [5], "running": True,
             "container": CONTAINER_IDS["gpu-gentp1a"], "ip": "172.18.0.7",
-            "models": {IMAGE: "image"}, "llm": None,
+            # the parking pair on one card
+            "models": SLOT_MODELS["gpu-gentp1a"], "mlens": SLOT_MLEN["gpu-gentp1a"], "llm": None,
             "status": {"state": "running", "stops": [], "blockers": [], "busy": "gpu-gentp1a" in busy},
         },
         {
             "name": "gpu-gentp1b", "display": "Gen TP1-B", "cards": 1,
             "assigned": [6], "holding": [6], "running": True,
             "container": CONTAINER_IDS["gpu-gentp1b"], "ip": "172.18.0.8",
-            "models": {IMAGE: "image"}, "llm": None,
+            "models": SLOT_MODELS["gpu-gentp1b"], "mlens": SLOT_MLEN["gpu-gentp1b"], "llm": None,
             "status": {"state": "running", "stops": [], "blockers": [], "busy": "gpu-gentp1b" in busy},
         },
         {
@@ -787,7 +1041,9 @@ def gen_view() -> dict:
             "running": t2_up,
             "container": CONTAINER_IDS["gpu-gentp2"] if t2_up else None,
             "ip": "172.18.0.9" if t2_up else "",
-            "models": {VIDEO: "video"}, "llm": None,
+            # the LONG-PASS seat: the video model + NoctQ-V4 at tp 2 with no
+            # bound, for the passes a tp1 card cannot hold
+            "models": SLOT_MODELS["gpu-gentp2"], "mlens": SLOT_MLEN["gpu-gentp2"], "llm": None,
             "status": {
                 "state": "running" if t2_up else "down-idle-stops",
                 "stops": [] if t2_up else ["gpu-gentp1a", "gpu-gentp1b"],
@@ -812,19 +1068,119 @@ def gen_view() -> dict:
         "active": active,
         "counts": counts,
         "models": gen_models(),
+        # the row model the chips price a frame with — gen_jobs' constants
+        "row_model": {"row_px": ROW_PX, "ref_rows": REF_ROWS, "prompt_rows": PROMPT_ROWS},
         "purposes": GEN_SETTINGS["purposes"],
         "enhance": GEN_SETTINGS["enhance"],
         "gc_days": GEN_SETTINGS["gc_days"],
     }
 
 
+class HttpError(ValueError):
+    """A ValueError carrying the real endpoint's status (413 for the picture
+    size door, 400 for the rest) — the demo shows the real code."""
+
+    def __init__(self, detail: str, status: int = 400) -> None:
+        super().__init__(detail)
+        self.status = status
+
+
+def picture_magic(data: bytes):
+    """The real _picture_magic, as the sniffed mime: png / jpeg / webp else
+    None — the stored extension and the browser's <img> both follow the bytes."""
+    if data[:4] == b"\x89PNG":
+        return "image/png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def mock_edit_parse(images, mask):
+    """The real create endpoint's input doors, in the real order (a bad picture
+    is reported before an over-budget pass). Nothing is stored yet — the real
+    endpoint writes the files only once every check has passed. Same limits,
+    same messages. Returns (pictures, mask) as (bytes, sniffed-mime) pairs."""
+    # the transport bound first (a backstop — the real endpoint reads the whole
+    # body anyway): a payload that cannot be one picture of the allowed size
+    # never reaches the decoder. (+512 = data: prefix slack.)
+    pairs = [(f"images[{i}]", ref) for i, ref in enumerate(images or [])]
+    if mask:
+        pairs.append(("mask", mask))
+    for field, ref in pairs:
+        if not isinstance(ref, str) or len(ref) > 4 * ((EDIT_MAX_BYTES + 2) // 3) + 512:
+            raise HttpError(f"{field}: a picture is at most {EDIT_MAX_BYTES // 1048576} MiB", 413)
+
+    def one(ref, field, want_mask):
+        # the real _gen_read_data_url, step for step and message for message —
+        # including the FIELD it names the error by. A mask gets the smaller
+        # allowed set.
+        if not isinstance(ref, str) or not ref:
+            raise ValueError(f"{field}: want a data: URL")
+        m = DATA_URL_RE.match(ref)
+        if not m:
+            raise ValueError(f"{field}: want a data:image/…;base64,… URL")
+        mime = (m.group(1) or "").lower()
+        allowed = EDIT_MASK_MIMES if want_mask else EDIT_MIME_EXT
+        kind = "a mask format" if want_mask else "an edit format"
+        if mime not in allowed:
+            raise ValueError(f"{field}: {mime or 'no mime'} is not {kind} (want: {', '.join(sorted(allowed))})")
+        if not m.group(2):
+            raise ValueError(f"{field}: the data URL must be base64")
+        try:
+            raw = base64.b64decode(m.group(3), validate=True)
+        except Exception:
+            raise ValueError(f"{field}: bad base64") from None
+        if not raw:
+            raise ValueError(f"{field}: empty picture")
+        if len(raw) > EDIT_MAX_BYTES:
+            raise HttpError(
+                f"{field}: {len(raw) / 1048576:.1f} MiB — an edit's picture is at most "
+                f"{EDIT_MAX_BYTES // 1048576} MiB (the model resamples it to its "
+                "1024x1024 reference area anyway)",
+                413,
+            )
+        stored = picture_magic(raw)
+        if stored is None:
+            raise ValueError(f"{field}: these bytes are not a png, jpeg or webp picture")
+        # the stored mime/extension come from the bytes' magic, like the real door
+        return raw, stored
+
+    imgs = [one(ref, f"images[{i}]", False) for i, ref in enumerate(images or [])]
+    m = one(mask, "mask", True) if mask else None
+    return imgs, m
+
+
+def mock_edit_store(jid: str, parsed) -> dict:
+    """The real create endpoint's store step — after every check has passed:
+    the bytes land beside the queued job under the job's own names (a refused
+    job never leaves files behind, like the real one)."""
+    imgs_parsed, mask_parsed = parsed
+    out = {"images": [], "mask": None}
+    for i, (raw, stored) in enumerate(imgs_parsed):
+        fname = f"{jid}-in{i}.{EDIT_MIME_EXT[stored]}"
+        ARTS[fname] = (raw, stored)
+        out["images"].append({"url": f"/gen/{fname}", "mime": stored, "size": len(raw)})
+    if mask_parsed:
+        raw, stored = mask_parsed
+        fname = f"{jid}-mask.{EDIT_MIME_EXT[stored]}"
+        ARTS[fname] = (raw, stored)
+        out["mask"] = {"url": f"/gen/{fname}", "mime": stored, "size": len(raw)}
+    return out
+
+
+SLOT_DISPLAY = {"gpu-gentp1a": "Gen TP1-A", "gpu-gentp1b": "Gen TP1-B", "gpu-gentp2": "Gen TP2"}
+
+
 def gen_create(body: dict) -> dict:
-    """Like the real POST /api/gen/jobs: prompt/model/enhance/params all
-    validated before anything is queued (same 400s, same messages)."""
+    """Like the real POST /api/gen/jobs: everything validated before anything
+    is queued (same 400s, same messages); an EDIT (a request that brings
+    `images`) is gated the same way."""
     prompt = (body.get("prompt") or "").strip()
     if not prompt:
         raise ValueError("prompt is required")
-    model, kind = mock_resolve_model(body.get("model"))
+    model, kind, purpose = mock_resolve_model(body.get("model"))
     enhance_in = body.get("enhance")
     enhance = bool(enhance_in) if enhance_in is not None else bool(GEN_SETTINGS["enhance"]["enabled"])
     if enhance and not (GEN_SETTINGS["enhance"].get("prompts") or {}).get(model, ""):
@@ -832,7 +1188,59 @@ def gen_create(body: dict) -> dict:
             raise ValueError(f"enhancement on but no prompt configured for {model!r} (Gen settings)")
         enhance = False  # the settings' default is on, no prompt: skip (the plan's rule)
     params = mock_validate_params(kind, body.get("params") or {})
+    imgs_in, mask_in = body.get("images") or [], body.get("mask")
+    # the real create endpoint's order and wording: count, then the mask's
+    # anchor, then the purpose, then the model's class, then its capability
+    if not isinstance(imgs_in, list) or len(imgs_in) > EDIT_MAX_IMAGES:
+        raise ValueError(f"images: an edit takes at most {EDIT_MAX_IMAGES} pictures")
+    if mask_in is not None and not imgs_in:
+        raise ValueError("mask: a mask belongs to the first picture — send that picture too")
+    if purpose == "edit" and not imgs_in:
+        raise ValueError(f"purpose 'edit' needs at least one source picture (model {model!r})")
+    if imgs_in and kind != "image":
+        raise ValueError(f"{model!r} is a {kind} model — an edit's pictures go to an image model")
+    if imgs_in and EDITS.get(model) is False:
+        raise ValueError(f"{model!r} reads no pictures — radiance answers 501 on /v1/images/edits for it")
+    # the real endpoint decodes the pictures here, before the routing check:
+    # a bad picture is named before an over-budget pass
+    parsed = mock_edit_parse(imgs_in, mask_in) if imgs_in else None
+    # the two doors radiance would only answer at submit (on the decoded
+    # bytes): the mask-vs-first-picture size, and the 64 MP decode budget
+    if parsed:
+        imgs_parsed, mask_parsed = parsed
+        door_items = [(f"images[{i}]", p) for i, p in enumerate(imgs_parsed)]
+        if mask_parsed is not None:
+            m_dims, f_dims = image_size(mask_parsed[0]), image_size(imgs_parsed[0][0])
+            if m_dims and f_dims and m_dims != f_dims:
+                raise ValueError(
+                    f"mask: it must be the first picture's size ({m_dims[0]}x{m_dims[1]} ≠ {f_dims[0]}x{f_dims[1]}) — "
+                    "radiance compares them, it does not resample"
+                )
+            door_items.append(("mask", mask_parsed))
+        for which, item in door_items:
+            dims = image_size(item[0])
+            if dims and dims[0] * dims[1] > EDIT_MAX_SOURCE_PIXELS:
+                raise ValueError(
+                    f"{which}: {dims[0]}x{dims[1]} is {dims[0] * dims[1]:,} pixels — radiance decodes a "
+                    f"source picture at most {EDIT_MAX_SOURCE_PIXELS:,} (64 MP)"
+                )
+    # THE ROUTING CHECK (the real endpoint's): refuse the shape no seat can
+    # take, before a slot start is spent on it.
+    rows = pass_rows(kind, params, len(imgs_in))
+    if rows is not None:
+        seats = [slot_bound(sl, model) for sl, ms in SLOT_MODELS.items() if model in ms]
+        if seats and all(b > 0 and rows > b for b in seats):
+            longest = max(seats)
+            where = "/".join(SLOT_DISPLAY[sl] for sl in sorted(SLOT_MODELS) if model in SLOT_MODELS[sl] and slot_bound(sl, model) == longest)
+            raise ValueError(
+                f"{params.get('size') or 'this size'} + {len(imgs_in)} reference picture(s) is a "
+                f"{rows}-row pass; the longest {model} gets anywhere is {longest} ({where}) — "
+                "a smaller frame or one fewer picture fits"
+            )
     with GEN_LOCK:
+        # the bytes land with the record (mkjob is asked for a plain generation,
+        # so its placeholder writer never overwrites the -inN/-mask files)
+        seq = SEQ + 1
         j = mkjob(
             model,
             prompt,
@@ -841,6 +1249,8 @@ def gen_create(body: dict) -> dict:
             params=params,
             enhance=enhance,
         )
+        if parsed:
+            j["edit"] = mock_edit_store(f"job-{seq:06d}", parsed)
         j["created_at"] = time.time()
         STAGE[j["id"]] = time.time()
         return j
@@ -877,13 +1287,27 @@ def gen_archive(ids: list[str]) -> bytes:
             name = url.rsplit("/", 1)[-1]
             if name in ARTS:
                 zf.writestr(name, ARTS[name][0])
+                # an edit's source pictures too
+                edit = j.get("edit") or {}
+                for ref in [*(edit.get("images") or []), edit.get("mask")]:
+                    n2 = ((ref or {}).get("url") or "").rsplit("/", 1)[-1]
+                    if n2 in ARTS:
+                        zf.writestr(n2, ARTS[n2][0])
                 # the real manifest, line for line (the prompts.txt a folder of
                 # pictures carries with it)
                 when = time.strftime("%Y-%m-%d %H:%M", time.localtime(j.get("created_at") or 0))
+                ed = j.get("edit") or {}
+                nsrc = len(ed.get("images") or [])
                 manifest.append(
-                    f"[{jid}] {j.get('model')} ({j.get('kind')}) — {when}\n"
+                    f"[{jid}] {j.get('model')} ({'edit' if nsrc else j.get('kind')}) — {when}\n"
                     f"  prompt:   {j.get('prompt')}\n"
                     + (f"  enhanced: {j['enhanced_prompt']}\n" if j.get("enhanced_prompt") else "")
+                    + (
+                        f"  sources:  {nsrc} picture(s){' + mask' if ed.get('mask') else ''} "
+                        f"({', '.join((r or {}).get('url', '').rsplit('/', 1)[-1] for r in ed.get('images') or [])})\n"
+                        if nsrc
+                        else ""
+                    )
                     + f"  params:   {json.dumps(j.get('params') or {}, sort_keys=True)}\n"
                 )
         if not manifest:
@@ -926,6 +1350,8 @@ def gen_page(limit: int, cursor: int, q: str, flt: str) -> dict:
         if flt == "image" and j["kind"] != "image":
             return False
         if flt == "video" and j["kind"] != "video":
+            return False
+        if flt == "edit" and not j.get("edit"):
             return False
         if flt == "failed" and j["state"] not in ("failed", "canceled"):
             return False
@@ -1110,8 +1536,8 @@ class Handler(BaseHTTPRequestHandler):
             # the gallery's page — same params + semantics as the real endpoint
             # (card records, ETag/304'd)
             flt = params.get("filter", "all")
-            if flt not in ("all", "active", "image", "video", "failed"):
-                self._json({"detail": "filter: one of all, active, image, video, failed"}, 400)
+            if flt not in ("all", "active", "image", "video", "edit", "failed"):
+                self._json({"detail": "filter: one of all, active, image, video, edit, failed"}, 400)
                 return
             try:
                 limit = max(1, min(int(params.get("limit", "50")), 200))
@@ -1204,6 +1630,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(gpus())
             else:
                 self._json({"ok": True})
+        except HttpError as e:
+            self._json({"detail": str(e)}, e.status)
         except ValueError as e:
             self._json({"detail": str(e)}, 400)
 

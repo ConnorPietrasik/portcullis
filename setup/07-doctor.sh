@@ -143,7 +143,7 @@ fi
 # (panel-api talks to it by container IP, like the LLM router). The flag
 # asserts no-host BOTH ways: a router on a private service is drift.
 fleet_routes() { # <compose.yml> <gpu.yml> <label>
-  local comp="$1" routes="$2" label="$3" svc sub orph cards cfg tp priv block
+  local comp="$1" routes="$2" label="$3" svc sub orph cards cfg tps widest over t priv block
   local -a svcs=() priv_svs=()
   mapfile -t svcs < <(grep -oE '^  gpu-[a-z0-9][a-z0-9-]*:' "$comp" | sed 's/^  //; s/:$//' | sort -u)
   for svc in "${svcs[@]}"; do
@@ -187,7 +187,10 @@ fleet_routes() { # <compose.yml> <gpu.yml> <label>
       hint "add '- gpu.cards=N' to the block — N == tp in compose/gpu-configs/${svc}.yaml (radiance 2.x has no --tp to fall back to)"
     fi
     # The radiance config (2.x's ONLY settings surface) — mounted per block,
-    # named after the service; its tp must equal the label.
+    # named after the service. EVERY entry's tp is checked (a config is a
+    # parking pair — "the config's tp" is a set): no entry may want more cards
+    # than the container holds (radiance cannot shard an entry wider than its
+    # placement), and the widest entry should fill it.
     cfg="$(printf '%s\n' "$block" | grep -oE '\./gpu-configs/[a-z0-9._-]+\.yaml' | head -n1)"
     if [[ -z "$cfg" ]]; then
       bad "$label: $svc (compose) mounts no radiance config (2.x runs on --config only)"
@@ -196,12 +199,21 @@ fleet_routes() { # <compose.yml> <gpu.yml> <label>
       bad "$label: $svc (compose) mounts $cfg, which does not exist"
       hint "create compose/gpu-configs/${svc}.yaml (copy a sibling; rename its model entry as needed)"
     else
-      tp="$(grep -oE '^[[:space:]]*tp:[[:space:]]*[0-9]+' "$(dirname "$comp")/$cfg" | head -n1 | grep -oE '[0-9]+')"
-      if [[ -z "$tp" ]]; then
+      tps="$(grep -oE '^[[:space:]]*tp:[[:space:]]*[0-9]+' "$(dirname "$comp")/$cfg" | grep -oE '[0-9]+' | sort -un)"
+      if [[ -z "$tps" ]]; then
         bad "$label: $cfg has no tp: key (the engine defaults to 1 — the card pin will not match)"
-      elif [[ -n "$cards" && "$tp" != "$cards" ]]; then
-        bad "$label: $svc — gpu.cards=${cards} but $cfg says tp: ${tp} (the pool grabs a different count than the engine shards)"
-        hint "make them agree (the label == the config's tp)"
+      else
+        widest="$(printf '%s\n' "$tps" | tail -n1)"
+        over=""
+        for t in $tps; do
+          [[ -n "$cards" && "$t" -gt "$cards" ]] && over="${over} ${t}"
+        done
+        if [[ -n "$over" ]]; then
+          bad "$label: $cfg has entries at tp:${over} but gpu.cards=${cards} — the container cannot hold them (radiance cannot shard an entry wider than the cards it is placed on)"
+          hint "raise gpu.cards (the pool grabs that many) or shard those entries down to tp: ${cards}"
+        elif [[ -n "$cards" && "$widest" != "$cards" ]]; then
+          warn "$label: $svc — gpu.cards=${cards} but the widest entry in $cfg is tp: ${widest} (the pool grabs a card no entry uses)"
+        fi
       fi
     fi
   done
@@ -856,10 +868,10 @@ if systemctl is-enabled --quiet gpu-autostart 2>/dev/null; then
 else
   warn "gpu-autostart.service not enabled — the fleet won't auto-start on boot"; hint "make api (installs + enables it)"
 fi
-# Gen section state (job queue + settings: the same 0600-panel-owned pattern
-# as the GPU ledger; missing files are legal — panel-api reads defaults and
-# creates them on first write).
-for f in gen-jobs.json gen-settings.json; do
+# Gen section state (job queue + settings + the probed capabilities: the same
+# 0600-panel-owned pattern as the GPU ledger; missing files are legal —
+# panel-api reads defaults and creates them on first write).
+for f in gen-jobs.json gen-settings.json gen-capabilities.json; do
   if [[ -f "/opt/panel-api/$f" ]]; then
     m="$(stat -c %a "/opt/panel-api/$f" 2>/dev/null || true)"
     if [[ "$m" == 600 ]]; then ok "$f (gen state) mode 600"

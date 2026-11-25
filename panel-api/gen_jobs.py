@@ -4,19 +4,26 @@ A GEN SLOT is a ``gpu-*`` fleet instance whose radiance config lists at least
 one model under ``/models/image/`` or ``/models/video/`` (the /models/{llm,
 image,video} layout is the contract) — the gpu.private instances, discovered
 from the deployed configs (``/opt/panel/gpu-configs/``, the repo copy in dev)
-— no second model registry to drift. A slot's config is GEN-ONLY: its gen
-model is the sole entry and stays resident; prompt enhancement runs OFF-SLOT,
-on the settings' ENHANCE TARGET (default: the gpu-writer instance's "Writer"
-model — a public chat instance the engine reaches by container IP, like the
-slots), so a slot's VRAM never serves the enhancer.
+— no second model registry to drift. A slot's config is GEN-ONLY (no LLM
+shares it); its entries are PARKING partners, never concurrent ones —
+admission keeps ONE model per slot in flight (see ``admission``). Prompt
+enhancement runs OFF-SLOT, on the settings' ENHANCE TARGET (default: the
+gpu-writer instance's "Writer" model — a public chat instance the engine
+reaches by container IP, like the slots), so a slot's VRAM never serves the
+enhancer.
 
-Two state files (next to this file; /opt/panel-api/ in production), the
+Three state files (next to this file; /opt/panel-api/ in production), the
 gpu_pool.py pattern:
 - ``gen-settings.json`` (0600) — admin-editable from the Gen tab: purposes
   (purpose key → model name), enhance (global toggle + per-gen-model prompt
   + the enhance target: instance + model), gc_days.
 - ``gen-jobs.json`` (0600) — the FIFO: seq, jobs (id → record), order
   (oldest first).
+- ``gen-capabilities.json`` (0600) — per-model capabilities DISCOVERED from
+  radiance (``/v1/models`` → ``capabilities.image_edit``), cached by model
+  name; the stored container path is the row's validity (a file swapped under
+  a name re-probes). Never probed = ``edits: null`` = unverified, never
+  "cannot" — the panel keeps no hand-written model table. See ``known_models``.
 
 Job lifecycle: queued → enhancing → queued → starting → loading → running →
 completed (a job without enhance skips straight from the first queued to
@@ -32,7 +39,9 @@ itself):
   — one in progress + one queued in radiance, which sequences the model's
   work itself. A STARTING flight (the slot booting) has no gen request yet
   and consumes no headroom. Enhancement runs off-slot, so it never contends
-  for the slot's VRAM either.
+  for the slot's VRAM either. Plus ONE MODEL AT A TIME per slot: a flight on
+  a different model than one in flight (or starting) on that slot waits — the
+  entries park for each other (see admission).
 - ENHANCEMENT (system-wide, GEN_ENHANCE_CAP): at most GEN_ENHANCE_CAP jobs
   in ENHANCING — their rewrites all land on ONE entry (the enhance target),
   so the cap is global, not per slot. Enhancement runs BEFORE the slot
@@ -52,6 +61,7 @@ import fcntl
 import json
 import os
 import re
+import struct
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -73,6 +83,13 @@ LOCK_PATH = Path(
     os.environ.get("GEN_LOCK_PATH")
     or (".gen-jobs.lock" if DEV_MODE else "/opt/panel-api/.gen-jobs.lock")
 )
+# Discovered per-model capabilities (radiance's answer — see the module
+# docstring). Keyed by model name (a name maps to one model file); the stored
+# path is the row's validity: a file swapped under the name re-probes.
+CAPS_PATH = Path(
+    os.environ.get("GEN_CAPS_PATH")
+    or ("gen-capabilities.json" if DEV_MODE else "/opt/panel-api/gen-capabilities.json")
+)
 # The radiance configs (one per gpu-* service, named after it) — the deployed
 # copy is the running truth; dev reads the repo's.
 CONFIG_DIR = Path(
@@ -83,20 +100,107 @@ CONFIG_DIR = Path(
 # ── the contracts ──────────────────────────────────────────────────────────
 # Purpose keys: what the UI/servitor say; the admin maps them to models in
 # the settings. RESERVED — a model literally named one of these could never
-# be addressed by name, so the key set is closed over them.
-PURPOSE_KEYS = ("image", "video")  # + "edit" when an edit model lands
-RESERVED_MODEL_NAMES = frozenset(PURPOSE_KEYS) | {"edit"}
+# be addressed by name, so the key set is closed over them. "edit" names the
+# picture-reading path (/v1/images/edits): its job needs at least one source
+# picture and an edit-capable model (validate_settings).
+PURPOSE_KEYS = ("image", "video", "edit")
+RESERVED_MODEL_NAMES = frozenset(PURPOSE_KEYS)
 
 # /models layout: the 2nd path component of a model path is its class.
 KIND_DIRS = frozenset({"llm", "image", "video"})
 
 MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,127}$")  # entry names may carry case (Krea2, Minimax-H3-T2V)
+
+# An EDIT's source pictures ride the create request as ``data:`` URLs (the
+# shape radiance's /v1/images/edits takes) and are stored next to the
+# artifact (before/after view, replay).
+EDIT_INPUT_MIMES = frozenset({"image/png", "image/jpeg", "image/webp"})  # radiance's edit formats
+# A mask is the alpha-having subset: radiance decodes a jpeg mask fully
+# opaque, so nothing would change — a silent no-op, so the door refuses it.
+EDIT_MASK_MIMES = frozenset({"image/png", "image/webp"})
+# radiance's cap on an edit's pictures (up to ten); a model with a smaller
+# own cap 400s at submit naming its number.
+EDIT_MAX_IMAGES = 10
+# Per-picture cap. The one size guard besides radiance's submit 400: the
+# request is buffered whole with no transport cap, and a 30 MB upload would
+# otherwise cost a slot start to fail (bound: 10 × 16 MiB + a mask).
+EDIT_INPUT_MAX_BYTES = 16 * 1024 * 1024
+# radiance's decoded-source budget (64 MP) on every picture and the mask: a
+# 10000x10000 photo is a legal 16-MiB file that would fail after the slot
+# started, so the door checks the header's dimensions (image_size).
+EDIT_MAX_SOURCE_PIXELS = 1 << 26
+
+
+def image_size(data: bytes) -> Optional[tuple[int, int]]:
+    """(w, h) from the file's header — png (IHDR), webp (VP8/VP8L/VP8X), jpeg
+    (first SOFn) — or None when unreadable (radiance's own decode answers
+    then). Header-only: needed for the mask-size door and the 64 MP cap."""
+    try:
+        if data[:8] == b"\x89PNG\r\n\x1a\n":
+            w, h = struct.unpack(">II", data[16:24])
+            return (w, h) if w and h else None
+        if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            if len(data) < 30:  # shorter than any chunk's header + dimension bytes
+                return None
+            chunk = data[12:16]
+            if chunk == b"VP8 ":  # lossy: 3-byte frame tag + 3-byte start code (9D 01 2A), then 14-bit w/h
+                w = int.from_bytes(data[26:28], "little") & 0x3FFF
+                h = int.from_bytes(data[28:30], "little") & 0x3FFF
+                return (w, h) if w and h else None
+            if chunk == b"VP8L":  # lossless: 0x2f, then 14-bit (w-1)/(h-1)
+                b0 = int.from_bytes(data[21:25], "little")
+                return ((b0 & 0x3FFF) + 1, ((b0 >> 14) & 0x3FFF) + 1)
+            if chunk == b"VP8X":  # extended: 1 flag byte, then 24-bit (w-1) / 24-bit (h-1)
+                w = int.from_bytes(data[21:24], "little") + 1
+                h = int.from_bytes(data[24:27], "little") + 1
+                return (w, h) if w and h else None
+            return None
+        if data[:2] == b"\xff\xd8":  # jpeg: walk markers to the first SOFn
+            i, n = 2, len(data)
+            while i + 4 <= n:
+                while i < n and data[i] == 0xFF:
+                    i += 1
+                if i >= n:
+                    return None
+                marker = data[i]
+                i += 1
+                if marker == 0xD9 or marker == 0x01 or 0xD0 <= marker <= 0xD8:
+                    continue  # EOI / TEM / RSTn / SOI — no length segment
+                seglen = int.from_bytes(data[i : i + 2], "big")
+                if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC9, 0xCB, 0xCC, 0xCD, 0xCE, 0xCF):
+                    if i + 7 > n:
+                        return None
+                    h = int.from_bytes(data[i + 3 : i + 5], "big")
+                    w = int.from_bytes(data[i + 5 : i + 7], "big")
+                    return (w, h) if w and h else None
+                if seglen < 2:
+                    return None
+                i += seglen
+            return None
+    except (IndexError, struct.error, ValueError):
+        return None
+    return None
+
+# ───────────────────── the row model of one pass (routing) ─────────────────────
+# Radiance sizes an image model's context in LATENT ROWS (16x16 px blocks); the
+# entry's ``max-model-len`` is the rows ONE pass gets — prompt, every reference
+# picture and the drawn picture all pay out of it. A model can be bound
+# differently per slot (NoctQ-V4: 8192 on tp1, unbounded on tp2), so a job's
+# row cost picks its slot (job_candidates). REF_ROWS is upstream's sizing
+# figure (MULTIMODEL §6.3; the KV cost is 4096, GUIDE §5.6 — RUNBOOK → Editing
+# pictures); PROMPT_ROWS is an allowance, not a measurement. Radiance stays the
+# authority: a pass it cannot hold 400s naming the rows needed.
+LATENT_ROW_PX = 16
+EDIT_REF_ROWS = 4600
+PROMPT_ROWS = 256
 # No length caps on the user prompt or the enhancement prompts: the real cap
 # is per-model and in TOKENS (a video model's max_text, an image model's
 # conditioning budget), and radiance enforces it at SUBMIT with a 400 that
 # lands in the job's error. That failure IS the "too big" mark; the panel
 # does not second-guess it in chars.
 MAX_JOBS_KEPT = 500  # history kept in the state file (newer survive a trim)
+GEN_CAPS_PROBE_S = 60.0  # the capability pass's clock (its work list is usually empty)
+GEN_CAPS_REFRESH_S = 3600.0  # re-ask an answer this old — the path check only sees a re-pointed entry
 
 GEN_CAP = 2  # gen-phase flights per slot (LOADING + RUNNING; STARTING has no
              # request yet — see the module docstring's admission rules)
@@ -198,6 +302,67 @@ def save_settings(s: dict[str, Any]) -> None:
     _atomic_write(SETTINGS_PATH, json.dumps(s, indent=2) + "\n", 0o600)
 
 
+# ─────────────────── discovered capabilities (radiance's answer) ───────────────────
+
+
+def _empty_caps() -> dict[str, Any]:
+    return {"models": {}}
+
+
+def load_caps() -> dict[str, Any]:
+    """Per-model capabilities {name: {edits, path, at}}; shape-coerced like
+    the other state files (a corrupt file is no capabilities, never a
+    crash)."""
+    try:
+        data = json.loads(CAPS_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return _empty_caps()
+    out = _empty_caps()
+    if not isinstance(data, dict) or not isinstance(data.get("models"), dict):
+        return out
+    for name, row in data["models"].items():
+        if not isinstance(name, str) or not isinstance(row, dict):
+            continue
+        if not isinstance(row.get("edits"), bool):
+            continue
+        out["models"][name] = {
+            "edits": row["edits"],
+            "path": row.get("path") if isinstance(row.get("path"), str) else "",
+            "at": row["at"] if isinstance(row.get("at"), (int, float)) else 0.0,
+        }
+    return out
+
+
+def caps_of(caps: dict[str, Any], name: str, path: str) -> Optional[bool]:
+    """Does ``name`` read pictures (radiance's ``capabilities.image_edit``)?
+    None = never probed, or the cached answer belongs to a different container
+    path — both read as unknown, never "cannot". A file swap under the same
+    path is re-asked by age, not here."""
+    row = caps["models"].get(name)
+    if not row or (row["path"] and row["path"] != path):
+        return None
+    return row["edits"]
+
+
+def caps_refresh(name: str, path: str, edits: bool) -> bool:
+    """Record one probed answer. Call OUTSIDE gen_lock(); returns True when it
+    WROTE. A fresh confirm writes nothing (no per-pass writes on a steady
+    fleet); a stale or changed answer re-stamps the age clock."""
+    with gen_lock():
+        caps = load_caps()
+        row = caps["models"].get(name)
+        if (
+            row
+            and row["edits"] == edits
+            and row["path"] == path
+            and time.time() - float(row["at"]) <= GEN_CAPS_REFRESH_S
+        ):
+            return False  # same answer on the same file, still fresh: nothing to record
+        caps["models"][name] = {"edits": edits, "path": path, "at": time.time()}
+        _atomic_write(CAPS_PATH, json.dumps(caps, indent=2) + "\n", 0o600)
+        return True
+
+
 def _empty_jobs() -> dict[str, Any]:
     return {"seq": 0, "jobs": {}, "order": []}
 
@@ -247,7 +412,10 @@ def create_job(
     params: dict[str, Any],
     user: Optional[str],
 ) -> dict[str, Any]:
-    """Append a queued job; returns it. Call inside gen_lock()."""
+    """Append a queued job; returns it. Call inside gen_lock(). ``kind`` is
+    the artifact class ("image" for an edit too); the edit block is set by the
+    create path in the same critical section (its files are named after the
+    job)."""
     state = load_jobs()
     job: dict[str, Any] = {
         "id": _next_id(state),
@@ -263,6 +431,7 @@ def create_job(
         "progress": None,
         "error": None,
         "artifact": None,
+        "edit": None,
         "radiance_video_id": None,
         "created_at": time.time(),
         "started_at": None,
@@ -297,12 +466,21 @@ def remove_job(jid: str) -> bool:
     """Drop a job (and its slot claim, if any). Call OUTSIDE gen_lock()."""
     with gen_lock():
         state = load_jobs()
-        if jid not in state["jobs"]:
+        if not remove_job_locked(state, jid):
             return False
-        del state["jobs"][jid]
-        state["order"] = [j for j in state["order"] if j != jid]
         save_jobs(state)
         return True
+
+
+def remove_job_locked(state: dict[str, Any], jid: str) -> bool:
+    """Drop a job from an already-loaded store (caller holds the lock and
+    saves) — the create path rolls a job back when its pictures fail to land,
+    in the same critical section (no nested lock)."""
+    if jid not in state["jobs"]:
+        return False
+    del state["jobs"][jid]
+    state["order"] = [j for j in state["order"] if j != jid]
+    return True
 
 
 def get_job(jid: str) -> Optional[dict[str, Any]]:
@@ -322,11 +500,15 @@ def has_work(jobs: dict[str, Any]) -> bool:
 
 
 def parse_slot_config(text: str) -> dict[str, dict[str, Any]]:
-    """The ``models:`` section of a radiance config → name → {path, kind, tp}.
+    """The ``models:`` section of a radiance config → name → {path, kind, tp,
+    mlen}.
 
     Strict line-based (the repo owns this format and doctor checks it — no
     YAML dependency in the host service); unknown shapes are skipped, not
     fatal: a config the engine can't read simply exposes no models.
+
+    ``mlen`` is the entry's ``max-model-len``: the row budget of one pass
+    (None = the model's own length).
     """
     out: dict[str, dict[str, Any]] = {}
     in_models = False
@@ -347,7 +529,7 @@ def parse_slot_config(text: str) -> dict[str, dict[str, Any]]:
             continue
         if indent == 2 and code.endswith(":"):
             current = code.strip()[:-1]
-            out[current] = {"path": None, "kind": None, "tp": None}
+            out[current] = {"path": None, "kind": None, "tp": None, "mlen": None}
             continue
         if indent >= 4 and current and ":" in code:
             key, _, val = code.strip().partition(":")
@@ -356,6 +538,8 @@ def parse_slot_config(text: str) -> dict[str, dict[str, Any]]:
                 out[current]["path"] = val
             elif key == "tp" and val.isdigit():
                 out[current]["tp"] = int(val)
+            elif key == "max-model-len" and val.isdigit():
+                out[current]["mlen"] = int(val)
     # kind from the /models layout (the 2nd path component)
     for m in out.values():
         p = m["path"]
@@ -415,6 +599,8 @@ def build_instances(
             "container": container,
             "ip": (ips.get(container, "") if container else ""),
             "models": {n: m["kind"] for n, m in models.items()},
+            "mlens": {n: int(m["mlen"] or 0) for n, m in models.items()},  # 0 = no bound set
+            "paths": {n: (m["path"] or "") for n, m in models.items()},  # the capability cache's identity
             "llms": [n for n, m in models.items() if m["kind"] == "llm"],
         }
     return out
@@ -437,6 +623,8 @@ def build_slots(instances: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any
             "container": row["container"],
             "ip": row["ip"],
             "models": dict(row["models"]),
+            "mlens": dict(row["mlens"]),
+            "paths": dict(row["paths"]),
             "llm": row["llms"][0] if row["llms"] else None,
         }
     return slots
@@ -449,28 +637,51 @@ def _article(word: str) -> str:
     return "an" if word[:1].lower() in "aeiou" else "a"
 
 
-def known_models(slots: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """model name → {kind, slots} across the gen slots (the UI's model list
-    and the settings validation's address space)."""
+def known_models(slots: dict[str, dict[str, Any]], caps: Optional[dict[str, Any]] = None) -> dict[str, dict[str, Any]]:
+    """model name → {kind, slots, edits, mlen, mlen_min} across the gen slots
+    (the UI's model list and the settings validation's address space).
+
+    ``edits`` is radiance's answer from the capability cache (None = never
+    probed = unverified, never "cannot"); ``mlen``/``mlen_min`` are the
+    longest/shortest BOUNDED pass any slot gives the model (0 = no slot
+    bounds it) — the line the tab prices frames against and job_candidates
+    routes on.
+    """
+    caps = caps if caps is not None else load_caps()
     out: dict[str, dict[str, Any]] = {}
     for slot in slots.values():
         for name, kind in slot["models"].items():
             if kind not in ("image", "video"):
                 continue
-            e = out.setdefault(name, {"kind": kind, "slots": []})
+            path = (slot.get("paths") or {}).get(name) or ""
+            bound = int((slot.get("mlens") or {}).get(name) or 0)
+            e = out.setdefault(
+                name,
+                {"kind": kind, "slots": [], "edits": None, "mlen": 0, "mlen_min": 0, "_edits": [], "_bounds": []},
+            )
             if slot["name"] not in e["slots"]:
                 e["slots"].append(slot["name"])
+            e["mlen"] = max(e["mlen"], bound)
+            e["_bounds"].append(bound)
+            e["_edits"].append(caps_of(caps, name, path))
     for e in out.values():
+        bounded = [b for b in e.pop("_bounds") if b > 0]
+        e["mlen_min"] = min(bounded) if bounded else 0
+        seen = [v for v in e.pop("_edits") if v is not None]
+        # True on any slot beats False on another
+        e["edits"] = True if True in seen else (False if seen else None)
         e["slots"].sort()
     return out
 
 
-def resolve_model(model: str, settings: dict[str, Any], slots: dict[str, dict[str, Any]]) -> tuple[str, str]:
-    """A job's ``model`` field → (model name, kind).
-
-    A purpose key (image/video) is translated through the admin's settings;
-    anything else must be an exact model name. Raises ValueError (user-ready).
-    """
+def resolve_model(
+    model: str, settings: dict[str, Any], slots: dict[str, dict[str, Any]]
+) -> tuple[str, str, Optional[str]]:
+    """A job's ``model`` field → (model name, kind, purpose key or None). A
+    purpose key (image/video/edit) is translated through the settings; anything
+    else must be an exact model name. ``kind`` is the artifact class (an
+    edit's is still "image"); the third value says the request was asked for
+    the picture-reading path. Raises ValueError (user-ready)."""
     model = (model or "").strip()
     known = known_models(slots)
     if model in RESERVED_MODEL_NAMES:
@@ -479,13 +690,13 @@ def resolve_model(model: str, settings: dict[str, Any], slots: dict[str, dict[st
             raise ValueError(f"purpose {model!r} is not configured (Gen settings)")
         if target not in known:
             raise ValueError(f"purpose {model!r} points at unknown model {target!r}")
-        return target, known[target]["kind"]
+        return target, known[target]["kind"], model
     if not model:
         raise ValueError("model is required (a purpose key like 'image' or an exact model name)")
     if model not in known:
         avail = ", ".join(sorted(known)) or "(none — no gen slot is up in compose)"
         raise ValueError(f"unknown model {model!r} (known: {avail})")
-    return model, known[model]["kind"]
+    return model, known[model]["kind"], None
 
 
 def validate_settings(
@@ -520,8 +731,21 @@ def validate_settings(
             if v not in known:
                 errors.append(f"purposes.{k}: unknown model {v!r} (not hosted by any gen slot)")
                 continue
-            if known[v]["kind"] != k:
-                kind = known[v]["kind"]
+            kind = known[v]["kind"]
+            if k == "edit":
+                # An unprobed model (edits None) is allowed — radiance answers
+                # at submit — so a fresh deploy stays configurable.
+                if kind != "image":
+                    errors.append(f"purposes.edit: {v!r} is {_article(kind)} {kind} model, not an image model")
+                    continue
+                if known[v]["edits"] is False:
+                    errors.append(
+                        f"purposes.edit: {v!r} refuses /v1/images/edits (radiance says it reads no "
+                        "pictures) — pick an edit-capable model, or start a slot that hosts it so its "
+                        "capabilities can be read"
+                    )
+                    continue
+            elif kind != k:
                 errors.append(f"purposes.{k}: {v!r} is {_article(kind)} {kind} model, not {_article(k)} {k} model")
                 continue
             out["purposes"][k] = v
@@ -575,17 +799,34 @@ def flights_on_slot(jobs: dict[str, Any], slot: str) -> list[dict[str, Any]]:
 def admission(
     jobs: dict[str, Any], slot: str, self_jid: Optional[str] = None
 ) -> tuple[bool, str]:
-    """May a flight on ``slot`` take its GEN PHASE? The per-slot cap counts
-    GEN_PHASE_STATES only: a STARTING flight has no gen request yet, and
-    enhancement runs off-slot (its own global cap), so it never contends for
-    the slot's VRAM. ``self_jid`` excludes a re-checking flight from its own
-    count."""
-    fl = [
-        j
-        for j in jobs.values()
-        if j.get("slot") == slot and j.get("state") in GEN_PHASE_STATES and j.get("id") != self_jid
-    ]
-    if len(fl) >= GEN_CAP:
+    """May a flight on ``slot`` take its GEN PHASE? Two rules.
+
+    THE CAP counts GEN_PHASE_STATES only: a STARTING flight has no gen request
+    yet, and enhancement runs off-slot, so neither contends for the slot's
+    VRAM.
+
+    ONE MODEL AT A TIME: a flight on a different model blocks this job, in any
+    in-flight state (a STARTING one is about to ask for its model) — the
+    slot's entries park for each other, so two models in flight would hand
+    the card back and forth every step. Behind it is bounded work: the
+    flights drain, the model switches once, the job runs.
+
+    ``self_jid`` excludes a re-checking flight from its own count (and names
+    the model to compare against).
+    """
+    mine = (jobs.get(self_jid) or {}).get("model") if self_jid else None
+    same = 0
+    for j in jobs.values():
+        if j.get("slot") != slot or j.get("id") == self_jid:
+            continue
+        st = j.get("state")
+        if st not in IN_FLIGHT_STATES:
+            continue
+        if mine and j.get("model") != mine:
+            return False, f"slot {slot} is on {j.get('model')} (one model per slot at a time)"
+        if st in GEN_PHASE_STATES:
+            same += 1
+    if same >= GEN_CAP:
         return False, f"slot {slot} is at its gen-phase cap ({GEN_CAP})"
     return True, ""
 
@@ -650,27 +891,88 @@ def claim_enhance(jid: str) -> Optional[dict[str, Any]]:
         return None
 
 
+def slot_pass(slot: dict[str, Any], model: str) -> int:
+    """The rows this slot's config gives one pass of ``model`` (0 = no bound)."""
+    return int((slot.get("mlens") or {}).get(model) or 0)
+
+
+def slot_covers(slot: dict[str, Any], model: str, rows: Optional[int]) -> bool:
+    """Can one pass of ``model`` on ``slot`` hold ``rows``? Unknown rows route
+    as an unknown cost — radiance answers for them."""
+    bound = slot_pass(slot, model)
+    return bound <= 0 or rows is None or rows <= bound
+
+
+def size_rows(size: Any) -> Optional[int]:
+    """WxH → the latent rows a frame that size costs. None when it is not two
+    numbers: the model then draws its own default, and the panel keeps no
+    model table — an unknown size is an unknown cost, and radiance says no."""
+    if not isinstance(size, str):
+        return None
+    m = re.match(r"^\s*(\d+)\s*[x*]\s*(\d+)\s*$", size, re.I)
+    if not m:
+        return None
+    w, h = int(m.group(1)), int(m.group(2))
+    if w <= 0 or h <= 0:
+        return None
+    return (w // LATENT_ROW_PX) * (h // LATENT_ROW_PX)
+
+
+def pass_rows(kind: str, params: dict[str, Any], refs: int = 0) -> Optional[int]:
+    """The rows one gen pass needs: the frame + its reference pictures + the
+    prompt allowance. None for a video job (its bound is its own conditioning)
+    or an image job whose size cannot be costed."""
+    if kind != "image":
+        return None
+    rows = size_rows((params or {}).get("size"))
+    if rows is None:
+        return None
+    return rows + max(0, refs) * EDIT_REF_ROWS + PROMPT_ROWS
+
+
+def job_rows(job: dict[str, Any]) -> Optional[int]:
+    """``pass_rows`` for a stored job record (its edit block says how many
+    reference pictures it carries)."""
+    refs = len(((job.get("edit") or {}).get("images")) or [])
+    return pass_rows(job.get("kind") or "", job.get("params") or {}, refs)
+
+
+def longest_pass(slots: dict[str, dict[str, Any]], model: str) -> tuple[int, list[str]]:
+    """(the longest pass any slot gives ``model``, the slots that host it) —
+    0 means some slot runs it unbounded."""
+    host = [s for s in slots.values() if model in s["models"]]
+    return max((slot_pass(s, model) for s in host), default=0), [s["name"] for s in host]
+
+
 def job_candidates(
     jobs: dict[str, Any],
     slots: dict[str, dict[str, Any]],
-    model: str,
+    job: dict[str, Any],
 ) -> list[tuple[str, str]]:
-    """Slots that host ``model``, most-attractive first: running before down,
-    then LEAST-LOADED (in-flight flights on the slot) — a model hosted by
-    several slots SPREADS across them (two identical image slots take one
-    job each, not two on the first up to the per-slot cap). The caller
-    reloads ``jobs`` per claim, so a claim made earlier in the same tick
-    already counts toward its slot's load. Name is the final tiebreak
-    (deterministic). Returns [(slot, reason-if-not-running)]."""
+    """Slots that can serve ``job``, most-attractive first: running before
+    down, then the CHEAPEST PASS THAT FITS (a model bound at 8192 on tp1 and
+    unbounded on tp2 is one model; a 2048x2048 request only fits the second),
+    then LEAST-LOADED (spreads a multi-slot model across its slots), then
+    name. Cost comes after "running" because a cold slot costs a start + a
+    load, dearer than the card-minutes it saves. The caller reloads ``jobs``
+    per claim, so a claim earlier in the same tick already counts. Returns
+    [(slot, reason-if-not-running)]."""
+    model = job.get("model") or ""
+    rows = job_rows(job)
     out = []
+    UNBOUNDED = 1 << 40  # an unbounded entry is the most expensive seat, not the free one
     for name in sorted(slots):
         slot = slots[name]
-        if model not in slot["models"]:
+        if model not in slot["models"] or not slot_covers(slot, model, rows):
             continue
-        load = len(flights_on_slot(jobs, name))
-        out.append((name, "" if slot["running"] and slot["ip"] else "down", load))
-    out.sort(key=lambda x: (x[1] != "", x[2], x[0]))
-    return [(name, why) for name, why, _load in out]
+        up = bool(slot["running"] and slot["ip"])
+        bound = slot_pass(slot, model)
+        out.append(
+            (name, "" if up else "down", 0 if up else 1, bound if bound > 0 else UNBOUNDED,
+             len(flights_on_slot(jobs, name)), name)
+        )
+    out.sort(key=lambda x: (x[2], x[3], x[4], x[5]))
+    return [(name, why) for name, why, *_rest in out]
 
 
 def queue_wait_reason(
@@ -679,20 +981,30 @@ def queue_wait_reason(
     status: Optional[dict[str, dict[str, Any]]] = None,
 ) -> Optional[str]:
     """Why a QUEUED, gen-phase-bound job can never be claimed under the
-    CURRENT configs, when the wait would otherwise run in silence: a config
-    drift since the job was queued (its model is no longer hosted), or a
-    lane EVERY hosting slot is blocked on. The normal queue (the gen-phase
-    cap, a free or yieldable lane, a stop that didn't land) says nothing and
-    gets None. The engine marks the result on the record's error column so
-    the job row says why; a claim later clears it (claim_job). The enhance
-    target's structural reasons are marked UP FRONT by the tick's enhance
-    branch (a pending-enhance job never reaches the slot loop). None
-    otherwise (the caller leaves the record's error alone — a re-queue's
-    reason may be riding it)."""
+    CURRENT configs: a config drift since the job was queued (its model is no
+    longer hosted, or no slot's pass covers it), or a lane EVERY hosting slot
+    is blocked on. The normal queue (caps, free/yieldable lanes, a stop that
+    didn't land, a slot parked on another model) gets None. The result is
+    marked on the record's error column (the enhance target's structural
+    reasons up front in the tick's enhance branch); a later claim clears it.
+    None otherwise (a re-queue's reason may be riding it)."""
     model = job.get("model") or ""
     hosting = [s for s in slots.values() if model in s["models"]]
     if not hosting:
         return f"no gen slot hosts {model!r} (a config changed since the job was queued)"
+    # Only the slots whose pass covers this job count: a 2048x2048 edit of a
+    # model bound at 8192 on tp1 is not "waiting for tp1 to drain", it is a
+    # pass tp1 can never take. Create refuses that shape, so reaching here means
+    # the configs shrank (or the store was edited) since the job was queued.
+    rows = job_rows(job)
+    covers = [s for s in hosting if slot_covers(s, model, rows)]
+    if not covers:
+        longest, _names = longest_pass(slots, model)
+        return (
+            f"no slot hosting {model!r} takes a {rows}-row pass (the longest bound is {longest}) "
+            f"— a smaller frame or one fewer reference picture fits (the configs changed since this was queued)"
+        )
+    hosting = covers
     # Every hosting slot blocked (a lane the engine can't free: held by an
     # LLM instance, the pool can't cover it even after the idle yield —
     # structural, only an admin clears it — or a busy gen holder — transient,
@@ -875,13 +1187,28 @@ def sniff(data: bytes) -> tuple[str, str]:
 
 
 def _artifact_job_id(name: str) -> str:
-    """The job id an artifact FILENAME belongs to: the name minus its
-    extension and a trailing ``-thumb`` (video thumbs are named after their
-    MP4)."""
+    """The job id an artifact FILENAME belongs to: the name minus its extension
+    and a trailing ``-thumb`` / ``-mask`` / ``-in<N>`` — all job-named files age
+    GC with their record."""
     stem = name.rsplit(".", 1)[0]
-    if stem.endswith("-thumb"):
-        stem = stem[: -len("-thumb")]
+    for suffix in ("-thumb", "-mask"):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+    if "-in" in stem:
+        head, _, tail = stem.rpartition("-in")
+        if head.startswith("job-") and tail.isdigit():
+            stem = head
     return stem
+
+
+def edit_input_names(jid: str, images: int, mask: bool) -> tuple[list[str], Optional[str]]:
+    """An edit's input file names: ``job-<n>-in<i>.<ext>`` +
+    ``job-<n>-mask.<ext>``. Named like the artifact so the nginx allowlist,
+    the age GC and the record's delete all reach them by the same rules."""
+    return (
+        [f"{jid}-in{i}" for i in range(images)],
+        f"{jid}-mask" if mask else None,
+    )
 
 
 def gc_old_artifacts(

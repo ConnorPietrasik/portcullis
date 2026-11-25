@@ -10,6 +10,16 @@ scheduler:
   drain-timeout: 30s
   warm-up: true
 models:
+  # One model per card at a time (a parking pair; gen_jobs.admission).
+  # NoctQ-V4's 8192 is upstream's one-card bound (it needs 29.7 GiB — radiance
+  # docs/GUIDE §5.6); passes past it route to the UNBOUNDED tp2 pair.
+  # See RUNBOOK → Editing pictures.
   Krea2:
     model: /models/image/krea-2-raw-iq8r.rad
     tp: 1
+    park: {ram: never}
+  NoctQ-V4:
+    model: /models/image/noctq-v4-uncensored-iq8r.rad
+    tp: 1
+    max-model-len: 8192
+    park: {ram: never}

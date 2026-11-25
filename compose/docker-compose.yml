@@ -211,6 +211,7 @@ services:
       RADIANCE_LOG: "warn"
     volumes:
       - /models/video:/models/video:ro
+      - /models/image:/models/image:ro
       - ./gpu-configs/gpu-gentp2.yaml:/etc/radiance/radiance.yaml:ro
     labels:
       - panel.manage=Gen TP2

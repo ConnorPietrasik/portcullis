@@ -40,6 +40,12 @@ node tools/demo/shot.mjs --scenario=tools/demo/scenarios/gen.json
 #    gen — the composer → gallery (select all, a job modal, settings + prompts tabs)
 #    actions — the workbench (a run, the confirm dialog, an arg picker)
 #    aspect — the composer's frame retune across image/video
+#    gen-edit — the EDIT path: the model that reads pictures, attaching a source
+#             picture + a mask (real files through the picker's change event),
+#             which SEAT a pass draws on (a frame only the unbounded tp2 pair can
+#             take — nothing in this fleet is over budget), the edit filter, a job's before/after strip,
+#             remix (its stored sources pulled back into the composer)
+node tools/demo/shot.mjs --scenario=tools/demo/scenarios/gen-edit.json
 
 # Options: --tabs=Gen,Actions (which tabs, default all six) · --warm=35 (warm-up
 # seconds, 0 = skip) · --pre=file.js (one page script after warm-up, before the

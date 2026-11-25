@@ -256,6 +256,22 @@ export interface GenArtifact {
   thumb: string | null
 }
 
+/** One of an edit's stored inputs (a source picture or its mask) — same shape
+ *  and /gen/* serving as an artifact. */
+export interface GenEditInput {
+  url: string
+  mime: string
+  size: number
+}
+
+/** The EDIT block: set on a job that went to /v1/images/edits, null on a plain
+ *  generation. `kind` stays "image" either way — this says the request read
+ *  pictures. */
+export interface GenEdit {
+  images: GenEditInput[]
+  mask: GenEditInput | null
+}
+
 export type GenState =
   | 'queued'
   | 'starting'
@@ -281,6 +297,9 @@ export interface GenJob {
   progress: number | null
   error: string | null
   artifact: GenArtifact | null
+  /** the edit's source pictures + mask (null = a plain generation). Optional:
+   *  records written before the edit path shipped simply have no field. */
+  edit?: GenEdit | null
   radiance_video_id: string | null
   created_at: number
   started_at: number | null
@@ -304,8 +323,13 @@ export interface GenSlot {
   holding: number[] | null
   running: boolean
   ip: string
-  /** entry name → class (a gen slot's config is gen-only — no llm entry) */
+  /** entry name → class (a gen slot's config is gen-only — no llm entry). The
+   *  entries are PARKING partners: one runs at a time (gen_jobs.admission). */
   models: Record<string, 'llm' | 'image' | 'video' | null>
+  /** entry name → max-model-len (0 = unset) — the rows one pass gets HERE. A
+   *  model can be bound differently per slot, which is what routes a job: see
+   *  GenModelInfo.mlen/mlen_min and gen_jobs.job_candidates. */
+  mlens: Record<string, number>
   llm: string | null
   status: GenSlotStatus
 }
@@ -335,6 +359,22 @@ export interface GenEnhanceTarget {
 export interface GenModelInfo {
   kind: 'image' | 'video'
   slots: string[]
+  /** radiance's answer (capabilities.image_edit), cached by the engine: true
+   *  reads pictures, false refuses them ("text only"), null never probed
+   *  (unverified). */
+  edits: boolean | null
+  /** the LONGEST pass any slot gives this model (0 = no slot bounds it). */
+  mlen: number
+  /** the SHORTEST bounded pass any slot gives it (0 = nothing bounds it). */
+  mlen_min: number
+}
+
+/** The row model both sides price a pass with — the server's, so the chips
+ *  and the routing can never disagree. */
+export interface GenRowModel {
+  row_px: number
+  ref_rows: number
+  prompt_rows: number
 }
 
 export interface GenCounts {
@@ -342,6 +382,8 @@ export interface GenCounts {
   active: number
   image: number
   video: number
+  /** jobs that went to /v1/images/edits (a modifier, not a kind) */
+  edit: number
   failed: number
 }
 
@@ -364,6 +406,8 @@ export interface GenPage {
 
 export interface GenOverview {
   slots: GenSlot[]
+  /** the row model of one pass (frames → rows, a reference picture → rows) */
+  row_model?: GenRowModel
   /** fleet instances with llm entries (the enhance-target candidates) */
   instances: GenInstance[]
   enhance_target: GenEnhanceTarget

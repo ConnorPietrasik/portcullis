@@ -27,7 +27,18 @@ import { api, download, NotFound } from '../api'
 import { usePoll } from '../usePoll'
 import { ConfirmModal, CopyBtn, Field, FRow, Meter, Modal, Segmented, Toggle } from '../ui'
 import { clockOf, dur, relTime } from '../fmt'
-import type { GenInstance, GenJob, GenJobCard, GenOverview, GenPage, GenSlot, GenState } from '../types'
+import type {
+  GenEditInput,
+  GenRowModel,
+  GenInstance,
+  GenJob,
+  GenJobCard,
+  GenModelInfo,
+  GenOverview,
+  GenPage,
+  GenSlot,
+  GenState,
+} from '../types'
 
 const IN_FLIGHT: ReadonlySet<GenState> = new Set(['queued', 'starting', 'enhancing', 'loading', 'running'])
 const isLive = (j: GenJob | GenJobCard) => IN_FLIGHT.has(j.state)
@@ -59,13 +70,97 @@ const STATE: Record<GenState, { cls: string; label: string }> = {
 
 const shortId = (id: string) => id.replace('job-', '#')
 
+/** A job's mode label: an edit READS PICTURES; its artifact class (`kind`)
+ *  is still "image". */
+const modeOf = (j: GenJob | GenJobCard) => (j.edit ? 'edit' : j.kind)
+
 // What a deployed model can actually do, read off radiance's implementation
 // (ref/radiance). A tooltip, not a second model registry: no discovery, no
 // enforcement — radiance's submit-time 400 stays the authority, and unknown
-// models get no note.
+// models get no note. (What a model is ALLOWED to do — generate, or also
+// edit — is radiance's answer: `models[name].edits`.)
 const MODEL_NOTES: Record<string, string> = {
   'Minimax-H3-T2V':
     '5.17–14.38 s (24 fps, request rounds up to a ≈0.71 s chunk) · with sound · sides ×32, ≥256 px, ≤1344×768 area, aspect ≤4:1 · prompt ≤8192 tokens',
+}
+
+// ── an edit's row budget (why the frames change with the model) ────────────
+// max-model-len is the rows ONE pass gets: prompt + every reference picture +
+// the frame. A reference resamples to the model's 1024x1024 reference area,
+// which is what the 4600-row figure sizes (MULTIMODEL §6.3; the KV cost is
+// 4096, GUIDE §5.6 — RUNBOOK → Editing pictures). PROMPT_ROWS is an
+// allowance, not a measurement. Over budget is radiance's 400, which lands in
+// the job's error column.
+const ROW_PX = 16 // one latent row is a 16x16 block of pixels
+const REF_ROWS = 4600 // MULTIMODEL §6.3: sizing a pass for one reference
+const PROMPT_ROWS = 256 // allowance for the prompt's text rows (not measured)
+// The fallback row model; the server's (`row_model`) arrives with the overview
+// so the chips and the scheduler's routing price a pass the same way.
+const RM0: GenRowModel = { row_px: ROW_PX, ref_rows: REF_ROWS, prompt_rows: PROMPT_ROWS }
+
+/** What one pass costs: the frame + every reference picture + the prompt. */
+function passRows(rm: GenRowModel, rows: number, refs: number): number {
+  return rows + refs * rm.ref_rows + rm.prompt_rows
+}
+
+/** The slots that could take a `need`-row pass for `model`, cheapest seat
+ *  first — the UI's echo of gen_jobs.job_candidates. An unbounded slot takes
+ *  any pass, so it is the dearest seat, not the free one. */
+function seatsFor(o: GenOverview, model: string | null, need: number | null): string[] {
+  if (!model) return []
+  const rank = (b: number) => (b > 0 ? b : Number.MAX_SAFE_INTEGER)
+  return o.slots
+    .filter(s => model in s.models)
+    .filter(s => {
+      const b = s.mlens[model] ?? 0
+      return b <= 0 || need == null || need <= b
+    })
+    .sort((a, b) => rank(a.mlens[model] ?? 0) - rank(b.mlens[model] ?? 0))
+    .map(s => s.display.replace(/^Gen /, ''))
+}
+
+/** WxH (or W*H) → the latent rows it costs, or null when it isn't two numbers
+ *  (the row width comes from the server's row model, so the chips and the
+ *  routing price a frame the same way). */
+function latentRows(rm: GenRowModel, size: string): number | null {
+  const m = /^\s*(\d+)\s*[x*]\s*(\d+)\s*$/i.exec(size)
+  if (!m) return null
+  const px = rm.row_px || ROW_PX
+  return Math.floor(Number(m[1]) / px) * Math.floor(Number(m[2]) / px)
+}
+
+/** Rows a frame has LEFT on a slot bounding the model at `bound`: the bound
+ *  minus the reference pictures and the prompt. 0 = that slot bounds nothing. */
+function editBudget(rm: GenRowModel, bound: number, refs = 1): number {
+  return bound > 0 ? Math.max(0, bound - refs * rm.ref_rows - rm.prompt_rows) : 0
+}
+
+// The frame ladder per aspect, largest first — the widest rung that fits the
+// budget becomes the chip. Sides stay multiples of 32 (what these models take).
+const EDIT_LADDER: { ratio: string; sizes: string[] }[] = [
+  { ratio: '1:1', sizes: ['1024x1024', '960x960', '896x896', '768x768', '640x640'] },
+  { ratio: '4:3', sizes: ['1152x864', '1024x768', '896x672', '768x576'] },
+  { ratio: '3:2', sizes: ['1152x768', '1024x672', '896x576'] },
+  { ratio: '16:9', sizes: ['1280x704', '1024x576', '896x512', '768x448'] },
+  { ratio: '3:4', sizes: ['864x1152', '768x1024', '672x896', '576x768'] },
+  { ratio: '2:3', sizes: ['768x1152', '672x1024', '576x896'] },
+  { ratio: '9:16', sizes: ['704x1280', '576x1024', '512x896', '448x768'] },
+]
+
+/** The edit's frames: each aspect's largest rung the CHEAP seat can take (when
+ *  it can take nothing, the smallest rung — the unbounded long-pass seat takes
+ *  any rung, and the chips stay dotted "far"). Sizing off the cheap seat keeps
+ *  the chips on the frames the fleet serves routinely. */
+function editFrames(rm: GenRowModel, bound: number, refs = 1, cheap = 0): { ratio: string; size: string }[] {
+  const budget = editBudget(rm, bound, refs)
+  const cheapBudget = cheap > 0 && cheap < bound ? editBudget(rm, cheap, refs) : budget
+  return EDIT_LADDER.map(({ ratio, sizes }) => {
+    const rung = (cap: number) => (cap > 0 ? sizes.find(x => (latentRows(rm, x) ?? 0) <= cap) : undefined)
+    return {
+      ratio,
+      size: bound <= 0 ? sizes[0] : (rung(cheapBudget) ?? rung(budget) ?? sizes[sizes.length - 1]),
+    }
+  })
 }
 
 // One-click frames per class, square → landscape → portrait. Every entry
@@ -97,23 +192,68 @@ function aspect(size: string): number | null {
   return m ? Number(m[1]) / Number(m[2]) : null
 }
 
-/** A frame that fits one model is often illegal on the other (1536×1152 is a
- *  fine Krea2 4:3 and over H3's 1344×768 area), so switching kind retunes the
- *  size: keep it if it is a frame of the new class, else take the new class's
- *  preset for the same aspect, else its 16:9. Null = leave it alone. */
-function retune(kind: 'image' | 'video' | null, size: string): string | null {
-  if (!kind) return null
-  const list = SIZES[kind]
-  if (list.some(p => p.size === size.trim())) return null
+/** The frame chips for one composer state: a video model's list, an edit's
+ *  budget-sized ladder, or the generation list. Identity matters — a change
+ *  of list is what retunes the size field (see refit). */
+function framesFor(rm: GenRowModel, kind: 'image' | 'video' | null, editing: boolean, bound: number, refs = 1, cheap = 0): { ratio: string; size: string }[] {
+  if (kind === 'video') return SIZES.video
+  return editing ? editFrames(rm, bound, refs, cheap) : SIZES.image
+}
+
+/** A frame that fits one model/list is often illegal on another, so a change
+ *  of kind or mode retunes the size: keep it if it is a frame of the new list,
+ *  else take that list's rung for the same aspect, else its 16:9. Null = leave
+ *  it alone. */
+function refit(size: string, frames: { ratio: string; size: string }[]): string | null {
+  if (frames.some(p => p.size === size.trim())) return null
   const a = aspect(size)
   const same =
     a == null
       ? undefined
-      : list.find(p => {
+      : frames.find(p => {
           const [w, h] = p.size.split('x').map(Number)
           return Math.abs(w / h - a) < 1e-6
         })
-  return (same ?? list.find(p => p.ratio === '16:9') ?? list[0]).size
+  return (same ?? frames.find(p => p.ratio === '16:9') ?? frames[0]).size
+}
+
+/** The composer's one-line note: the hardcoded per-model facts plus what the
+ *  config and radiance say about the model in hand — including whether it can
+ *  take pictures at all, and what an edit's frame fits. */
+function noteFor(
+  rm: GenRowModel,
+  resolved: string,
+  info: GenModelInfo | undefined,
+  editing: boolean,
+  refs: number,
+  need: number | null,
+  seats: string[],
+): string {
+  const parts: string[] = []
+  if (MODEL_NOTES[resolved]) parts.push(MODEL_NOTES[resolved])
+  if (info) {
+    if (info.kind === 'image') {
+      if (info.edits === false) parts.push('text only — radiance answers 501 on /v1/images/edits')
+      else if (info.edits === null) parts.push('edits unverified — this slot has not answered /v1/models yet')
+      if (info.mlen) {
+        // WHERE it will draw: the same routing the scheduler will apply.
+        const cost = `${refs} picture${refs > 1 ? 's' : ''} cost ${refs * rm.ref_rows}`
+        const here = seats.join('/')
+        if (need != null && info.mlen_min > 0 && need > info.mlen_min) {
+          parts.push(
+            `${need} rows${editing ? ` (${cost})` : ''} — only ${here || `${info.mlen} rows`} takes that pass (${info.mlen_min} bounds the others)`,
+          )
+        } else {
+          parts.push(
+            `${need ?? info.mlen} rows${editing ? ` (${cost})` : ''} — ${here || 'any slot'} can draw it`,
+          )
+        }
+      } else if (editing) {
+        parts.push('edits')
+      }
+    }
+  }
+  return parts.join(' · ')
 }
 
 // The composer survives a reload (the prompt you were writing is the one
@@ -138,6 +278,87 @@ function loadDraft(): Draft {
     return BLANK
   }
 }
+
+// ── an edit's source pictures (composer state, never the draft) ────────────
+// `dataUrl` is what gets posted (a data: URL, the shape radiance's images API
+// takes). Held in React state, NOT the persisted draft: base64 would eat the
+// localStorage quota.
+interface Source {
+  key: string
+  name: string
+  size: number
+  mime: string
+  dataUrl: string
+  /** the mask marks what may change (its alpha), on the FIRST picture */
+  mask?: boolean
+  /** remixed from this stored artifact */
+  from?: string
+  /** decoded pixel size (absent when the browser cannot draw it); the mask's
+   *  door compares it against the first picture's */
+  w?: number
+  h?: number
+}
+
+// radiance's reference-picture cap and formats; the size cap mirrors
+// gen_jobs.EDIT_INPUT_MAX_BYTES (a too-big upload is refused here so it never
+// costs a slot start to fail).
+const SRC_MAX = 10
+const SRC_TYPES = ['image/png', 'image/jpeg', 'image/webp']
+// a mask is the alpha-having subset (a jpeg mask decodes fully opaque and
+// would repaint nothing — the server refuses it the same way)
+const SRC_MASK_TYPES = ['image/png', 'image/webp']
+const SRC_MAX_BYTES = 16 * 1024 * 1024
+const SRC_ACCEPT = SRC_TYPES.join(',')
+const SRC_MASK_ACCEPT = SRC_MASK_TYPES.join(',')
+
+function readSource(file: File, mask: boolean): Promise<Source> {
+  return new Promise((resolve, reject) => {
+    if (!SRC_TYPES.includes(file.type)) {
+      reject(new Error(`${file.name}: not a png, jpeg or webp picture`))
+      return
+    }
+    if (file.size > SRC_MAX_BYTES) {
+      reject(new Error(`${file.name}: ${(file.size / 1048576).toFixed(1)} MiB — a picture is at most 16 MiB`))
+      return
+    }
+    const fr = new FileReader()
+    fr.onload = () => {
+      // the decoded pixel size rides along (the mask's door compares it to the
+      // first picture's); a picture the browser cannot decode still attaches —
+      // without w/h the check stands down.
+      const base = { key: `${file.name}-${file.size}-${crypto.randomUUID?.() ?? Math.random()}`, name: file.name, size: file.size, mime: file.type, dataUrl: String(fr.result), mask }
+      const img = new Image()
+      img.onload = () => resolve({ ...base, w: img.naturalWidth, h: img.naturalHeight })
+      img.onerror = () => resolve(base)
+      img.src = String(fr.result)
+    }
+    fr.onerror = () => reject(new Error(`${file.name}: could not be read`))
+    fr.readAsDataURL(file)
+  })
+}
+
+/** A stored input (a remix's source) → the same shape, so one code path posts
+ *  it. A dead URL (age GC, a deleted record) throws — the caller says so
+ *  rather than queueing an edit with a missing picture. */
+async function fetchSource(url: string, mask: boolean, mime?: string): Promise<Source> {
+  const r = await fetch(url)
+  if (!r.ok) throw new Error(`${url}: ${r.status}`)
+  const blob = await r.blob()
+  const name = url.split('/').pop() ?? 'picture'
+  // the record's mime wins over the transport's: the panel stored exactly
+  // these bytes under exactly that type
+  const src = await readSource(new File([blob], name, { type: mime || blob.type || 'image/png' }), mask)
+  return { ...src, from: url }
+}
+
+/** A chip's preview; a picture that will not decode collapses to a
+ *  placeholder rather than a broken-image glyph. */
+function SrcPreview({ src }: { src: Source }) {
+  const [bad, setBad] = useState(false)
+  return bad ? <span className="noimg">no preview</span> : <img src={src.dataUrl} alt="" onError={() => setBad(true)} />
+}
+
+const kibi = (n: number) => (n < 1024 * 1024 ? `${Math.max(1, Math.round(n / 1024))} KiB` : `${(n / 1048576).toFixed(1)} MiB`)
 
 // ── status strip ────────────────────────────────────────────────────────────
 
@@ -220,25 +441,139 @@ function Composer({
   o,
   draft,
   setDraft,
+  srcs,
+  setSrcs,
   running,
   onSubmit,
 }: {
   o: GenOverview
   draft: Draft
   setDraft: (d: Draft) => void
+  /** an edit's source pictures (composer state — see the Source note) */
+  srcs: Source[]
+  setSrcs: (s: Source[]) => void
   running: boolean
   onSubmit: () => Promise<string | null>
 }) {
   const [err, setErr] = useState<string | null>(null)
   const [flash, setFlash] = useState<string | null>(null)
+  const [drag, setDrag] = useState(false)
   const ta = useRef<HTMLTextAreaElement>(null)
+  const fileIn = useRef<HTMLInputElement>(null)
+  const maskIn = useRef<HTMLInputElement>(null)
 
-  const { imageModels, videoModels, effective, kind, resolved } = resolveModel(o, draft.model)
-  const note = resolved ? MODEL_NOTES[resolved] : undefined
+  const { imageModels, videoModels, editModels, effective, kind, resolved, purpose } = resolveModel(o, draft.model)
+  const info = resolved ? o.models[resolved] : undefined
+  const refs = srcs.filter(s => !s.mask)
+  const mask = srcs.find(s => s.mask)
+  /** what the model radiance says about pictures: false = "text only", null
+   *  = "never probed" — not "cannot", so the attach stays open */
+  const canEdit = kind === 'image' && info?.edits !== false
+  const editing = refs.length > 0 || purpose === 'edit'
+  // One picture is assumed the moment the edit purpose is chosen with nothing
+  // attached yet (submit stays disabled until one is). The model can be bound
+  // differently per slot, so two lines matter: what the CHEAPEST seat takes and
+  // what the LONGEST BOUNDED one takes (an unbounded seat takes any pass).
+  const rm = o.row_model ?? RM0
+  const big = info?.mlen ?? 0
+  const cheap = info?.mlen_min ?? 0
+  const nrefs = Math.max(1, refs.length)
+  const frames = framesFor(rm, kind, editing, big, nrefs, cheap)
+  const rows = latentRows(rm, draft.size)
+  const need = rows == null ? null : passRows(rm, rows, editing ? nrefs : 0)
+  const seats = seatsFor(o, resolved, need)
+  const only = rows != null && cheap > 0 && need != null && need > cheap
+  // create's routing check, mirrored: a pass is refused only when EVERY seat
+  // bounds the model and none covers it (an unbounded seat takes any pass).
+  const seatBounds = resolved ? o.slots.filter(s => resolved in s.models).map(s => s.mlens[resolved] ?? 0) : []
+  const noSeat = (n: number) => seatBounds.length > 0 && seatBounds.every(b => b > 0 && n > b)
+  /** no slot's pass covers it: create refuses this, and says it up front here */
+  const over = rows != null && need != null && noSeat(need)
+  const overLabel = `${draft.size}${refs.length ? ` + ${refs.length} picture${refs.length > 1 ? 's' : ''}` : ''} = ${need} rows > ${big} — no slot gives ${resolved} that pass`
+  const note = noteFor(rm, resolved, info, editing, editing ? nrefs : 0, need, seats)
   const configured = !!(resolved && o.enhance.prompts[resolved])
   const enhanceOn = draft.enhance ?? o.enhance.enabled
 
   const patch = (p: Partial<Draft>) => setDraft({ ...draft, ...p })
+
+  function say(msg: string | null) {
+    setFlash(msg)
+    if (msg) window.setTimeout(() => setFlash(null), 4000)
+  }
+
+  /** Attach pictures. The first one retunes the frame (an edit pays for its
+   *  reference picture out of the frame's row budget). */
+  async function addPics(files: File[]) {
+    if (!files.length) return
+    setErr(null)
+    if (!canEdit) {
+      setErr(`${resolved} reads no pictures — pick an edit-capable model`)
+      return
+    }
+    const room = SRC_MAX - refs.length
+    if (room <= 0) {
+      setErr(`an edit takes ${SRC_MAX} pictures — remove one first`)
+      return
+    }
+    const take = files.filter(f => !srcs.some(s => !s.mask && s.name === f.name && s.size === f.size)).slice(0, room)
+    if (!take.length) return
+    const first = refs.length === 0
+    try {
+      const got = await Promise.all(take.map(f => readSource(f, false)))
+      setSrcs([...srcs, ...got])
+      if (first) {
+        const size = refit(draft.size, framesFor(rm, kind, true, big, refs.length + take.length, cheap))
+        if (size) patch({ size })
+      }
+      if (take.length < files.length) setErr(`${files.length - take.length} picture(s) skipped (${SRC_MAX} a request, or already attached)`)
+    } catch (e) {
+      setErr(String(e instanceof Error ? e.message : e))
+    }
+  }
+
+  /** One mask slot: it belongs to the FIRST picture, so a second one replaces
+   *  the first rather than joining the list the model never reads. */
+  async function addMask(files: File[]) {
+    if (!files.length) return
+    setErr(null)
+    if (!refs.length) {
+      setErr('a mask belongs to a picture — attach that picture first')
+      return
+    }
+    const f = files[0]
+    if (!SRC_MASK_TYPES.includes(f.type)) {
+      setErr(`${f.name}: a mask is a png or webp (its alpha is what the model reads)`)
+      return
+    }
+    try {
+      const m = await readSource(files[0], true)
+      // the door radiance enforces at submit, asked of the browser first — a
+      // mismatch would cost a slot start to 400
+      const first = refs[0]
+      if (m.w != null && first.w != null && (m.w !== first.w || m.h !== first.h)) {
+        setErr(`${m.name}: a mask must be the first picture's size (${m.w}x${m.h} ≠ ${first.w}x${first.h}) — radiance compares them, it does not resample`)
+        return
+      }
+      setSrcs([...refs, m])
+    } catch (e) {
+      setErr(String(e instanceof Error ? e.message : e))
+    }
+  }
+
+  function drop(src: Source) {
+    let next = srcs.filter(s => s.key !== src.key)
+    // a mask qualifies the FIRST picture — removing that one (or the last,
+    // which re-anchors the list) orphans it, so it goes with its picture
+    if (!src.mask && (refs.length === 1 || refs[0].key === src.key)) {
+      next = next.filter(s => !s.mask)
+    }
+    setSrcs(next)
+    // the last picture off ⇒ back to a generation: let the frame grow back
+    if (src.mask) return
+    if (next.some(s => !s.mask)) return
+    const size = refit(draft.size, framesFor(rm, kind, false, big))
+    if (size) patch({ size })
+  }
 
   async function submit() {
     if (!effective || !draft.prompt.trim()) return
@@ -246,15 +581,15 @@ function Composer({
     setFlash(null)
     try {
       const id = await onSubmit()
-      setFlash(id ? `queued ${shortId(id)}` : 'queued')
-      window.setTimeout(() => setFlash(null), 4000)
+      say(id ? `queued ${shortId(id)}` : 'queued')
       ta.current?.focus()
     } catch (e) {
       setErr(String(e instanceof Error ? e.message : e))
     }
   }
 
-  const canSubmit = !!effective && draft.prompt.trim().length > 0 && !running
+  const needPic = purpose === 'edit' && refs.length === 0
+  const canSubmit = !!effective && draft.prompt.trim().length > 0 && !running && !needPic
 
   return (
     <div className="card gen-comp">
@@ -264,11 +599,27 @@ function Composer({
             value={effective}
             onChange={e => {
               const next = e.target.value
-              // a purpose key and a model name can be the same class (image →
-              // Krea2): only a real class change retunes the frame
-              const nk = resolveModel(o, next).kind
-              const size = nk && nk !== kind ? retune(nk, draft.size) : null
+              const r = resolveModel(o, next)
+              const nk = r.kind
+              const ni = r.resolved ? o.models[r.resolved] : undefined
+              // the frame follows the LIST the new state gets (a purpose key and
+              // a model name can be the same class: only a real change retunes)
+              const size =
+                nk !== kind || (ni?.edits === false && refs.length > 0)
+                  ? refit(draft.size, framesFor(rm, nk, nk === 'image' && ni?.edits !== false && refs.length > 0, ni?.mlen ?? 0, Math.max(1, refs.length), ni?.mlen_min ?? 0))
+                  : null
               patch({ model: next, enhance: null, ...(size ? { size } : {}) })
+              // a model the pictures cannot go to (a video, or a text-only
+              // image — an unprobed one still takes them): drop the mask WITH
+              // its pictures, or it would re-attach to a later edit.
+              if (refs.length && (nk === 'video' || (nk === 'image' && ni?.edits === false))) {
+                setSrcs([])
+                const why =
+                  nk === 'video'
+                    ? `${r.resolved} is a video model (an edit's pictures go to an image model)`
+                    : `${r.resolved} reads no pictures`
+                say(`dropped ${refs.length} picture${refs.length === 1 ? '' : 's'}${mask ? ' + the mask' : ''} — ${why}`)
+              }
             }}
             disabled={running}
             title={note}
@@ -283,11 +634,17 @@ function Composer({
                 video → {o.purposes.video}
               </option>
             )}
+            {o.purposes.edit && (
+              <option value="edit" disabled={editModels.length === 0}>
+                edit → {o.purposes.edit}
+              </option>
+            )}
             {imageModels.length > 0 && (
               <optgroup label="image models">
                 {imageModels.map(n => (
                   <option key={n} value={n}>
                     {n}
+                    {o.models[n]?.edits === true ? ' · edits' : o.models[n]?.edits === null ? ' · edits?' : ''}
                   </option>
                 ))}
               </optgroup>
@@ -304,7 +661,7 @@ function Composer({
           </select>
         </Field>
 
-        <Field label="size" className="w-size" title="WxH — the chips are the frames each model accepts">
+        <Field label="size" className="w-size" title="WxH — the chips are the frames this model and mode accept">
           <input value={draft.size} onChange={e => patch({ size: e.target.value })} placeholder="1344x768" disabled={running} />
         </Field>
 
@@ -312,17 +669,31 @@ function Composer({
             line and a custom size simply leaves every chip off */}
         <Field label="aspect" className="w-aspect">
           <span className="ratios">
-            {(SIZES[kind ?? 'image'] ?? SIZES.image).map(p => (
-              <button
-                key={p.size}
-                type="button"
-                className={`mini${draft.size === p.size ? ' on' : ''}`}
-                title={p.size}
-                onClick={() => patch({ size: p.size })}
-              >
-                {p.ratio}
-              </button>
-            ))}
+            {frames.map(p => {
+              const r = latentRows(rm, p.size) ?? 0
+              const pneed = passRows(rm, r, editing ? nrefs : 0)
+              const bad = noSeat(pneed)
+              // past the CHEAP SEAT'S BOUND (pneed already pays for the
+              // references): only the long-pass slot takes this frame — worth a
+              // dot. (An unbounded long-pass seat: "far" = past every BOUNDED
+              // seat.)
+              const far = !bad && cheap > 0 && pneed > cheap
+              return (
+                <button
+                  key={p.size}
+                  type="button"
+                  className={`mini${draft.size === p.size ? ' on' : ''}${bad ? ' over' : far ? ' far' : ''}`}
+                  title={
+                    big
+                      ? `${p.size} · ${pneed} rows${bad ? ` — no slot gives ${resolved} more than ${big}` : far ? ` — only ${seatsFor(o, resolved, pneed).join('/')} takes this; it parks what is on those cards` : ` · fits ${seatsFor(o, resolved, pneed).join('/') || 'any slot'}`}`
+                      : p.size
+                  }
+                  onClick={() => patch({ size: p.size })}
+                >
+                  {p.ratio}
+                </button>
+              )
+            })}
           </span>
         </Field>
 
@@ -363,11 +734,92 @@ function Composer({
         </span>
       </div>
 
+      {/* the edit's source pictures: attach by button or by drag, one chip
+          each, a mask of its own (radiance reads ONE, for the first picture) */}
+      {canEdit && (
+        <div
+          className={`srcs${drag ? ' drag' : ''}${refs.length ? ' on' : ''}`}
+          onDragOver={e => {
+            e.preventDefault()
+            setDrag(true)
+          }}
+          onDragLeave={() => setDrag(false)}
+          onDrop={e => {
+            e.preventDefault()
+            setDrag(false)
+            void addPics(Array.from(e.dataTransfer?.files ?? []))
+          }}
+        >
+          {refs.map((s, i) => (
+            <figure key={s.key} className="src" title={`${s.name} · ${kibi(s.size)}${s.from ? ` · remixed from ${s.from}` : ''}`}>
+              <SrcPreview src={s} />
+              <figcaption>{i === 0 ? 'source' : `ref ${i + 1}`}</figcaption>
+              <button type="button" title="remove" disabled={running} onClick={() => drop(s)}>
+                ✕
+              </button>
+            </figure>
+          ))}
+          {mask && (
+            <figure className="src mask" title={`${mask.name} · ${kibi(mask.size)} — transparent pixels may change${mask.from ? ` · remixed from ${mask.from}` : ''}`}>
+              <SrcPreview src={mask} />
+              <figcaption>mask</figcaption>
+              <button type="button" title="remove" disabled={running} onClick={() => drop(mask)}>
+                ✕
+              </button>
+            </figure>
+          )}
+          <div className="srcpick">
+            <span className="pickrow">
+              <button type="button" className="pick" disabled={running || refs.length >= SRC_MAX} onClick={() => fileIn.current?.click()} title={`png, jpeg or webp · up to ${SRC_MAX} · ≤16 MiB each · or drop them here`}>
+                + picture
+              </button>
+              <button
+                type="button"
+                className="pick"
+                disabled={running || !refs.length}
+                onClick={() => maskIn.current?.click()}
+                title={refs.length ? 'a mask: transparent pixels are what the model may change — it must be the first picture\u2019s exact size' : 'attach the picture the mask belongs to first'}
+              >
+                + mask
+              </button>
+              <input
+                ref={fileIn}
+                type="file"
+                accept={SRC_ACCEPT}
+                multiple
+                hidden
+                onChange={e => {
+                  void addPics(Array.from(e.target.files ?? []))
+                  e.target.value = ''
+                }}
+              />
+              <input
+                ref={maskIn}
+                type="file"
+                accept={SRC_MASK_ACCEPT}
+                hidden
+                onChange={e => {
+                  void addMask(Array.from(e.target.files ?? []))
+                  e.target.value = ''
+                }}
+              />
+            </span>
+            <span className="hint">
+              {refs.length
+                ? `${refs.length} picture${refs.length === 1 ? '' : 's'}${mask ? ' + mask' : ''}${need != null && big ? (over ? ` · ${need} rows — over every slot` : only ? ` · ${need} rows → ${seats.join('/') || 'the long-pass slot'} only` : ` · ${need} rows → ${seats.join('/') || 'any slot'}`) : ''}`
+                : info?.edits === null
+                  ? 'drop a picture in to edit — radiance has not confirmed this model reads them yet (its slot has never been up)'
+                  : 'drop a picture in to edit — this model reads what you attach (png / jpeg / webp)'}
+            </span>
+          </div>
+        </div>
+      )}
+
       <textarea
         ref={ta}
         rows={2}
         value={draft.prompt}
-        placeholder={kind === 'video' ? 'a red fox trotting through a snowy pine forest, snow crunching underfoot' : 'a red fox in fresh snow, morning light'}
+        placeholder={kind === 'video' ? 'a red fox trotting through a snowy pine forest, snow crunching underfoot' : editing ? 'put a red scarf on the fox' : 'a red fox in fresh snow, morning light'}
         onChange={e => patch({ prompt: e.target.value })}
         onKeyDown={e => {
           if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
@@ -377,10 +829,16 @@ function Composer({
         }}
       />
       <div className="cfoot">
-        {note && (
-          <span className="note" title={note}>
-            {resolved} · {note}
+        {over ? (
+          <span className="note warn" title={`${overLabel} (the frame is ${rows} rows, a reference picture ${rm.ref_rows}, the prompt allowance ${rm.prompt_rows}) — create refuses it instead of queueing a job that spends a slot start to fail`}>
+            {overLabel}
           </span>
+        ) : (
+          note && (
+            <span className="note" title={note}>
+              {resolved} · {note}
+            </span>
+          )
         )}
         {flash && <span className="flash">{flash} ✓</span>}
         {err && (
@@ -388,8 +846,13 @@ function Composer({
             {err}
           </span>
         )}
-        <button className="go" disabled={!canSubmit} onClick={() => void submit()} title="⌘/ctrl + ⏎">
-          {running ? 'queueing…' : `queue ${kind ?? 'job'}`}
+        <button
+          className="go"
+          disabled={!canSubmit}
+          onClick={() => void submit()}
+          title={needPic ? 'the edit purpose needs a source picture — attach one' : '⌘/ctrl + ⏎'}
+        >
+          {running ? 'queueing…' : `queue ${refs.length ? 'edit' : kind ?? 'job'}`}
         </button>
       </div>
     </div>
@@ -448,6 +911,22 @@ function Thumb({ job, big }: { job: GenJob | GenJobCard; big?: boolean }) {
   return <img className="media" src={src} alt="" loading="lazy" onError={() => setGone(true)} />
 }
 
+/** The card's corner chip: the picture an EDIT worked from. A dead URL (age
+ *  GC, a deleted record) drops the chip. */
+function SrcChip({ job }: { job: GenJob | GenJobCard }) {
+  const src = job.edit?.images?.[0]
+  const [gone, setGone] = useState(false)
+  if (!src || gone) return null
+  return (
+    <span
+      className="jsrc"
+      title={`edited from ${job.edit?.images.length} picture${job.edit && job.edit.images.length > 1 ? 's' : ''}${job.edit?.mask ? ' + mask' : ''}`}
+    >
+      <img src={src.url} alt="" loading="lazy" onError={() => setGone(true)} />
+    </span>
+  )
+}
+
 function JobCard({
   job,
   selected,
@@ -474,7 +953,8 @@ function JobCard({
         <label className="jcheck" onClick={e => e.stopPropagation()}>
           <input type="checkbox" checked={selected} onChange={e => onSel(e.target.checked)} />
         </label>
-        <span className="jkind">{job.kind}</span>
+        <span className="jkind">{modeOf(job)}</span>
+        <SrcChip job={job} />
         {inf &&
           (job.progress != null ? (
             <span className="jprog">
@@ -614,6 +1094,19 @@ function JobModal({
   const instruction = o.enhance.prompts[j.model] ?? ''
   const queueS = j.started_at != null ? j.started_at - j.created_at : null
   const runS = j.started_at != null && j.finished_at != null ? j.finished_at - j.started_at : null
+  // the before/after strip: the edit's stored pictures (the mask last — it
+  // qualifies the FIRST picture, it is not one)
+  const inputs: { key: string; url: string; label: string; size: number; mask?: boolean }[] = [
+    ...(j.edit?.images ?? []).map((s: GenEditInput, i: number) => ({
+      key: `in${i}`,
+      url: s.url,
+      label: i === 0 ? 'source' : `ref ${i + 1}`,
+      size: s.size,
+    })),
+    ...(j.edit?.mask ? [{ key: 'mask', url: j.edit.mask.url, label: 'mask', size: j.edit.mask.size, mask: true }] : []),
+  ]
+  const [show, setShow] = useState<string | null>(null)
+  const shown = inputs.find(s => s.key === show)
 
   return (
     <Modal
@@ -643,7 +1136,16 @@ function JobModal({
       <div className="jm">
         <div className="jm-l">
           <div className="jm-media">
-            <Thumb job={j} big />
+            {shown ? (
+              <>
+                <img className="media" src={shown.url} alt="" />
+                <button type="button" className="back" onClick={() => setShow(null)}>
+                  ← result
+                </button>
+              </>
+            ) : (
+              <Thumb job={j} big />
+            )}
             {j.state === 'running' && j.progress != null && (
               <span className="jprog under">
                 <Meter pct={j.progress / 100} tone="load" />
@@ -651,6 +1153,29 @@ function JobModal({
               </span>
             )}
           </div>
+          {/* an edit's before/after: the pictures it worked from, stored beside
+              its result — flip the big view between them */}
+          {inputs.length > 0 && (
+            <div className="b4">
+              <button type="button" className={shown ? '' : 'on'} onClick={() => setShow(null)} title="what the model made">
+                {j.artifact?.url ? <img src={j.artifact.url} alt="" /> : <span className="noimg">—</span>}
+                <em>after</em>
+              </button>
+              {inputs.map(s => (
+                <button
+                  key={s.key}
+                  type="button"
+                  className={show === s.key ? 'on' : ''}
+                  onClick={() => setShow(shown === s ? null : s.key)}
+                  title={`${s.label} · ${kibi(s.size)}${s.mask ? ' — transparent pixels are what the model may change' : ''}`}
+                >
+                  <img src={s.url} alt="" />
+                  <em>{s.label}</em>
+                </button>
+              ))}
+              <span className="muted b4hint">click to compare</span>
+            </div>
+          )}
           <PromptBlock label="prompt" text={j.prompt} hint={enhanced ? 'what you typed' : undefined} />
           {enhanced && <PromptBlock label="enhanced" text={enhanced} hint="what rendered" />}
           {instruction && (
@@ -666,7 +1191,7 @@ function JobModal({
 
         <div className="jm-r">
           <Row k="model">
-            {j.model} <span className="muted">{j.kind}</span>
+            {j.model} <span className="muted">{j.edit ? 'image · edit' : j.kind}</span>
           </Row>
           <Row k="slot">
             {j.slot ?? <span className="muted">—</span>}
@@ -752,6 +1277,9 @@ function SettingsModal({ o, busy, onSaved, onClose }: { o: GenOverview; busy: bo
   const videoModels = Object.entries(o.models)
     .filter(([, m]) => m.kind === 'video')
     .map(([n]) => n)
+  // the "edit" purpose may name an UNPROBED model (null) — the server's rule;
+  // one radiance says reads no pictures is not offered (the save would 400)
+  const editModels = imageModels.filter(n => o.models[n].edits !== false)
   const genModels = [...imageModels, ...videoModels]
   const stale = Object.keys(form.prompts).filter(n => !genModels.includes(n))
   const setCount = genModels.filter(n => (form.prompts[n] ?? '').trim() !== '').length
@@ -849,6 +1377,23 @@ function SettingsModal({ o, busy, onSaved, onClose }: { o: GenOverview; busy: bo
               {videoModels.map(n => (
                 <option key={n} value={n}>
                   {n}
+                </option>
+              ))}
+            </select>
+          </FRow>
+          <FRow
+            label="edit purpose"
+            hint="what a request naming the “edit” purpose gets — a model radiance reports as reading pictures (unprobed ones stay pickable)"
+          >
+            <select
+              value={form.purposes.edit ?? ''}
+              onChange={e => setForm({ ...form, purposes: { ...form.purposes, edit: e.target.value } })}
+            >
+              <option value="">— none —</option>
+              {editModels.map(n => (
+                <option key={n} value={n}>
+                  {n}
+                  {o.models[n].edits === null ? ' — unprobed' : ''}
                 </option>
               ))}
             </select>
@@ -984,7 +1529,7 @@ function SettingsModal({ o, busy, onSaved, onClose }: { o: GenOverview; busy: bo
 
 // ── the view ────────────────────────────────────────────────────────────────
 
-type Filter = 'all' | 'active' | 'image' | 'video' | 'failed'
+type Filter = 'all' | 'active' | 'image' | 'video' | 'edit' | 'failed'
 
 const PAGE = 24 // the gallery's window: one screenful of cards per transfer
 
@@ -998,6 +1543,8 @@ type BatchResult = { id: string; ok: boolean; action?: string; error?: string }
 function pageMatches(j: GenJob, filter: Filter, q: string): boolean {
   if (filter === 'image' && j.kind !== 'image') return false
   if (filter === 'video' && j.kind !== 'video') return false
+  // "edit" is a modifier on the image class (its artifact is a picture too)
+  if (filter === 'edit' && !j.edit) return false
   if (filter === 'failed') return false
   const needle = q.trim().toLowerCase().slice(0, 200)
   if (needle) {
@@ -1063,6 +1610,10 @@ export default function Gen({ intervalMs, onTab }: { intervalMs: number; onTab?:
 
   const [busy, setBusy] = useState<string | null>(null)
   const [draft, setDraft] = useState<Draft>(loadDraft)
+  // an edit's attached pictures — deliberately OUT of the persisted draft
+  // (base64 would eat the localStorage quota); they survive a submit (the same
+  // picture twice is a perfectly valid thing to want)
+  const [srcs, setSrcs] = useState<Source[]>([])
   const [sel, setSel] = useState<Set<string>>(() => new Set())
   // what the selection carries, remembered per id: the MiB total and the
   // artifact count must survive paging (a job off the current page still
@@ -1171,6 +1722,21 @@ export default function Gen({ intervalMs, onTab }: { intervalMs: number; onTab?:
       seconds: p.seconds != null ? String(p.seconds) : BLANK.seconds,
       enhance: j.enhance,
     })
+    // an edit remixes its PICTURES too — stored under /gen/*, so pull them
+    // back into the composer. A file that is gone is said, not silently
+    // dropped: an edit without its picture is a different job.
+    const refs = (j.edit?.images ?? []).map(s => fetchSource(s.url, false, s.mime))
+    const mask = j.edit?.mask ? [fetchSource(j.edit.mask.url, true, j.edit.mask.mime)] : []
+    if (refs.length + mask.length) {
+      void Promise.all([...refs, ...mask])
+        .then(setSrcs)
+        .catch(e => {
+          setSrcs([])
+          setNote(`remix: its source picture is gone (${e instanceof Error ? e.message : String(e)}) — attach it again to repeat the edit`)
+        })
+    } else {
+      setSrcs([])
+    }
     setOpen(null)
     composer.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
   }
@@ -1254,11 +1820,13 @@ export default function Gen({ intervalMs, onTab }: { intervalMs: number; onTab?:
           o={o}
           draft={draft}
           setDraft={setDraft}
+          srcs={srcs}
+          setSrcs={setSrcs}
           running={busy !== null}
           onSubmit={async () => {
             setBusy('new')
             try {
-              const r = await api<{ id: string }>('/gen/jobs', { method: 'POST', body: JSON.stringify(draftPayload(draft, o)) })
+              const r = await api<{ id: string }>('/gen/jobs', { method: 'POST', body: JSON.stringify(draftPayload(draft, o, srcs)) })
               poll.refresh()
               return r.id
             } finally {
@@ -1283,6 +1851,7 @@ export default function Gen({ intervalMs, onTab }: { intervalMs: number; onTab?:
               { value: 'all', label: 'all', count: o.counts.all },
               { value: 'active', label: 'active', count: o.counts.active },
               { value: 'image', label: 'image', count: o.counts.image },
+              { value: 'edit', label: 'edit', count: o.counts.edit },
               { value: 'video', label: 'video', count: o.counts.video },
               { value: 'failed', label: 'failed', count: o.counts.failed },
             ]}
@@ -1408,9 +1977,10 @@ export default function Gen({ intervalMs, onTab }: { intervalMs: number; onTab?:
   )
 }
 
-/** The composer draft as the create endpoint wants it (the draft is UI state:
- *  strings, the settings-default sentinel, and fields the model may not take). */
-function draftPayload(draft: Draft, o: GenOverview) {
+/** The composer draft + its attached pictures as the create endpoint wants
+ *  them (the draft is UI state: strings, the settings-default sentinel, and
+ *  fields the model may not take). Pictures in the body make it an EDIT. */
+function draftPayload(draft: Draft, o: GenOverview, srcs: Source[]) {
   const { effective, kind } = resolveModel(o, draft.model)
   const params: Record<string, unknown> = {}
   if (draft.size.trim()) params.size = draft.size.trim()
@@ -1421,10 +1991,19 @@ function draftPayload(draft: Draft, o: GenOverview) {
   // the same rule as seed; sending Number('') would 400 on 0
   if (kind === 'video' && draft.seconds.trim() !== '' && Number.isFinite(seconds)) params.seconds = seconds
   const enhance = draft.enhance ?? o.enhance.enabled
+  const refs = srcs.filter(s => !s.mask)
+  const mask = srcs.find(s => s.mask)
   const body: Record<string, unknown> = { model: effective, prompt: draft.prompt.trim(), params }
+  if (refs.length) body.images = refs.map(s => s.dataUrl)
+  // a mask belongs to the first picture; without one the server refuses it
+  if (refs.length && mask) body.mask = mask.dataUrl
   if (draft.enhance !== null) body.enhance = enhance
   return body
 }
+
+/** Purpose key → the class it names. "edit" is an IMAGE model read through the
+ *  picture path — the same artifact class. */
+const PURPOSE_KIND: Record<string, 'image' | 'video'> = { image: 'image', video: 'video', edit: 'image' }
 
 /** Purpose key or model name → what it resolves to. An empty selection falls
  *  back to the configured purposes (so the composer is useful before anyone
@@ -1436,8 +2015,16 @@ function resolveModel(o: GenOverview, model: string) {
   const videoModels = Object.entries(o.models)
     .filter(([, m]) => m.kind === 'video')
     .map(([n]) => n)
-  const effective = model || o.purposes.image || o.purposes.video || imageModels[0] || videoModels[0] || ''
-  const kind = effective in o.purposes ? (effective as 'image' | 'video') : o.models[effective]?.kind ?? null
-  const resolved = effective in o.purposes ? o.purposes[effective] : effective
-  return { imageModels, videoModels, effective, kind, resolved }
+  // what the "edit" purpose could name — the server's rule: UNPROBED (null)
+  // is not "refuses pictures"
+  const editModels = imageModels.filter(n => o.models[n].edits !== false)
+  // image → video → edit: an empty composer falls back to the plain-generation
+  // models first (its default is never the model the operator pointed "edit"
+  // at)
+  const effective =
+    model || o.purposes.image || o.purposes.video || o.purposes.edit || imageModels[0] || videoModels[0] || ''
+  const purpose = effective in o.purposes ? effective : null
+  const kind = purpose ? PURPOSE_KIND[purpose] ?? null : o.models[effective]?.kind ?? null
+  const resolved = purpose ? o.purposes[purpose] : effective
+  return { imageModels, videoModels, editModels, effective, kind, resolved, purpose }
 }

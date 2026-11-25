@@ -2002,10 +2002,12 @@ def gpus_unreserve(body: GpuUnreserveBody, _admin: Optional[str] = Depends(requi
 # The panel's Gen section: one FIFO of jobs, served by the GEN SLOTS — the
 # gpu.private instances (no public host; make doctor asserts it), discovered
 # from the deployed radiance configs, reached by container IP like the LLM
-# router. Each slot is gen-ONLY: its gen model is the sole config entry and
-# stays resident. Prompt ENHANCEMENT runs off-slot, on the settings' enhance
-# target (default: the gpu-writer instance's "Writer" entry), which the
-# engine starts via the same panel-do gpu-apply when needed.
+# router. Each slot is gen-ONLY; its entries are PARKING partners (radiance
+# keeps one resident per card and swaps the rest in — the engine enforces one
+# model per slot at a time, gen_jobs.admission). Prompt ENHANCEMENT runs
+# off-slot, on the settings' enhance target (default: the gpu-writer instance's
+# "Writer" entry), which the engine starts via the same panel-do gpu-apply when
+# needed.
 #
 # Every endpoint here rides the admin gate; V2 exposes the SAME job API to
 # the servitor on /machine/gen/* behind the LLM bearer key — no second queue.
@@ -2020,6 +2022,10 @@ def gpus_unreserve(body: GpuUnreserveBody, _admin: Optional[str] = Depends(requi
 #
 # Radiance contract (upstream, ref/radiance): images — sync
 # POST /v1/images/generations, response_format b64_json ONLY (url is refused);
+# an EDIT — sync POST /v1/images/edits, the same fields plus the source
+# pictures as JSON data URLs — served by the models that read pictures,
+# answered 501 by the ones that don't (which is why the panel ASKS radiance
+# which is which — _gen_probe_caps — rather than keep a table of its own);
 # videos — POST /v1/videos → {id, status}, GET /v1/videos/{id} →
 # status(queued|in_progress|completed|failed) + progress(0-100),
 # GET /v1/videos/{id}/content → the MP4 (?variant=thumbnail → first frame),
@@ -2030,13 +2036,18 @@ def gpus_unreserve(body: GpuUnreserveBody, _admin: Optional[str] = Depends(requi
 # synchronous calls. Auth: Bearer LLM_API_KEY (the slots' and the writer's
 # RADIANCE_API_KEY is the same fleet key).
 #
-# Admission (two caps — see gen_jobs): per slot, at most GEN_CAP jobs in the
-# GEN PHASE (one in progress + one queued in radiance — the model's own
-# sequencing; a starting flight consumes no headroom); system-wide, at most
-# GEN_ENHANCE_CAP enhancements in flight on the enhance target. Enhancement
-# runs BEFORE the slot phase and OFF-SLOT (a different card): a queued job
-# enhances as soon as there is enhance headroom, without a slot being claimed
-# or started.
+# Admission (two caps + one rule — see gen_jobs): per slot, at most GEN_CAP
+# jobs in the GEN PHASE (one in progress + one queued in radiance — a starting
+# flight consumes no headroom) and ONE MODEL per slot at a time (the entries
+# park for each other); system-wide, at most GEN_ENHANCE_CAP enhancements in
+# flight on the enhance target. Enhancement runs BEFORE the slot phase and
+# OFF-SLOT (a different card): a queued job enhances as soon as there is
+# enhance headroom, without a slot being claimed or started.
+#
+# What a model can do is radiance's answer, not a table here: the capability
+# pass reads `capabilities.image_edit` off each running slot's /v1/models into
+# gen-capabilities.json (the UI offers the EDIT path on true, "text only" on
+# false, unverified on null).
 
 GEN_ARTIFACT_DIR = Path(
     os.environ.get("GEN_ARTIFACT_DIR")
@@ -2115,6 +2126,7 @@ def _gen_sweep_zips() -> list[str]:
 _gen_http: Optional[httpx.AsyncClient] = None  # created in lifespan
 _gen_tasks: dict[str, asyncio.Task] = {}  # job id → in-flight task
 _gen_gc_at: float = 0.0
+_gen_caps_at: float = 0.0
 _gen_dev_logged: bool = False
 
 
@@ -2464,7 +2476,11 @@ async def _gen_enhance_call(base: str, model: str, user_prompt: str, instruction
 
 
 async def _gen_image_call(base: str, job: dict[str, Any], final_prompt: str) -> bytes:
-    """The synchronous image POST — b64_json only (radiance refuses url)."""
+    """The synchronous image POST — b64_json only (radiance refuses url). An
+    EDIT job (record carries the `edit` block) goes to /v1/images/edits with
+    its source pictures instead."""
+    if job.get("edit"):
+        return await _gen_edit_call(base, job, final_prompt)
     body: dict[str, Any] = {
         "model": job["model"],
         "prompt": final_prompt,
@@ -2477,6 +2493,36 @@ async def _gen_image_call(base: str, job: dict[str, Any], final_prompt: str) -> 
     r = await _gen_http.post(f"{base}/v1/images/generations", headers=_gen_auth(), json=body, timeout=1800.0)
     if r.status_code >= 400:
         raise _GenError(f"image generation failed: HTTP {r.status_code}: {r.text[:300]}")
+    return _gen_b64_picture(r)
+
+
+async def _gen_edit_call(base: str, job: dict[str, Any], final_prompt: str) -> bytes:
+    """The synchronous EDIT POST. The pictures go as JSON data URLs (radiance's
+    /v1/images/edits takes them beside OpenAI's multipart) — one request shape,
+    no multipart plumbing."""
+    body: dict[str, Any] = {
+        "model": job["model"],
+        "prompt": final_prompt,
+        "response_format": "b64_json",
+        "images": [{"image_url": url} for url in await asyncio.to_thread(_gen_input_urls, job)],
+    }
+    mask = await asyncio.to_thread(_gen_input_url, job["edit"].get("mask"))
+    if mask:
+        body["mask"] = {"image_url": mask}
+    if job["params"].get("size"):
+        body["size"] = job["params"]["size"]
+    if job["params"].get("seed") is not None:
+        body["seed"] = job["params"]["seed"]
+    r = await _gen_http.post(f"{base}/v1/images/edits", headers=_gen_auth(), json=body, timeout=1800.0)
+    if r.status_code >= 400:
+        why = " (this model reads no pictures)" if r.status_code == 501 else ""
+        raise _GenError(f"image edit failed{why}: HTTP {r.status_code}: {r.text[:300]}")
+    return _gen_b64_picture(r)
+
+
+def _gen_b64_picture(r: httpx.Response) -> bytes:
+    """The one picture out of an images response (generations and edits share
+    the shape)."""
     try:
         b64 = r.json()["data"][0]["b64_json"]
     except (KeyError, IndexError, ValueError):
@@ -2540,6 +2586,105 @@ async def _gen_video_cancel(base: str, vid: str) -> None:
         pass  # best effort — the slot may already be gone
 
 
+_DATA_URL_RE = re.compile(r"\Adata:([-.+a-zA-Z0-9]+/[-.+a-zA-Z0-9]+)?(;base64)?,(.*)\z", re.S)
+
+
+def _gen_read_data_url(
+    field: str,
+    value: Any,
+    mimes: frozenset[str] = gen_jobs.EDIT_INPUT_MIMES,
+    kind: str = "an edit format",
+) -> tuple[bytes, str]:
+    """One `data:` URL of an edit's source pictures → (bytes, mime). Refused
+    at submission: a bad or oversized picture would otherwise cost a slot start
+    before failing. Formats are radiance's edit set (the mask gets its
+    alpha-having subset); the size cap is gen_jobs.EDIT_INPUT_MAX_BYTES."""
+    if not isinstance(value, str) or not value:
+        raise HTTPException(400, f"{field}: want a data: URL")
+    m = _DATA_URL_RE.match(value)
+    if not m:
+        raise HTTPException(400, f"{field}: want a data:image/…;base64,… URL")
+    mime = (m.group(1) or "").lower()
+    if mime not in mimes:
+        want = ", ".join(sorted(mimes))
+        raise HTTPException(400, f"{field}: {mime or 'no mime'} is not {kind} (want: {want})")
+    if not m.group(2):
+        raise HTTPException(400, f"{field}: the data URL must be base64")
+    try:
+        data = base64.b64decode(m.group(3), validate=True)
+    except Exception:  # noqa: BLE001 — one user-facing message is enough
+        raise HTTPException(400, f"{field}: bad base64") from None
+    if not data:
+        raise HTTPException(400, f"{field}: empty picture")
+    if len(data) > gen_jobs.EDIT_INPUT_MAX_BYTES:
+        raise HTTPException(
+            413,
+            f"{field}: {len(data) / 1048576:.1f} MiB — an edit's picture is at most "
+            f"{gen_jobs.EDIT_INPUT_MAX_BYTES // 1048576} MiB (the model resamples it to its "
+            "1024x1024 reference area anyway)",
+        )
+    # The stored extension comes from the bytes' magic, not the declared mime:
+    # panel-web's allowlist and the browser both read the name.
+    if not _picture_magic(data):
+        raise HTTPException(400, f"{field}: these bytes are not a png, jpeg or webp picture")
+    return data, gen_jobs.sniff(data)[1]
+
+
+def _picture_magic(data: bytes) -> bool:
+    """png / jpeg / webp magic — the formats an edit's pictures come in."""
+    return (
+        data[:4] == b"\x89PNG"
+        or data[:3] == b"\xff\xd8\xff"
+        or (data[:4] == b"RIFF" and data[8:12] == b"WEBP")
+    )
+
+
+def _gen_write_inputs(jid: str, images: list[tuple[bytes, str]], mask: Optional[tuple[bytes, str]]) -> dict[str, Any]:
+    """Store an edit's source pictures next to its artifact and return the
+    record's EDIT block. Same dir, 0644 pin and `job-*` naming as the
+    artifacts, so the allowlisted /gen/ serving, the age GC and the record's
+    delete all reach them. Sync (file IO) — the caller holds gen_lock()."""
+    names, mask_name = gen_jobs.edit_input_names(jid, len(images), mask is not None)
+    GEN_ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+
+    def put(name: str, payload: tuple[bytes, str]) -> dict[str, Any]:
+        path = GEN_ARTIFACT_DIR / f"{name}{gen_jobs.sniff(payload[0])[0]}"
+        path.write_bytes(payload[0])
+        path.chmod(0o644)
+        written.append(path)
+        return {"url": f"/gen/{path.name}", "mime": payload[1], "size": len(payload[0])}
+
+    try:
+        rows = [put(n, p) for n, p in zip(names, images)]
+        mask_row = put(mask_name, mask) if mask_name and mask else None
+    except OSError as e:
+        for p in written:
+            _gen_unlink(str(p))
+        raise HTTPException(500, f"could not store the edit's pictures: {type(e).__name__}: {e}") from e
+    return {"images": rows, "mask": mask_row}
+
+
+def _gen_input_url(ref: Optional[dict[str, Any]]) -> Optional[str]:
+    """A stored input's data: URL, read back for the edit request (None passes
+    through — a job with no mask sends no mask)."""
+    if not ref or not ref.get("url"):
+        return None
+    name = ref["url"].rsplit("/", 1)[-1]
+    path = GEN_ARTIFACT_DIR / name
+    if not path.is_file():
+        raise _GenError(f"edit source {name} is gone (the age GC, or its record was deleted)")
+    mime = ref.get("mime") or mimetypes.guess_type(name)[0] or "image/png"
+    return f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
+
+
+def _gen_input_urls(job: dict[str, Any]) -> list[str]:
+    refs = (job.get("edit") or {}).get("images") or []
+    if not refs:
+        raise _GenError("this edit job carries no source pictures")
+    return [u for u in (_gen_input_url(r) for r in refs) if u]
+
+
 def _gen_write_artifact(job: dict[str, Any], data: bytes, thumb: Optional[bytes]) -> dict[str, Any]:
     """Write under GEN_ARTIFACT_DIR (this host service's artifact dir, user
     panel; ro on panel-web at /gen — the UI's static URLs). Sync (file IO) —
@@ -2566,10 +2711,16 @@ def _gen_write_artifact(job: dict[str, Any], data: bytes, thumb: Optional[bytes]
 
 
 def _gen_delete_artifacts(job: dict[str, Any]) -> None:
+    """The job's files on disk: artifact (+ thumb) and, for an edit, its source
+    pictures — all job-named in one dir, so one rule drops them all."""
     art = job.get("artifact") or {}
-    for key in ("url", "thumb"):
-        u = art.get(key)
-        if not u:
+    edit = job.get("edit") or {}
+    urls: list[Any] = [art.get("url"), art.get("thumb")]
+    urls += [r.get("url") for r in edit.get("images") or [] if isinstance(r, dict)]
+    if isinstance(edit.get("mask"), dict):
+        urls.append(edit["mask"].get("url"))
+    for u in urls:
+        if not isinstance(u, str) or not u:
             continue
         try:
             (GEN_ARTIFACT_DIR / u.rsplit("/", 1)[-1]).unlink()
@@ -2872,8 +3023,9 @@ async def _gen_tick() -> None:
 
             await asyncio.to_thread(gen_jobs.update_job, jid, _m)
             continue
-        # PHASE 2 — the gen phase (the per-slot gen-phase cap).
-        for sname, _why in gen_jobs.job_candidates(jobs, slots, job["model"]):
+        # PHASE 2 — the gen phase (per-slot cap + one model per slot:
+        # gen_jobs.admission).
+        for sname, _why in gen_jobs.job_candidates(jobs, slots, job):
             srow = slots[sname]
             ok, _why = gen_jobs.admission(jobs, sname, jid)
             if not ok:
@@ -2893,19 +3045,15 @@ async def _gen_tick() -> None:
             _gen_tasks[jid] = asyncio.create_task(_gen_run_job(jid, sname))
             break
         else:
-            # No candidate admitted it this tick. The transient reasons (the
-            # gen-phase cap, a stop that didn't land) are the normal queue —
-            # no say-so. The waits that would otherwise run in silence get
-            # marked on the record's error column (queued-only — a later
-            # claim clears the error, see claim_job): a config drift since
-            # the job was queued (its model is no longer hosted), or a lane
-            # EVERY hosting slot is blocked on — an LLM occupant, or a pool
-            # that can't cover the slot even after the idle yield (structural
-            # — an admin clears it), or a busy holder that drains on its own
-            # (transient — the mark rides until the claim, see
-            # queue_wait_reason). The enhance target's structural reasons are
-            # marked up front in the enhance branch above — a pending-enhance
-            # job never gets here.
+            # No candidate admitted it this tick. The transient reasons (caps,
+            # a stop that didn't land, a slot parked on another model) are the
+            # normal queue — no say-so. The waits that would otherwise run in
+            # silence get marked on the record's error column (queued-only — a
+            # later claim clears it): a config drift since the job was queued,
+            # or a lane EVERY hosting slot is blocked on (structural — an admin
+            # clears it). The enhance target's structural reasons are marked up
+            # front in the enhance branch above — a pending-enhance job never
+            # gets here.
             reason = gen_jobs.queue_wait_reason(job, slots, status)
             if reason:
                 def _m(j, _r=reason):
@@ -2915,10 +3063,59 @@ async def _gen_tick() -> None:
                 await asyncio.to_thread(gen_jobs.update_job, jid, _m)
 
 
+def _gen_caps_due(slots: dict[str, Any], caps: dict[str, Any]) -> list[str]:
+    """RUNNING slots with at least one model whose capability answer is
+    missing, on a different container path, or aged past GEN_CAPS_REFRESH_S.
+    A fully probed fleet is an empty list."""
+    due: list[str] = []
+    now = time.time()
+    for name, slot in slots.items():
+        if not (slot["running"] and slot["ip"]):
+            continue  # a down slot answers nothing (and must not be started for this)
+        for model in slot["models"]:
+            row = caps["models"].get(model)
+            path = (slot.get("paths") or {}).get(model) or ""
+            if row is None or row["path"] != path or now - float(row["at"]) > gen_jobs.GEN_CAPS_REFRESH_S:
+                due.append(name)
+                break
+    return due
+
+
+async def _gen_probe_caps(slots: dict[str, Any]) -> None:
+    """Ask each due slot's ``/v1/models`` what its models can do and cache the
+    answers (``capabilities.image_edit`` → the EDIT path in the UI). Only an
+    OPEN entry carries its capabilities — a parked/cold one stays unknown
+    (``edits: null`` = "radiance has not said no", never "cannot")."""
+    caps = await asyncio.to_thread(gen_jobs.load_caps)
+    for sname in _gen_caps_due(slots, caps):
+        ip = slots[sname]["ip"]
+        try:
+            r = await _gen_http.get(f"http://{ip}:8000/v1/models", headers=_gen_auth(), timeout=15.0)
+            if r.status_code >= 400:
+                continue  # a blip — the next pass asks again
+            rows = (r.json() or {}).get("data") or []
+        except (httpx.HTTPError, ValueError):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            model = row.get("id")
+            # an adapter child (`base:adapter`) is not a config entry, and
+            # neither is an alias: only the names the config lists get cached
+            if not isinstance(model, str) or model not in slots[sname]["models"] or row.get("parent"):
+                continue
+            capsj = row.get("capabilities")
+            if not isinstance(capsj, dict) or not isinstance(capsj.get("image_edit"), bool):
+                continue
+            path = (slots[sname].get("paths") or {}).get(model) or ""
+            if await asyncio.to_thread(gen_jobs.caps_refresh, model, path, capsj["image_edit"]):
+                print(f"gen: {model} image_edit={capsj['image_edit']} (radiance /v1/models)", flush=True)
+
+
 async def _gen_engine_loop() -> None:
-    """~2 s tick + the age-GC. Never dies — a bad tick is logged, not raised
-    (a dead engine wedges every queued job)."""
-    global _gen_gc_at, _gen_dev_logged
+    """~2 s tick + the age-GC + the capability pass. Never dies — a bad tick is
+    logged, not raised (a dead engine wedges every queued job)."""
+    global _gen_gc_at, _gen_caps_at, _gen_dev_logged
     while True:
         await asyncio.sleep(2.0)
         if DEV_MODE:
@@ -2962,16 +3159,29 @@ async def _gen_engine_loop() -> None:
                     _audit(None, "gen-zip-sweep", removed_zips, 0, " ".join(removed_zips)[:200])
             except Exception as e:  # noqa: BLE001
                 print(f"gen artifact GC failed: {type(e).__name__}: {e}", flush=True)
+        if now >= _gen_caps_at:
+            _gen_caps_at = now + gen_jobs.GEN_CAPS_PROBE_S
+            try:
+                # Own world build — the tick's fast-path skips world-building on
+                # an idle queue, exactly when capabilities are wanted.
+                await _gen_probe_caps((await asyncio.to_thread(_gen_world))["slots"])
+            except Exception as e:  # noqa: BLE001
+                print(f"gen capability pass failed: {type(e).__name__}: {e}", flush=True)
 
 
 # ── endpoints (admin-gated like the rest of the panel) ──
 
 
 class GenJobBody(BaseModel):
-    model: str  # a purpose key ("image"/"video") or an exact model name
+    model: str  # a purpose key ("image"/"video"/"edit") or an exact model name
     prompt: str
     enhance: Optional[bool] = None  # None → the settings' global toggle
     params: dict[str, Any] = {}  # image: size, seed · video: seconds, size, seed
+    # An EDIT's source pictures: `data:` URLs as the images API takes them.
+    # Non-empty ⇒ this job is an edit (so is the "edit" purpose key, which then
+    # REQUIRES at least one). `mask` is the first picture's mask.
+    images: list[str] = []
+    mask: Optional[str] = None
 
 
 def _gen_validate_params(kind: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -3093,10 +3303,17 @@ def gen_overview(request: Request, _admin: Optional[str] = Depends(require_admin
     return _gen_conditional(
         request,
         {
-            "slots": [{**row, "status": w["status"][row["name"]]} for row in sorted(w["slots"].values(), key=lambda r: r["name"])],
+            # `paths` stays server-side (the capability probe reads the world
+            # in-process; the tab uses none of it).
+            "slots": [
+                {k: v for k, v in row.items() if k != "paths"} | {"status": w["status"][row["name"]]}
+                for row in sorted(w["slots"].values(), key=lambda r: r["name"])
+            ],
             # the whole fleet (the settings' enhance-target picks an instance +
             # one of its llm models from here)
-            "instances": [row for row in w["instances"].values() if row["llms"]],
+            "instances": [
+                {k: v for k, v in row.items() if k != "paths"} for row in w["instances"].values() if row["llms"]
+            ],
             "enhance_target": w["enhance_target"],
             "active": active,
             # whole-store counts (the gallery's filter tabs) — counting is cheap,
@@ -3106,9 +3323,17 @@ def gen_overview(request: Request, _admin: Optional[str] = Depends(require_admin
                 "active": len(active),
                 "image": sum(1 for j in jobs if j["kind"] == "image"),
                 "video": sum(1 for j in jobs if j["kind"] == "video"),
+                "edit": sum(1 for j in jobs if j.get("edit")),
                 "failed": sum(1 for j in jobs if j["state"] in (gen_jobs.FAILED, gen_jobs.CANCELED)),
             },
             "models": gen_jobs.known_models(w["slots"]),
+            # the row model both sides price a pass with — one home, so the
+            # chips and the routing can never disagree
+            "row_model": {
+                "row_px": gen_jobs.LATENT_ROW_PX,
+                "ref_rows": gen_jobs.EDIT_REF_ROWS,
+                "prompt_rows": gen_jobs.PROMPT_ROWS,
+            },
             "purposes": settings["purposes"],
             "enhance": settings["enhance"],
             "gc_days": settings["gc_days"],
@@ -3127,7 +3352,7 @@ def gen_job_create(body: GenJobBody, _admin: Optional[str] = Depends(require_adm
     slots = w["slots"]
     settings = gen_jobs.load_settings()
     try:
-        model, kind = gen_jobs.resolve_model(body.model, settings, slots)
+        model, kind, purpose = gen_jobs.resolve_model(body.model, settings, slots)
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
     enhance = body.enhance if body.enhance is not None else settings["enhance"]["enabled"]
@@ -3139,13 +3364,94 @@ def gen_job_create(body: GenJobBody, _admin: Optional[str] = Depends(require_adm
     if enhance and not et["ok"]:
         raise HTTPException(400, et["reason"])
     params = _gen_validate_params(kind, body.params)
+    # THE EDIT PATH. Pictures in the request, or the "edit" purpose key, make
+    # this an edit; both need an IMAGE model radiance says reads pictures
+    # (`edits` None = never probed = allowed — radiance answers at submit).
+    # All checks run before a byte is written, and record+files land in ONE
+    # critical section.
+    if len(body.images) > gen_jobs.EDIT_MAX_IMAGES:
+        raise HTTPException(400, f"images: an edit takes at most {gen_jobs.EDIT_MAX_IMAGES} pictures")
+    if body.mask is not None and not body.images:
+        raise HTTPException(400, "mask: a mask belongs to the first picture — send that picture too")
+    if purpose == "edit" and not body.images:
+        raise HTTPException(400, f"purpose 'edit' needs at least one source picture (model {model!r})")
+    if body.images and kind != "image":
+        raise HTTPException(400, f"{model!r} is a {kind} model — an edit's pictures go to an image model")
+    if body.images and gen_jobs.known_models(slots).get(model, {}).get("edits") is False:
+        raise HTTPException(
+            400, f"{model!r} reads no pictures — radiance answers 501 on /v1/images/edits for it"
+        )
+    images = [_gen_read_data_url(f"images[{i}]", u) for i, u in enumerate(body.images)]
+    mask = (
+        _gen_read_data_url("mask", body.mask, mimes=gen_jobs.EDIT_MASK_MIMES, kind="a mask format")
+        if body.mask is not None
+        else None
+    )
+    # Two doors radiance would only answer at submit (a slot start would be
+    # spent to 400): the mask must be the first picture's size (radiance never
+    # resamples), and no picture may pass radiance's 64 MP decode budget. An
+    # unreadable header stands down — radiance's own decode answers in the job.
+    if mask is not None:
+        m_dims, f_dims = gen_jobs.image_size(mask[0]), gen_jobs.image_size(images[0][0])
+        if m_dims and f_dims and m_dims != f_dims:
+            raise HTTPException(
+                400,
+                f"mask: it must be the first picture's size ({m_dims[0]}x{m_dims[1]} ≠ {f_dims[0]}x{f_dims[1]}) — "
+                "radiance compares them, it does not resample",
+            )
+    door_items = [(f"images[{i}]", p) for i, p in enumerate(images)]
+    if mask is not None:
+        door_items.append(("mask", mask))
+    for which, item in door_items:
+        dims = gen_jobs.image_size(item[0])
+        if dims and dims[0] * dims[1] > gen_jobs.EDIT_MAX_SOURCE_PIXELS:
+            raise HTTPException(
+                400,
+                f"{which}: {dims[0]}x{dims[1]} is {dims[0] * dims[1]:,} pixels — radiance decodes a "
+                f"source picture at most {gen_jobs.EDIT_MAX_SOURCE_PIXELS:,} (64 MP)",
+            )
+    # THE ROUTING CHECK. The same model can be bound differently per slot, and
+    # job_candidates hands the job to a slot whose pass covers it. If NO slot
+    # covers it, saying so here costs nothing (queueing it would spend a slot
+    # start to be told the same by radiance). An unparsable size routes
+    # unconstrained — radiance answers for it.
+    rows = gen_jobs.pass_rows(kind, params, len(images))
+    if rows is not None:
+        seats = [gen_jobs.slot_pass(s, model) for s in slots.values() if model in s["models"]]
+        if seats and all(b > 0 and rows > b for b in seats):
+            longest = max(seats)
+            where = "/".join(
+                s["display"]
+                for s in sorted(slots.values(), key=lambda x: x["name"])
+                if model in s["models"] and gen_jobs.slot_pass(s, model) == longest
+            )
+            raise HTTPException(
+                400,
+                f"{params.get('size') or 'this size'} + {len(images)} reference picture(s) is a "
+                f"{rows}-row pass; the longest {model} gets anywhere is {longest} ({where}) — "
+                "a smaller frame or one fewer picture fits",
+            )
     with gen_jobs.gen_lock():
         job = gen_jobs.create_job(model, kind, prompt, enhance, params, _admin)
-    _audit(_admin, "gen-job-create", [job["id"], model, kind], 0)
+        if images or mask:
+            try:
+                edit = _gen_write_inputs(job["id"], images, mask)
+            except Exception:
+                # the record must not outlive its pictures: a queued edit whose
+                # files never landed would fail at the slot, not here
+                state = gen_jobs.load_jobs()
+                gen_jobs.remove_job_locked(state, job["id"])
+                gen_jobs.save_jobs(state)
+                raise
+            state = gen_jobs.load_jobs()
+            state["jobs"][job["id"]]["edit"] = edit
+            job["edit"] = edit
+            gen_jobs.save_jobs(state)
+    _audit(_admin, "gen-job-create", [job["id"], model, kind] + ([f"edit:{len(images)}p"] if images else []), 0)
     return job
 
 
-GEN_JOB_FILTERS = ("all", "active", "image", "video", "failed")
+GEN_JOB_FILTERS = ("all", "active", "image", "video", "edit", "failed")
 
 
 def _gen_job_seq(jid: str) -> Optional[int]:
@@ -3198,6 +3504,9 @@ def gen_jobs_list(
         if filter == "image" and j["kind"] != "image":
             return False
         if filter == "video" and j["kind"] != "video":
+            return False
+        # an edit is a modifier, not a kind (its artifact is a picture too)
+        if filter == "edit" and not j.get("edit"):
             return False
         if filter == "failed" and j["state"] not in (gen_jobs.FAILED, gen_jobs.CANCELED):
             return False
@@ -3324,23 +3633,32 @@ def gen_jobs_remove(body: GenBatchBody, _admin: Optional[str] = Depends(require_
 @app.post("/api/gen/jobs/archive")
 def gen_jobs_archive(body: GenBatchBody, _admin: Optional[str] = Depends(require_admin)) -> FileResponse:
     """Batch download: the selected jobs' artifacts in one ZIP (stored, not
-    deflated — PNG/MP4 are already compressed) plus a prompts.txt manifest, so
-    a folder of pictures carries the prompts that made it. No size cap (the
-    selection is explicit; the store bounds it); files gone from disk (age
-    GC, a delete) are skipped; nothing to pack is a 404."""
+    deflated — PNG/MP4 are already compressed) plus a prompts.txt manifest; an
+    edit's source pictures ride along. No size cap (the selection is explicit;
+    the store bounds it); files gone from disk are skipped; nothing to pack is
+    a 404."""
     ids = list(dict.fromkeys(body.ids))
     if not ids:
         raise HTTPException(400, "no job ids")
     store = gen_jobs.load_jobs()
     rows = [store["jobs"][i] for i in ids if i in store["jobs"]]
     files: list[tuple[dict[str, Any], Path]] = []
+    extra: list[Path] = []  # an edit's source pictures — packed beside its result
     for job in rows:
         url = (job.get("artifact") or {}).get("url") or ""
         if not url:
             continue
         path = GEN_ARTIFACT_DIR / url.rsplit("/", 1)[-1]
-        if path.is_file():
-            files.append((job, path))
+        if not path.is_file():
+            continue
+        files.append((job, path))
+        edit = job.get("edit") or {}
+        for ref in [*(edit.get("images") or []), edit.get("mask")]:
+            u = ref.get("url") if isinstance(ref, dict) else None
+            if isinstance(u, str) and u:
+                src = GEN_ARTIFACT_DIR / u.rsplit("/", 1)[-1]
+                if src.is_file():
+                    extra.append(src)
     if not files:
         raise HTTPException(404, "no artifacts to download (nothing selected has one on disk)")
     # The temp ZIP lands in the artifact dir, not /tmp (which may be a RAM
@@ -3356,15 +3674,27 @@ def gen_jobs_archive(body: GenBatchBody, _admin: Optional[str] = Depends(require
         with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_STORED) as zf:
             for _j, path in files:
                 zf.write(path, arcname=path.name)
+            # an edit's sources ride along (job-…-in0/-mask names tie them to
+            # the result)
+            for path in extra:
+                zf.write(path, arcname=path.name)
             # the manifest covers exactly what is in the zip — a file the age
             # GC took is not packed, so it is not listed
             manifest = []
             for job, _p in files:
                 when = time.strftime("%Y-%m-%d %H:%M", time.localtime(job["created_at"]))
+                edit = job.get("edit") or {}
+                n_src = len(edit.get("images") or [])
                 manifest.append(
-                    f"[{job['id']}] {job['model']} ({job['kind']}) — {when}\n"
+                    f"[{job['id']}] {job['model']} ({'edit' if edit else job['kind']}) — {when}\n"
                     f"  prompt:   {job['prompt']}\n"
                     + (f"  enhanced: {job['enhanced_prompt']}\n" if job.get("enhanced_prompt") else "")
+                    + (
+                        f"  sources:  {n_src} picture(s){' + mask' if edit.get('mask') else ''} "
+                        f"({', '.join(str((r or {}).get('url', '')).rsplit('/', 1)[-1] for r in edit.get('images') or [])})\n"
+                        if n_src
+                        else ""
+                    )
                     + f"  params:   {json.dumps(job.get('params') or {}, sort_keys=True)}\n"
                 )
             zf.writestr("prompts.txt", "\n".join(manifest))
@@ -3403,7 +3733,9 @@ def gen_job_content(jid: str, _admin: Optional[str] = Depends(require_admin)):
 # its stand-in, with the same job-* name allowlist. It can never exist on the
 # server: PANEL_DEV is local development only, and the systemd unit never
 # sets it.
-_GEN_ARTIFACT_NAME_RE = re.compile(r"^job-[0-9]+(-thumb)?\.(png|jpg|jpeg|webp|webm|mp4)$")
+_GEN_ARTIFACT_NAME_RE = re.compile(
+    r"^job-[0-9]+(-thumb|-mask|-in[0-9]+)?\.(png|jpg|jpeg|webp|webm|mp4)$"
+)
 
 
 if DEV_MODE:

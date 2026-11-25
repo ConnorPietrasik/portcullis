@@ -1,0 +1,87 @@
+[
+  {
+    "name": "gen-edit-model",
+    "tab": "Gen",
+    "wait": 2600
+  },
+  {
+    "name": "gen-edit-krea2-textonly",
+    "then": "(() => { const sel=document.querySelector('.w-model select'); Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set.call(sel,'Krea2'); sel.dispatchEvent(new Event('change',{bubbles:true})); return 'ok' })()",
+    "wait": 900
+  },
+  {
+    "name": "gen-edit-noctq",
+    "then": "(() => { const sel=document.querySelector('.w-model select'); Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set.call(sel,'NoctQ-V4'); sel.dispatchEvent(new Event('change',{bubbles:true})); const ta=document.querySelector('.gen-comp textarea'); Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(ta,'put a red knitted scarf on the fox, leave the snow and the pose alone'); ta.dispatchEvent(new Event('input',{bubbles:true})); return 'prompt=' + JSON.stringify(ta.value.slice(0,24)) })()",
+    "wait": 900
+  },
+  {
+    "name": "gen-edit-attach",
+    "then": "(() => { const png=(w,h,fn)=>{const c=document.createElement('canvas');c.width=w;c.height=h;const g=c.getContext('2d');fn(g,w,h);const b=atob(c.toDataURL('image/png').split(',')[1]);const u=new Uint8Array(b.length);for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return u}; const fox=(g,w,h)=>{const s=g.createLinearGradient(0,0,0,h);s.addColorStop(0,'#1b2b45');s.addColorStop(1,'#8fb3c9');g.fillStyle=s;g.fillRect(0,0,w,h);g.fillStyle='#e8eef4';g.beginPath();g.moveTo(0,h);g.lineTo(w*.35,h*.55);g.lineTo(w*.7,h);g.closePath();g.fill();g.fillStyle='#d1631f';g.beginPath();g.ellipse(w*.55,h*.68,w*.19,h*.13,0,0,7);g.fill();g.beginPath();g.arc(w*.68,h*.52,w*.07,0,7);g.fill()}; const msk=(g,w,h)=>{g.fillStyle='#000';g.fillRect(0,0,w,h);g.fillStyle='#fff';g.beginPath();g.ellipse(w*.55,h*.52,w*.2,h*.12,0,0,7);g.fill()}; const dt=new DataTransfer(); dt.items.add(new File([png(640,480,fox)],'fox.png',{type:'image/png'})); const i=document.querySelector('.srcs input[multiple]'); i.files=dt.files; i.dispatchEvent(new Event('change',{bubbles:true})); return 'ok' })()",
+    "wait": 1200
+  },
+  {
+    "name": "gen-edit-mask",
+    "then": "(() => { const png=(w,h,fn)=>{const c=document.createElement('canvas');c.width=w;c.height=h;const g=c.getContext('2d');fn(g,w,h);const b=atob(c.toDataURL('image/png').split(',')[1]);const u=new Uint8Array(b.length);for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return u}; const msk=(g,w,h)=>{g.fillStyle='#000';g.fillRect(0,0,w,h);g.fillStyle='#fff';g.beginPath();g.ellipse(w*.55,h*.52,w*.2,h*.12,0,0,7);g.fill()}; const dt=new DataTransfer(); dt.items.add(new File([png(640,480,msk)],'scarf-mask.png',{type:'image/png'})); const i=document.querySelectorAll('.srcs input[type=file]')[1]; i.files=dt.files; i.dispatchEvent(new Event('change',{bubbles:true})); return 'ok' })()",
+    "wait": 1200
+  },
+  {
+    "name": "gen-edit-tp2",
+    "then": "(() => { const s=document.querySelector('.w-size input'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(s,'1536x1536'); s.dispatchEvent(new Event('input',{bubbles:true})); return 'size=' + s.value })()",
+    "wait": 900
+  },
+  {
+    "name": "gen-edit-tp2-read",
+    "then": "(() => { const n=document.querySelector('.cfoot .note:not(.warn)'), w=document.querySelector('.cfoot .note.warn'); const far=[...document.querySelectorAll('.ratios .mini.far')].length; const h=[...document.querySelectorAll('.srcs .hint')].map(x=>x.textContent)[0]; return JSON.stringify({warn:(w||{}).textContent||null, note:(n||{}).textContent||null, farChips:far, hint:h}) })()",
+    "wait": 400
+  },
+  {
+    "name": "gen-edit-big",
+    "then": "(() => { const s=document.querySelector('.w-size input'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(s,'2048x2048'); s.dispatchEvent(new Event('input',{bubbles:true})); return 'size=' + s.value })()",
+    "wait": 900
+  },
+  {
+    "name": "gen-edit-big-read",
+    "then": "(() => { const n=document.querySelector('.cfoot .note:not(.warn)'), w=document.querySelector('.cfoot .note.warn'); const far=[...document.querySelectorAll('.ratios .mini.far')].length, over=[...document.querySelectorAll('.ratios .mini.over')].length; const h=[...document.querySelectorAll('.srcs .hint')].map(x=>x.textContent)[0]; return JSON.stringify({warn:(w||{}).textContent||null, note:(n||{}).textContent||null, farChips:far, overChips:over, hint:h}) })()",
+    "wait": 400
+  },
+  {
+    "name": "gen-edit-queue",
+    "then": "(() => { const s=document.querySelector('.w-size input'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(s,'1024x768'); s.dispatchEvent(new Event('input',{bubbles:true})); return 'size=' + s.value })()",
+    "wait": 1600
+  },
+  {
+    "name": "gen-edit-submit",
+    "then": "(() => { const b=document.querySelector('button.go'); if (!b) return 'no button'; if (b.disabled) return 'disabled: ' + b.textContent; b.click(); return 'clicked: ' + b.textContent.trim() })()",
+    "wait": 2200
+  },
+  {
+    "name": "gen-edit-filter",
+    "then": "(() => { const e=document.querySelector('.cfoot .gen-err'); const f=[...document.querySelectorAll('.flash')].map(x=>x.textContent); [...document.querySelectorAll('.jobs-bar .seg button')].find(b=>b.textContent.startsWith('edit'))?.click(); return 'err=' + JSON.stringify(e?e.textContent:null) + ' flash=' + JSON.stringify(f) })()",
+    "wait": 1400
+  },
+  {
+    "name": "gen-edit-job",
+    "then": "(() => { document.querySelector('.modal .modal-x')?.click(); const c=[...document.querySelectorAll('.jc:not(.inf)')].find(x=>x.querySelector('.jkind')?.textContent==='edit' && x.querySelector('.jthumb img')); c?.querySelector('.jbody')?.click(); return 'ok' })()",
+    "wait": 1600
+  },
+  {
+    "name": "gen-edit-before",
+    "then": "(() => { [...document.querySelectorAll('.b4 button')].find(b=>b.textContent.includes('source'))?.click(); return 'ok' })()",
+    "wait": 1200
+  },
+  {
+    "name": "gen-edit-remix",
+    "then": "(() => { [...document.querySelectorAll('.modal button')].find(b=>b.textContent.trim()==='remix')?.click(); return 'ok' })()",
+    "wait": 2200
+  },
+  {
+    "name": "gen-edit-failed",
+    "then": "(() => { const c=[...document.querySelectorAll('.jc.fail')].find(x=>x.querySelector('.jkind')?.textContent==='edit'); c?.querySelector('.jbody')?.click(); return 'ok' })()",
+    "wait": 1600
+  },
+  {
+    "name": "gen-edit-settings",
+    "then": "(() => { document.querySelector('.modal .modal-x')?.click(); document.querySelector('.bar > button:last-child')?.click(); return 'ok' })()",
+    "wait": 1400
+  }
+]
