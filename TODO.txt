@@ -1,4 +1,4 @@
-Add image / video edit stuff
+Add video edit stuff
 Add servitor image/video integration
 - `/machine/gen/*` route alias over the same handlers + bearer gate
   (`compare_digest`, not dev-bypassed) — no handler rework.

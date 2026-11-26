@@ -42,4 +42,4 @@ acme.json
 ref/
 
 # demo tool screenshots — regenerated on demand (shot.mjs), never a source
-tools/demo/screens/
+tools/demo/screens*/

@@ -400,12 +400,12 @@ ROW_PX = 16
 REF_ROWS = 4600
 PROMPT_ROWS = 256
 # max-model-len PER SLOT: the same model is bound differently where it is
-# served (8192 on the tp1 cards, no bound on the tp2 pair), so a job's row
-# cost picks its slot — the routing the tab shows.
+# served (tighter on the tp1 cards), so a job's row cost picks its slot — the
+# routing the tab shows.
 SLOT_MLEN = {
-    "gpu-gentp1a": {IMAGE: 0, EDIT: 8192},
-    "gpu-gentp1b": {IMAGE: 0, EDIT: 8192},
-    "gpu-gentp2": {VIDEO: 0, EDIT: 0},
+    "gpu-gentp1a": {IMAGE: 0, EDIT: 9500},
+    "gpu-gentp1b": {IMAGE: 0, EDIT: 9500},
+    "gpu-gentp2": {VIDEO: 0, EDIT: 30000},
 }
 # which entry lives on which slot (a parking pair on each)
 SLOT_MODELS = {s: {n: KNOWN_MODELS[n] for n in b} for s, b in SLOT_MLEN.items()}
@@ -876,12 +876,12 @@ def gen_seed() -> None:
     mkjob(EDIT, "put a red knitted scarf on the fox", state="completed", ago=3600 * 3 + 900,
           enhanced="put a red knitted scarf on the fox, wrapped once around its neck, wool texture matching the snow light, leave the snow, the pose and the fur unchanged",
           params={"size": "896x896", "seed": 4100}, edit=(1, True))
-    # frames that FIT the 8192-row pass once a reference is paid for
+    # frames that FIT the tp1 pass once a reference is paid for
     # (~4600 + the prompt) — the seeded rows stay physically possible.
     mkjob(EDIT, "make it night and add a full moon", state="completed", ago=3600 * 2 + 45,
           enhanced="make the scene night under a low full moon, cool blue key light from the upper right, keep the subject, framing and materials unchanged",
           params={"size": "1024x768", "seed": -1}, edit=(1, False))
-    # a pass no tp1 card holds (14072 rows > 8192): routed to the long-pass
+    # a pass no tp1 card holds (14072 rows — past the tp1 line): routed to the long-pass
     # seat by its row cost
     mkjob(EDIT, "relight this bench as a rainy night scene, keep the composition", state="completed",
           ago=3600 * 2 + 900,
@@ -1041,8 +1041,8 @@ def gen_view() -> dict:
             "running": t2_up,
             "container": CONTAINER_IDS["gpu-gentp2"] if t2_up else None,
             "ip": "172.18.0.9" if t2_up else "",
-            # the LONG-PASS seat: the video model + NoctQ-V4 at tp 2 with no
-            # bound, for the passes a tp1 card cannot hold
+            # the LONG-PASS seat: the video model + NoctQ-V4 at tp 2 (the bound
+            # mirrors the config), for the passes a tp1 card cannot hold
             "models": SLOT_MODELS["gpu-gentp2"], "mlens": SLOT_MLEN["gpu-gentp2"], "llm": None,
             "status": {
                 "state": "running" if t2_up else "down-idle-stops",

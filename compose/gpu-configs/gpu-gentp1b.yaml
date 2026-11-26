@@ -11,9 +11,10 @@ scheduler:
   warm-up: true
 models:
   # One model per card at a time (a parking pair; gen_jobs.admission).
-  # NoctQ-V4's 8192 is upstream's one-card bound (it needs 29.7 GiB — radiance
-  # docs/GUIDE §5.6); passes past it route to the UNBOUNDED tp2 pair.
-  # See RUNBOOK → Editing pictures.
+  # NoctQ-V4's 9500 sits at the one-card ceiling measured on this box
+  # (upstream's own value is 8192 — radiance docs/GUIDE §5.6); passes past it
+  # route to the tp2 pair (gpu-gentp2.yaml). Re-try the bound after a radiance
+  # update (tools/gpu-mlen-test.sh). See RUNBOOK → Editing pictures.
   Krea2:
     model: /models/image/krea-2-raw-iq8r.rad
     tp: 1
@@ -21,5 +22,5 @@ models:
   NoctQ-V4:
     model: /models/image/noctq-v4-uncensored-iq8r.rad
     tp: 1
-    max-model-len: 8192
+    max-model-len: 9500
     park: {ram: never}

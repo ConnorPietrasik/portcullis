@@ -185,7 +185,7 @@ def image_size(data: bytes) -> Optional[tuple[int, int]]:
 # Radiance sizes an image model's context in LATENT ROWS (16x16 px blocks); the
 # entry's ``max-model-len`` is the rows ONE pass gets — prompt, every reference
 # picture and the drawn picture all pay out of it. A model can be bound
-# differently per slot (NoctQ-V4: 8192 on tp1, unbounded on tp2), so a job's
+# differently per slot (NoctQ-V4: bound tighter on tp1 than on the tp2 pair), so a job's
 # row cost picks its slot (job_candidates). REF_ROWS is upstream's sizing
 # figure (MULTIMODEL §6.3; the KV cost is 4096, GUIDE §5.6 — RUNBOOK → Editing
 # pictures); PROMPT_ROWS is an allowance, not a measurement. Radiance stays the
@@ -950,8 +950,8 @@ def job_candidates(
     job: dict[str, Any],
 ) -> list[tuple[str, str]]:
     """Slots that can serve ``job``, most-attractive first: running before
-    down, then the CHEAPEST PASS THAT FITS (a model bound at 8192 on tp1 and
-    unbounded on tp2 is one model; a 2048x2048 request only fits the second),
+    down, then the CHEAPEST PASS THAT FITS (a model bound tighter on tp1 than on tp2
+    is one model; a 2048x2048 request only fits the second),
     then LEAST-LOADED (spreads a multi-slot model across its slots), then
     name. Cost comes after "running" because a cold slot costs a start + a
     load, dearer than the card-minutes it saves. The caller reloads ``jobs``
@@ -993,9 +993,10 @@ def queue_wait_reason(
     if not hosting:
         return f"no gen slot hosts {model!r} (a config changed since the job was queued)"
     # Only the slots whose pass covers this job count: a 2048x2048 edit of a
-    # model bound at 8192 on tp1 is not "waiting for tp1 to drain", it is a
-    # pass tp1 can never take. Create refuses that shape, so reaching here means
-    # the configs shrank (or the store was edited) since the job was queued.
+    # model bound tighter on tp1 than on tp2 is not "waiting for tp1 to
+    # drain", it is a pass tp1 can never take. Create refuses that shape, so
+    # reaching here means the configs shrank (or the store was edited) since
+    # the job was queued.
     rows = job_rows(job)
     covers = [s for s in hosting if slot_covers(s, model, rows)]
     if not covers:

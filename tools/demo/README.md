@@ -7,7 +7,7 @@ design review, or checking a UI change without the server, Docker, or GPUs.
 tools/demo/
 ├── mock-api.py   # mock of panel-api on 127.0.0.1:8010 (stdlib only, no deps)
 ├── shot.mjs      # headless-Chromium screenshots (Node ≥ 22) — a plain tab tour or a scenario
-├── scenarios/    # scripted walks for `shot.mjs --scenario` (the shipped ones: gen, actions, aspect)
+├── scenarios/    # scripted walks for `shot.mjs --scenario` (the shipped ones: gen, actions, aspect, gen-edit)
 └── screens/      # the captured PNGs
 ```
 
@@ -42,7 +42,7 @@ node tools/demo/shot.mjs --scenario=tools/demo/scenarios/gen.json
 #    aspect — the composer's frame retune across image/video
 #    gen-edit — the EDIT path: the model that reads pictures, attaching a source
 #             picture + a mask (real files through the picker's change event),
-#             which SEAT a pass draws on (a frame only the unbounded tp2 pair can
+#             which SEAT a pass draws on (a frame only the tp2 pair can
 #             take — nothing in this fleet is over budget), the edit filter, a job's before/after strip,
 #             remix (its stored sources pulled back into the composer)
 node tools/demo/shot.mjs --scenario=tools/demo/scenarios/gen-edit.json

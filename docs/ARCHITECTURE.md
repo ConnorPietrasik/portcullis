@@ -155,11 +155,11 @@ already talks to, over the same segment and the same fleet bearer — no new sur
 
 **A model's SIZE is the config's answer, and it can differ per seat — so cost routes.** `max-model-len` is
 an entry's context bound and, for a generator, its KV floor: the bytes every restore has to find room for.
-It is therefore sized per CARD, not per model: `NoctQ-V4` is bound at 8192 rows on a tp1 slot — the
-one-card value upstream sizes for this model (it needs 29.7 GiB, `docs/GUIDE` §5.6) — and UNBOUNDED on the
-tp2 pair as written (the long-pass seat, which loads only once bounded — RUNBOOK → Editing pictures), one entry with two seats. Nothing about that is a second trust boundary — same container
-class, same private slot, same config-driven discovery — but it does mean a job's `model` field no longer
-determines where it runs. So the scheduler costs the pass (frame rows + a figure per reference picture +
+It is therefore sized per CARD, not per model: `NoctQ-V4` is bound at the card ceiling measured on this
+box on a tp1 slot (upstream's own value is 8192, `docs/GUIDE` §5.6) — and at the pair's ceiling on the
+tp2 pair (the long-pass seat — RUNBOOK → Editing pictures), one entry with two seats. Nothing about that is
+a second trust boundary — same container class, same private slot, same config-driven discovery — but it
+does mean a job's `model` field no longer determines where it runs. So the scheduler costs the pass (frame rows + a figure per reference picture +
 the prompt, all upstream's numbers, in `gen_jobs` as ONE row model that `GET /api/gen` also hands the UI so
 the chips and the routing cannot drift apart) and takes it to the **cheapest slot whose bound covers it**;
 `create` refuses a pass no seat covers rather than spending a slot start to fail at radiance. Cost-first

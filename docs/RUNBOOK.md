@@ -552,8 +552,9 @@ config the script generates in /tmp (the real configs are read at most, never to
 DEFAULT log verbosity (the fleet's `RADIANCE_LOG=warn` is not set) — and the startup log, streamed:
 
 ```
-sudo tools/gpu-mlen-test.sh --base /opt/panel/compose/gpu-configs/gpu-gentp2.yaml --unbounded NoctQ-V4
-sudo tools/gpu-mlen-test.sh --base /opt/panel/compose/gpu-configs/gpu-gentp2.yaml --set-mlen NoctQ-V4=20480
+sudo tools/gpu-mlen-test.sh --base /opt/panel/gpu-configs/gpu-gentp2.yaml --unbounded NoctQ-V4
+# re-try a bound against the cards (the value is the config's, to update):
+sudo tools/gpu-mlen-test.sh --base /opt/panel/gpu-configs/gpu-gentp2.yaml --set-mlen NoctQ-V4=30000
 ```
 
 The log says the exact figure — `warm-up: NoctQ-V4 stays cold: it needs N MiB on card(s) 5,6 and that much
@@ -623,29 +624,28 @@ image/video) makes it a plain instance.
 
 | slot | cards | lane fallback | entries (one model per slot runs at a time) | host-mib |
 |---|---|---|---|---|
-| `gpu-gentp1a` | 1 | 5 | `Krea2` (16.4 GiB, image, text→picture only) + `NoctQ-V4` (image, **edits**, `max-model-len: 8192`) | 24576 |
+| `gpu-gentp1a` | 1 | 5 | `Krea2` (16.4 GiB, image, text→picture only) + `NoctQ-V4` (image, **edits**, bound — the tp1 line) | 24576 |
 | `gpu-gentp1b` | 1 | 6 | the same pair (identical config) | 24576 |
-| `gpu-gentp2` | 2 | 5,6 | `Minimax-H3-T2V` (62.7 GiB, video) + `NoctQ-V4` (**the same model again**, `tp: 2`, **no bound — the long-pass seat**) | 73728 |
+| `gpu-gentp2` | 2 | 5,6 | `Minimax-H3-T2V` (62.7 GiB, video) + `NoctQ-V4` (**the same model again**, `tp: 2`, bound — the long-pass seat) | 73728 |
 
 The two tp1 slots are identical, so a Krea 2 job and a NoctQ-V4 job run concurrently on **disjoint
 cards** — but never on the SAME card: the pair parks for each other (see the config's comment for the
 `max-model-len` and `park` reasoning, and **Editing pictures** below for what that bound means for an
 edit's frame size).
 
-**NoctQ-V4 is served twice — bounded on the tp1 cards, unbounded on the tp2 pair — and the job's row
-cost picks the seat.** A bound is what a card must hand back on every restore: upstream sizes it at
-8192 for this model on one card (it needs 29.7 GiB, `docs/GUIDE` §5.6), so 8192 is the hard line on the
-tp1 cards; the tp2 pair runs NoctQ with **no bound at all** — the long-pass seat: passes past the tp1
-line land there. `gen_jobs.job_candidates` then takes a
-job to the **cheapest slot whose pass covers it** (frame rows + 4600 a reference picture + the prompt
-allowance), and create REFUSES the shape no seat can take instead of queueing it (a rule for a fleet
-where every seat is bounded — here tp2 covers everything, so the tp1 line is the only one). So an
-ordinary render or a one-picture edit never asks the tp2 pair for anything — which is the point: the
-alternative routes tp1-sized work onto the pair and parks the video model to draw a 1024x768. What lands
-on tp2 is a second reference picture, or a frame the tp1 line cannot carry with its references — a
-plain frame past ~1.9 MP (the model's own 2048x2048 default is 16384 rows). Cost of a switch is the
-same as on tp1 — one disk re-read (`park: {ram: never}`);
-the job simply waits in the queue until the other model's flights drain.
+**NoctQ-V4 is served twice — bounded on the tp1 cards, and bound higher on the tp2 pair — and the job's
+row cost picks the seat.** A bound is what a card must hand back on every restore, so each seat's is
+sized to its cards: each is the ceiling measured on this box (upstream's own one-card value is 8192,
+`docs/GUIDE` §5.6 — the figures and the re-try rule sit with the configs; **Editing pictures**
+below). The tp2 pair is the long-pass seat: passes past the tp1 line land there. `gen_jobs.job_candidates`
+takes a job to the **cheapest slot whose pass covers it** (frame rows + 4600 a reference picture + the
+prompt allowance), and create REFUSES the shape no seat can take instead of queueing it (every seat is
+bounded — both ceilings refuse). So an ordinary render or a one-picture edit never asks the tp2 pair
+for anything — which is the point: the alternative routes tp1-sized work onto the pair and parks the
+video model to draw a 1024x768. What lands on tp2 is a second reference picture, or a frame the tp1
+line cannot carry with its references (the model's own 2048x2048 default is 16384 rows — tp2 territory).
+Cost of a switch is the same as on tp1 — one disk re-read (`park: {ram: never}`); the job simply waits
+in the queue until the other model's flights drain.
 `minimax-h3-i8.rad` is 98% of the pair as a FILE — it fits only because of
 `vision-tower-placement: ram` (the ViT towers sit in host RAM, which `host-mib` budgets — the value
 in the config file, not the container env). No pre-flight check: if it doesn't
@@ -692,13 +692,13 @@ the trust shape changes (ARCHITECTURE → "Image EDITING"); these are the knobs.
   pass) or restart panel-api. A model whose config name or path changed re-probes on the next pass (a cache
   line keys the config's model path); a FILE swapped under the same path keeps its cached answer until the
   1-hour age re-asks it.
-- **Frame size is a budget, not a taste.** `max-model-len: 8192` is what ONE pass gets, and the prompt, every
-  reference picture and the frame all pay out of it. Size it against radiance's own figure — *"set it to
-  cover the longest conditioning the deployment sends: a 1024 x 1024 reference picture adds about **4600
-  rows**"* (`docs/MULTIMODEL` §6.3; the rows it *costs* the cache are 4096, `docs/GUIDE` §5.6, the difference
-  being the conditioning's own overhead). So one reference leaves 3592 rows for prompt + frame — 3336 for
-  the frame after the prompt allowance, the 896×896 and 1024×768 chips — and a **second reference leaves
-  none**: a tp1 edit works from one picture with an optional mask.
+- **Frame size is a budget, not a taste.** The tp1 bound (`max-model-len`) is what ONE pass gets, and the
+  prompt, every reference picture and the frame all pay out of it. Size it against radiance's own figure
+  — *"set it to cover the longest conditioning the deployment sends: a 1024 x 1024 reference picture adds
+  about **4600 rows**"* (`docs/MULTIMODEL` §6.3; the rows it *costs* the cache are 4096, `docs/GUIDE` §5.6,
+  the difference being the conditioning's own overhead). So at the current tp1 bound one reference
+  leaves the full chip ladder, and a **second reference leaves no room for the frame**: a tp1 edit
+  works from one picture with an optional mask.
   Multi-reference work belongs on the tp2 seat, and the row model is what sends it there. The composer
   computes its chips from the config's number and the pictures attached, and a pass past the tp1 line is
   the thing the tab flags — the dotted
@@ -711,22 +711,21 @@ the trust shape changes (ARCHITECTURE → "Image EDITING"); these are the knobs.
   reference's 4600 + the prompt allowance, on both sides): `1024x768 + 1 picture → 7928 rows →
   TP1-A/TP1-B`, `1536x1536 + 1 picture → 14072 rows (9216 frame + 4600 + 256) → TP2 only`. The frame chips
   stay on the CHEAP seat (the largest rung a tp1 card takes), so the routine frame is one click and the
-  long pass is what you type (when tp1 can take nothing — two references — the chips fall back to the
-  smallest rungs, dotted far). A chip dotted blue will draw on the long-pass seat — the "needs tp2" tell —
-  and a dashed amber one no slot can serve at all.
-- **The bound is the model's floor — and only tp1 has one.** It is easy to read `max-model-len` as a
+  long pass is what you type (when tp1 can take nothing — two references today — the chips fall back
+  to the largest rung the long-pass bound covers, dotted far). A chip dotted blue will draw on the
+  long-pass seat — the "needs tp2" tell — and a dashed amber one no slot can serve at all.
+- **The bound is the model's floor.** It is easy to read `max-model-len` as a
   co-tenancy budget because the docs discuss it "beside other models in a fleet". It is not: a **parked**
   model holds no committed VRAM (`fixed(m)`: committed *while m is resident*) and admission counts only the
   **resident** models' fixed bytes and floors. What the bound sizes is the KV floor *this* model must find
-  room for on **every restore** — and a generator claims two sequences of it (one in flight + one queued:
-  the panel's gen cap), so on one card the two-sequence floor must fit on each swap; upstream sizes 8192
-  for this model there (it needs 29.7 GiB, `docs/GUIDE` §5.6). That is the whole reason tp1 carries a
-  bound. The tp2 pair is the long-pass seat and carries **no** bound as written — at the model's own
-  length the grant is 32.6 GiB a card, more than these cards (`docs/GUIDE` §5.6), so it will not load:
-  give it a `max-model-len` (upstream sizes 20480 at 25.4 GiB a card — it covers the default 2048×2048
-  frame, 16384 rows, not a frame plus a reference); `tools/gpu-mlen-test.sh` (GPU fleet → trial) tries
-  values against the cards first. Once bounded, it takes the passes past the tp1 line — the Gen tab's
-  "only TP2 takes that pass" tell.
+  room for on **every restore** — and a generator's one request holds both guidance branches at once
+  (two sequences of the bound), so on one card the two-sequence floor must fit on each swap; the tp1
+  bound is the one-card ceiling as measured on this box (upstream's own one-card value is 8192,
+  `docs/GUIDE` §5.6); that is the whole reason tp1 carries a bound. The tp2 pair is the long-pass
+  seat; its bound is the pair's ceiling, measured the same way (`tools/gpu-mlen-test.sh`, GPU fleet →
+  trial) — the configs' comments carry the figures; re-try both after a radiance update. It takes the
+  passes past the tp1 line, up to its own ceiling — the Gen tab's "only TP2 takes that pass" tell;
+  past that, create refuses, no seat covers it.
 - **The source pictures are artifacts.** They land beside the result as `job-NNNNNN-in0.png…` + `job-NNNNNN-mask.png`
   (panel-generated names, never the client's), are served from the same `/gen/*` location (its nginx URI
   allowlist carries those two name shapes), show as the card's corner chip and the modal's before/after strip,

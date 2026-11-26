@@ -147,10 +147,11 @@ const EDIT_LADDER: { ratio: string; sizes: string[] }[] = [
   { ratio: '9:16', sizes: ['704x1280', '576x1024', '512x896', '448x768'] },
 ]
 
-/** The edit's frames: each aspect's largest rung the CHEAP seat can take (when
- *  it can take nothing, the smallest rung — the unbounded long-pass seat takes
- *  any rung, and the chips stay dotted "far"). Sizing off the cheap seat keeps
- *  the chips on the frames the fleet serves routinely. */
+/** The edit's frames: each aspect's largest rung the CHEAP seat can take; when
+ *  it can take nothing, the largest rung the LONG-PASS bound covers (the chips
+ *  stay dotted "far"). An unbounded model takes the top rung, and the smallest
+ *  rung is the last resort when even the long-pass bound holds no rung. Sizing
+ *  off the cheap seat keeps the chips on the frames the fleet serves routinely. */
 function editFrames(rm: GenRowModel, bound: number, refs = 1, cheap = 0): { ratio: string; size: string }[] {
   const budget = editBudget(rm, bound, refs)
   const cheapBudget = cheap > 0 && cheap < bound ? editBudget(rm, cheap, refs) : budget
@@ -240,8 +241,12 @@ function noteFor(
         const cost = `${refs} picture${refs > 1 ? 's' : ''} cost ${refs * rm.ref_rows}`
         const here = seats.join('/')
         if (need != null && info.mlen_min > 0 && need > info.mlen_min) {
+          // here empty = every seat bounds the model and none covers the pass —
+          // create refuses it, so say so instead of naming a seat that isn't one
           parts.push(
-            `${need} rows${editing ? ` (${cost})` : ''} — only ${here || `${info.mlen} rows`} takes that pass (${info.mlen_min} bounds the others)`,
+            here
+              ? `${need} rows${editing ? ` (${cost})` : ''} — only ${here} takes that pass (${info.mlen_min} bounds the others)`
+              : `${need} rows${editing ? ` (${cost})` : ''} — no slot takes that pass (the longest bound is ${info.mlen} rows)`,
           )
         } else {
           parts.push(

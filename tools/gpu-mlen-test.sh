@@ -8,10 +8,10 @@
 # "no bound at all" admits — by varying one value and reading what the cards say:
 #
 #   refused (the figure you are sizing against):
-#     warm-up: NoctQ-V4 stays cold: it needs 34288 MiB on card(s) 5,6 and that much cannot
+#     warm-up: NoctQ-V4 stays cold: it needs N MiB on card(s) 5,6 and that much cannot
 #     be made free there; staying: Minimax-H3-T2V
 #   admitted:
-#     model NoctQ-V4: loaded on card(s) 5,6 in 41.3 s, holding 24.3 GiB a card
+#     model NoctQ-V4: loaded on card(s) 5,6 in X s, holding Y a card
 #
 # Vary the value until the line flips; the refused figure is the exact number the pair cannot
 # make free, so it tells you where the bound has to land. An on-demand load (a request while
@@ -313,30 +313,47 @@ TEE=$!
 # core/fleet/fleet.cpp) — its say is its own line, and without it this loop
 # would watch to the timeout an answer that is already on screen.
 deadline=$(( $(date +%s) + TIMEOUT ))
+STOP_REASON=""
 while :; do
   if grep -qE 'every model has been loaded once|warm-up: stops:' "$LOG" 2>/dev/null; then
+    STOP_REASON="the warm-up thread ended (every model loaded once / warm-up: stops)"
     break
   fi
-  quiet=0
   if [[ ${#ENTRIES[@]} -gt 0 ]]; then
-    quiet=1
+    all_in=1
+    verdicts=()
     for en in "${ENTRIES[@]}"; do
-      if ! grep -qF "model $en: loaded on card(s)" "$LOG" 2>/dev/null \
-        && ! grep -qF "model $en: not loaded:" "$LOG" 2>/dev/null \
-        && ! grep -qF "warm-up: $en stays cold:" "$LOG" 2>/dev/null; then
-        quiet=0
-        break
+      if grep -qF "warm-up: $en stays cold:" "$LOG" 2>/dev/null; then
+        verdicts+=("$en: stays cold")
+      elif grep -qF "model $en: not loaded:" "$LOG" 2>/dev/null; then
+        verdicts+=("$en: not loaded")
+      elif grep -qF "model $en: loaded on card(s)" "$LOG" 2>/dev/null; then
+        verdicts+=("$en: loaded")
+      else
+        all_in=0
       fi
     done
-    if (( quiet )); then break; fi
+    if (( all_in )); then
+      v=""
+      for x in "${verdicts[@]}"; do v+="${v:+ · }$x"; done
+      STOP_REASON="every entry has had its verdict — $v"
+      break
+    fi
   fi
   running=$(docker inspect -f '{{.State.Running}}' "$CID" 2>/dev/null) || running=false
-  [[ $running == true ]] || break
-  (( $(date +%s) < deadline )) || break
+  if [[ $running != true ]]; then
+    STOP_REASON="the container exited"
+    break
+  fi
+  if (( $(date +%s) >= deadline )); then
+    STOP_REASON="timeout after ${TIMEOUT} s"
+    break
+  fi
   sleep 2
 done
 
 echo
+echo "── stopped: $STOP_REASON ──"
 echo "── what the startup said (full log: $LOG) ──"
 grep -nE 'loaded on card|stays cold|not loaded|waiting for room|warm-up:' "$LOG" \
   || echo "(no load/warm-up lines found — the log above is the whole story)"
